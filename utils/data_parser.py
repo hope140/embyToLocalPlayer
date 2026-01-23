@@ -161,7 +161,8 @@ def parse_received_data_emby(received_data):
     if is_strm and not is_http_source:
         if strm_direct:
             mount_disk_mode = True
-        logger.info(f'{source_path=}')
+        hint = '\nyou may want to set strm_direct_host in ini' if not strm_direct else ''
+        logger.info(f'{source_path=}{hint}')
 
     if mount_disk_mode:  # 肯定不会是 http
         if is_strm:
@@ -441,7 +442,7 @@ def list_episodes(data: dict):
     headers.update(data['headers'])
 
     playlist_info = data.get('playlist_info')
-    playlist_info and logger.info('playlist_info found')
+    playlist_info and logger.info('playlist_info found, skip version filter and pretty title')
     main_ep_info = data.get('main_ep_info') or requests_urllib(
         f'{scheme}://{netloc}{extra_str}/Users/{user_id}/Items/{data["item_id"]}',
         params=params, headers=headers, get_json=True)

@@ -459,21 +459,6 @@ https://github.com/kjtsune/embyToLocalPlayer#faq
 ### 隐藏功能（无支持）:
 
 <details>
-<summary>替换媒体标题字符（高版本 Pot 渲染 Pin 失败）</summary>
-
-* 问题：标题含空格或者个别半角符号，会导致 pot 无法从命令行启动，无法播放。
-* 解决方案：把半角单双引号替换为全角，空格替换为连字符。是以下配置的默认行为。
-* 填写位置：`.ini` > `[dev]`
-  ```
-    # 此功能可能产生其他问题，建议仅在 pot 中使用。
-    # 谨慎配置，只接受单个字符，全角逗号隔开，成对填写。
-    # 不要有多余的空格引号，注意分隔符是全角的逗号。
-    media_title_translate = '，＇，"，＂， ，-
-  ```
-
-</details>
-
-<details>
 <summary>本地 重定向/替换 播放地址</summary>
 
 > 本地 重定向/替换 播放网址
@@ -782,6 +767,21 @@ https://github.com/kjtsune/embyToLocalPlayer#faq
   mix_s0 = yes
   ```
 * 播放的第一个文件是 S0 的话，会连续播 S0。（通用 Bug，换 mpv 也会这样）
+
+</details>
+
+<details>
+<summary>替换媒体标题字符（高版本 Pot 渲染 Pin 失败）已经默认启用</summary>
+
+* 问题：标题含空格或者个别半角符号，会导致 pot 无法从命令行启动，无法播放。
+* 解决方案：把半角单双引号替换为全角，空格替换为连字符。是以下配置的默认行为。
+* 填写位置：`.ini` > `[dev]`
+  ```
+    # 此功能可能产生其他问题，建议仅在 pot 中使用。
+    # 谨慎配置，只接受单个字符，全角逗号隔开，成对填写。
+    # 不要有多余的空格引号，注意分隔符是全角的逗号。
+    media_title_translate = '，＇，"，＂， ，-
+  ```
 
 </details>
 

@@ -159,7 +159,7 @@ class BaseManager(BaseInit):
                 _total_sec = _media_source and _media_source[0]['RunTimeTicks'] // 10 ** 7 or 0
                 if _media_source:
                     # 注意此处 id 变动了，为了确保回传成功，目前没不良影响。多版本不同支线的情况极少，emby 自身也是没区分。
-                    ep['item_id'] = _media_source[0]['ItemId']
+                    ep['item_id'] = _media_source[0].get('ItemId') or _media_source[0]['Id']  # jellyfin/10.11.1 是 Id
                     logger.info('strm: total_sec found by recheck server data')
                 else:
                     check_miss_runtime_start_sec(netloc, item_id, basename, stop_sec=_stop_sec)
@@ -194,7 +194,7 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
 
     def mpv_cache_via_nas_loop(self):
         mpv = self.player_kwargs.get('mpv')
-        if not mpv or not configs.check_str_match(self.data['netloc'], 'dev', 'playing_feedback_host', log=True):
+        if not mpv or not configs.check_str_match(self.data['netloc'], 'dev', 'playing_feedback_host', log_by=True):
             return
         if self.data['server'] == 'plex':
             logger.info('playing_feedback not support plex, skip')
@@ -213,7 +213,7 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
 
     def realtime_playing_feedback_loop(self):
         mpv = self.player_kwargs.get('mpv')
-        if not mpv or not configs.check_str_match(self.data['netloc'], 'dev', 'playing_feedback_host', log=True):
+        if not mpv or not configs.check_str_match(self.data['netloc'], 'dev', 'playing_feedback_host', log_by=True):
             return
         if self.data['server'] == 'plex':
             logger.info('playing_feedback not support plex, skip')
