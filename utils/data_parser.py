@@ -190,7 +190,8 @@ def parse_received_data_emby(received_data):
         # sub_data = media_source_info['MediaStreams'][sub_index]
         fallback_sub = f'{extra_str}/videos/{sub_jellyfin_str}{item_id}{sub_emby_str}/Subtitles' \
                        f'/{sub_index}/0/Stream.{sub_dict["Codec"]}?api_key={api_key}'
-        sub_delivery_url = sub_dict['Codec'] != 'sup' and sub_dict.get('DeliveryUrl') or fallback_sub
+        # pot 240618 不支持 emby DeliveryUrl 的 vtt 格式，实际是 srt。
+        sub_delivery_url = sub_dict['Codec'] not in ('sup', 'srt') and sub_dict.get('DeliveryUrl') or fallback_sub
     else:
         sub_delivery_url = None
 
