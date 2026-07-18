@@ -643,8 +643,12 @@ def stop_sec_mpc(mpc: MPCHttpApi, stop_sec_only=True, **_):
 
 def pot_player_start(cmd: list, start_sec=None, sub_file=None, media_title=None, get_stop_sec=True, **_):
     if sub_file:
-        if 'Plex-Token' in sub_file:
-            sub_file = save_sub_file(sub_file, name='pot sub.srt')
+        if 'Plex-Token' in sub_file or '.sup' in sub_file:
+            sub_name = 'pot sub.srt'
+            if '.sup' in sub_file:
+                sub_name = sub_name.replace('srt', 'sup')
+                logger.info('Pot not support http sup, downloading, or may enable disk mode')
+            sub_file = save_sub_file(sub_file, name=sub_name)
         cmd.append(f'/sub={sub_file}')
     if start_sec is not None:
         format_time = time.strftime('%H:%M:%S', time.gmtime(int(start_sec)))
