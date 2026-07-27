@@ -13,6 +13,23 @@ from utils.tools import (show_version_info, main_ep_to_title, main_ep_intro_time
 logger = MyLogger()
 
 
+def strm_local_media_path(file_path, source_path):
+    """Build the real media path from a .strm file path and its HTTP URL."""
+    source_url = urllib.parse.urlparse(source_path)
+    decoded_url_path = urllib.parse.unquote(source_url.path)
+    media_ext = os.path.splitext(decoded_url_path)[1]
+    if not re.fullmatch(r'\.[A-Za-z0-9]{1,10}', media_ext):
+        media_ext = configs.raw.get('dev', 'strm_local_fallback_ext', fallback='').strip()
+        if media_ext and not media_ext.startswith('.'):
+            media_ext = f'.{media_ext}'
+        if not re.fullmatch(r'\.[A-Za-z0-9]{1,10}', media_ext):
+            media_ext = ''
+
+    if not media_ext:
+        return file_path
+    return f'{os.path.splitext(file_path)[0]}{media_ext}'
+
+
 def _get_sub_order_by_ini(_sub_list):
     for _sub in _sub_list:
         _sub['Order'] = configs.check_str_match(
@@ -142,7 +159,13 @@ def parse_received_data_emby(received_data):
         stream_netloc = urllib.parse.urlparse(stream_url).netloc
 
     mount_disk_mode = received_data['mountDiskEnable'] == 'true'
-    if not mount_disk_mode or is_http_direct_strm:
+    strm_local_by_file_path = configs.raw.getboolean(
+        'dev', 'strm_local_by_file_path', fallback=False)
+    use_strm_local_path = (
+        mount_disk_mode and is_strm and strm_local_by_file_path
+        and source_path.lower().startswith(('http://', 'https://'))
+    )
+    if not mount_disk_mode or (is_http_direct_strm and not use_strm_local_path):
         stream_url = configs.string_replace_by_ini_pair(stream_url, 'dev', 'stream_redirect')
 
         if configs.check_str_match(stream_netloc, 'dev', 'redirect_check_host'):
@@ -155,7 +178,7 @@ def parse_received_data_emby(received_data):
             stream_prefix = configs.ini_str_split('dev', 'stream_prefix')[0].strip('/')
             stream_url = f'{stream_prefix}{stream_url}'
 
-    if is_strm and not strm_direct or is_http_source:
+    if (is_strm and not strm_direct or is_http_source) and not use_strm_local_path:
         mount_disk_mode = False
     if not is_http_source and force_disk_mode_by_path(file_path):
         mount_disk_mode = True
@@ -166,7 +189,9 @@ def parse_received_data_emby(received_data):
         logger.info(f'{source_path=}{hint}')
 
     if mount_disk_mode:  # 肯定不会是 http
-        if is_strm:
+        if use_strm_local_path:
+            media_path = translate_path_by_ini(strm_local_media_path(file_path, source_path))
+        elif is_strm:
             if strm_direct:
                 media_path = translate_path_by_ini(source_path)
             else:  # strm 文件无法直接播放
@@ -258,6 +283,8 @@ def parse_received_data_emby(received_data):
         is_strm=is_strm,
         strm_direct=strm_direct,
         is_http_source=is_http_source,
+        strm_local_by_file_path=strm_local_by_file_path,
+        use_strm_local_path=use_strm_local_path,
         source_path=source_path,
         is_http_direct_strm=is_http_direct_strm,
         sub_inner_idx=sub_inner_idx,
@@ -464,6 +491,7 @@ def list_episodes(data: dict):
     is_http_source = data['is_http_source']
     strm_direct = data['strm_direct']
     is_http_direct_strm = data['is_http_direct_strm']
+    strm_local_by_file_path = data.get('strm_local_by_file_path', False)
 
     def strm_file_name_sync(file_path, episodes_data):
         if is_strm and not is_http_source:
@@ -686,6 +714,15 @@ def list_episodes(data: dict):
         media_source_id = source_info["Id"]
         file_path = item['Path']
         source_path = source_info['Path']
+        item_is_strm = (
+            file_path.lower().endswith('.strm')
+            or source_info.get('Container') == 'strm'
+        )
+        item_is_http_source = source_path.lower().startswith(('http://', 'https://'))
+        use_strm_local_path = (
+            mount_disk_mode and item_is_strm and item_is_http_source
+            and strm_local_by_file_path
+        )
         fake_name = os.path.splitdrive(file_path)[1].replace('/', '__').replace('\\', '__')
         item_id = item['Id']
         container = os.path.splitext(file_path)[-1]
@@ -696,7 +733,9 @@ def list_episodes(data: dict):
             stream_url = source_path
 
         if mount_disk_mode:  # 肯定不会是 http
-            if is_strm:
+            if use_strm_local_path:
+                media_path = translate_path_by_ini(strm_local_media_path(file_path, source_path))
+            elif is_strm:
                 if strm_direct:
                     media_path = translate_path_by_ini(source_path)
                 else:  # strm 文件无法直接播放
