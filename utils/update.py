@@ -37,7 +37,7 @@ def check_ini_diff(old_path, new_path, diff_path):
 
 
 def main():
-    url = 'https://github.com/kjtsune/embyToLocalPlayer/releases/latest/download/embyToLocalPlayer.zip'
+    url = 'https://github.com/hope140/embyToLocalPlayer/releases/latest/download/embyToLocalPlayer.zip'
     cwd = configs.cwd
 
     ini_old = configs.path
