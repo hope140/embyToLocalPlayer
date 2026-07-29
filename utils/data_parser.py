@@ -798,6 +798,8 @@ def list_episodes(data: dict):
             intro_end=end_data.get(unique_key),
             order=order,
             sub_inner_idx=sub_inner_idx,
+            source_path=source_path,
+            use_strm_local_path=use_strm_local_path,
         ))
         return result
 

@@ -311,7 +311,39 @@ def get_player_cmd(media_path, file_path, data=None):
         exe = config['exe'][player_by_path]
     result = [exe, media_path]
     _logger.info('command line:', result)
-    if not media_path.startswith('http') and not os.path.exists(media_path):
+    media_path_exists = media_path.startswith('http') or os.path.exists(media_path)
+    if not media_path_exists and data and data.get('use_strm_local_path'):
+        try:
+            retry_seconds = max(
+                0, config.getfloat('dev', 'strm_local_path_retry_seconds', fallback=8))
+        except ValueError:
+            retry_seconds = 8
+
+        retry_start = time.monotonic()
+        retry_interval = 0.25
+        retry_index = 0
+        parent_path = os.path.dirname(media_path)
+        while True:
+            retry_remaining = retry_seconds - (time.monotonic() - retry_start)
+            if retry_remaining <= 0:
+                break
+            retry_index += 1
+            retry_wait = min(retry_interval, retry_remaining)
+            try:
+                os.stat(parent_path)
+            except OSError:
+                pass
+            _logger.info(
+                f'strm local path not ready, retry {retry_index}, wait={retry_wait:g}s')
+            time.sleep(retry_wait)
+            if os.path.exists(media_path):
+                media_path_exists = True
+                elapsed = time.monotonic() - retry_start
+                _logger.info(f'strm local path ready after {elapsed:.2f}s')
+                break
+            retry_interval = min(retry_interval * 2, 4)
+
+    if not media_path_exists:
         raise FileNotFoundError(f'{media_path}\nmay need to disable read disk mode, '
                                 f'or enable path_check, see detail in FAQ')
     return result
