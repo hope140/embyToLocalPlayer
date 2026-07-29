@@ -10,7 +10,7 @@ from html.parser import HTMLParser
 
 from utils.configs import configs, MyLogger
 from utils.data_parser import list_episodes
-from utils.net_tools import requests_urllib, save_sub_file
+from utils.net_tools import cache_sub_file, requests_urllib, save_sub_file
 from utils.python_mpv_jsonipc import MPV
 from utils.tools import activate_window_by_pid
 
@@ -18,6 +18,13 @@ logger = MyLogger()
 prefetch_data = dict(on=True, stop_sec_dict={}, done_list=[])
 pipe_port_stack = list(reversed(range(25)))
 mpv_play_speed = {'media_title': 'speed'}
+
+
+def prepare_subtitle(sub_file, data=None):
+    if sub_file and data and data.get('use_strm_local_path') and configs.raw.getboolean(
+            'dev', 'strm_local_subtitle_cache', fallback=True):
+        return cache_sub_file(sub_file)
+    return sub_file
 
 
 # *_player_start 返回获取播放时间等操作所需参数字典
@@ -50,6 +57,9 @@ def init_player_instance(function, **kwargs):
 
 def mpv_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_stop_sec=True, mount_disk_mode=None,
                      data=None):
+    sub_file = prepare_subtitle(sub_file, data)
+    if sub_file and data and data.get('use_strm_local_path'):
+        data['sub_file'] = sub_file
     intro_start, intro_end = data.get('intro_start'), data.get('intro_end')
     is_darwin = True if platform.system() == 'Darwin' else False
     is_iina = True if 'iina-cli' in cmd[0] else False
@@ -74,9 +84,10 @@ def mpv_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_s
             # https://github.com/iina/iina/issues/1991
             # https://github.com/kjtsune/embyToLocalPlayer/issues/26
             cmd.append(f'--sub-files-toggle={sub_file}')
-        if is_iina and not mount_disk_mode:
-            srt = save_sub_file(url=sub_file)
-            cmd.append(f'--sub-files={srt}')
+        if is_iina:
+            if not mount_disk_mode:
+                sub_file = save_sub_file(url=sub_file)
+            cmd.append(f'--sub-files={sub_file}')
     if mount_disk_mode and is_iina:
         # iina 读盘模式下 media-title 会影响下一集
         pass
@@ -204,6 +215,8 @@ def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
             sub_cmd = ''
             main_ep_sub = data.get('sub_file', '')
             if sub_file := ep['sub_file']:
+                sub_file = prepare_subtitle(sub_file, ep)
+                ep['sub_file'] = sub_file
                 # mpvnet 不支持 sub-files-toggle
                 if main_ep_sub and not getattr(mpv, 'is_mpvnet'):
                     sub_cmd = f',sub-files-remove={main_ep_sub},sub-files-append={main_ep_sub}'
@@ -355,7 +368,9 @@ def stop_sec_mpv(mpv: MPV, stop_sec_only=True, **_):
             return stop_sec if stop_sec_only else (name_stop_sec_dict, name_total_sec_dict)
 
 
-def vlc_player_start(cmd: list, start_sec=None, sub_file=None, get_stop_sec=True, mount_disk_mode=None, **_):
+def vlc_player_start(cmd: list, start_sec=None, sub_file=None, get_stop_sec=True, mount_disk_mode=None,
+                     data=None, **_):
+    sub_file = prepare_subtitle(sub_file, data)
     is_nt = True if os.name == 'nt' else False
     port = get_pipe_or_port_str()
     if mount_disk_mode:
@@ -374,8 +389,9 @@ def vlc_player_start(cmd: list, start_sec=None, sub_file=None, get_stop_sec=True
         cmd.remove('--one-instance')
         cmd.remove('--playlist-enqueue')
     if sub_file:
-        srt = save_sub_file(url=sub_file)
-        cmd.append(f':sub-file={srt}')  # vlc不支持http字幕
+        if sub_file.startswith(('http://', 'https://')):
+            sub_file = save_sub_file(url=sub_file)
+        cmd.append(f':sub-file={sub_file}')  # vlc不支持http字幕
     if start_sec is not None:
         cmd += [f':start-time={start_sec}']
 
@@ -444,7 +460,8 @@ def playlist_add_vlc(vlc: VLCHttpApi, data, eps_data=None, limit=5, **_):
             continue
         limit -= 1
         sub_file = ep['sub_file']
-        if mount_disk_mode or not sub_file:
+        sub_file = prepare_subtitle(sub_file, ep)
+        if (mount_disk_mode and not ep.get('use_strm_local_path')) or not sub_file:
             add_path = urllib.parse.quote(media_path)
             vlc.playlist_add(path=add_path)
         # api 貌似不能添加字幕
@@ -455,8 +472,9 @@ def playlist_add_vlc(vlc: VLCHttpApi, data, eps_data=None, limit=5, **_):
                 # vlc.playlist_add(path=add_path)
                 # 目前采用自动连播方案，故含 http_sub 时，禁用播放列表。
                 continue
-            sub_ext = sub_file.rsplit('.', 1)[-1]
-            sub_file = save_sub_file(sub_file, f'{os.path.splitext(ep["basename"])[0]}.{sub_ext}')
+            if sub_file.startswith(('http://', 'https://')):
+                sub_ext = sub_file.rsplit('.', 1)[-1]
+                sub_file = save_sub_file(sub_file, f'{os.path.splitext(ep["basename"])[0]}.{sub_ext}')
             cmd = [vlc.exe, media_path,
                    '--one-instance', '--playlist-enqueue',
                    f':sub-file={sub_file}']
@@ -494,7 +512,8 @@ def stop_sec_vlc(vlc: VLCHttpApi, stop_sec_only=True, **_):
         time.sleep(0.2)
 
 
-def mpc_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_stop_sec=True, **_):
+def mpc_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_stop_sec=True, data=None, **_):
+    sub_file = prepare_subtitle(sub_file, data)
     port = get_pipe_or_port_str()
     if sub_file:
         cmd += ['/sub', f'"{sub_file}"']
@@ -589,6 +608,7 @@ def playlist_add_mpc(mpc_path, data, eps_data=None, limit=4, **_):
             continue
         limit -= 1
         sub_file = ep['sub_file']
+        sub_file = prepare_subtitle(sub_file, ep)
         add_list = ['/add', ep['media_path'], '/sub', f'"{sub_file}"'] if sub_file else ['/add', ep['media_path']]
         if mount_disk_mode:
             eps_list += add_list
@@ -641,9 +661,12 @@ def stop_sec_mpc(mpc: MPCHttpApi, stop_sec_only=True, **_):
         time.sleep(0.5)
 
 
-def pot_player_start(cmd: list, start_sec=None, sub_file=None, media_title=None, get_stop_sec=True, **_):
+def pot_player_start(cmd: list, start_sec=None, sub_file=None, media_title=None, get_stop_sec=True,
+                     data=None, **_):
+    sub_file = prepare_subtitle(sub_file, data)
     if sub_file:
-        if 'Plex-Token' in sub_file or '.sup' in sub_file:
+        if sub_file.startswith(('http://', 'https://')) and (
+                'Plex-Token' in sub_file or '.sup' in sub_file):
             sub_name = 'pot sub.srt'
             if '.sup' in sub_file:
                 sub_name = sub_name.replace('srt', 'sup')

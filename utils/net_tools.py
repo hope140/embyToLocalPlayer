@@ -1,8 +1,10 @@
+import hashlib
 import json
 import os.path
 import re
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -19,6 +21,7 @@ sync_third_party_done_ids = {'trakt': [],
 
 logger = MyLogger()
 redirect_url_cache = {}
+subtitle_cache_cleaned = False
 
 
 def tg_notify(msg, silence=False):
@@ -404,3 +407,70 @@ def save_sub_file(url, name='tmp_sub.srt'):
     srt = os.path.join(configs.cwd, '.tmp', name)
     requests_urllib(url, save_path=srt)
     return srt
+
+
+def cache_sub_file(url):
+    """Cache an Emby subtitle URL without exposing its API key in the file name."""
+    global subtitle_cache_cleaned
+    cache_dir = os.path.join(configs.cwd, '.tmp', 'subtitles')
+    os.makedirs(cache_dir, exist_ok=True)
+
+    if not subtitle_cache_cleaned:
+        subtitle_cache_cleaned = True
+        max_age_days = max(
+            0, configs.raw.getint('dev', 'strm_local_subtitle_cache_days', fallback=30))
+        max_size_mb = max(
+            0, configs.raw.getint('dev', 'strm_local_subtitle_cache_max_mb', fallback=200))
+        cache_files = []
+        now = time.time()
+        for entry in os.scandir(cache_dir):
+            if not entry.is_file():
+                continue
+            try:
+                stat = entry.stat()
+                if entry.name.endswith('.part') or (
+                        max_age_days and now - stat.st_mtime > max_age_days * 86400):
+                    os.remove(entry.path)
+                    continue
+                cache_files.append((stat.st_mtime, stat.st_size, entry.path))
+            except OSError:
+                continue
+        if max_size_mb:
+            total_size = sum(item[1] for item in cache_files)
+            for _, file_size, file_path in sorted(cache_files):
+                if total_size <= max_size_mb * 1024 * 1024:
+                    break
+                try:
+                    os.remove(file_path)
+                    total_size -= file_size
+                except OSError:
+                    pass
+
+    url_parts = urllib.parse.urlsplit(url)
+    sub_ext = os.path.splitext(urllib.parse.unquote(url_parts.path))[1].lower()
+    if not re.fullmatch(r'\.[a-z0-9]{1,10}', sub_ext):
+        sub_ext = '.srt'
+    cache_key_url = urllib.parse.urlunsplit((
+        url_parts.scheme, url_parts.netloc, url_parts.path, '', ''))
+    cache_key = hashlib.sha256(cache_key_url.encode('utf-8')).hexdigest()[:24]
+    cache_path = os.path.join(cache_dir, f'{cache_key}{sub_ext}')
+    if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+        logger.info(f'strm local subtitle cache hit: {os.path.basename(cache_path)}')
+        return cache_path
+
+    temp_path = f'{cache_path}.{threading.get_ident()}.part'
+    try:
+        requests_urllib(url, save_path=temp_path, retry=3)
+        if not os.path.isfile(temp_path) or os.path.getsize(temp_path) == 0:
+            raise OSError('downloaded subtitle is empty')
+        os.replace(temp_path, cache_path)
+        logger.info(f'strm local subtitle cached: {os.path.basename(cache_path)}')
+        return cache_path
+    except Exception as exc:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        logger.error(f'strm local subtitle cache failed, fallback to HTTP: {exc}')
+        return url

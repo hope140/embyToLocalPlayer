@@ -36,8 +36,9 @@ def safe_deleter(file, ext: Union[str, list, tuple] = ('mkv', 'mp4', 'srt', 'ass
 def clean_tmp_dir():
     tmp = os.path.join(configs.cwd, '.tmp')
     if os.path.isdir(tmp):
-        for file in os.listdir(tmp):
-            os.remove(os.path.join(tmp, file))
+        for entry in os.scandir(tmp):
+            if entry.is_file():
+                os.remove(entry.path)
 
 
 def scan_cache_dir():
