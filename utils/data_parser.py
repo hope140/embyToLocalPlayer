@@ -207,7 +207,11 @@ def parse_received_data_emby(received_data):
 
     media_streams = media_source_info['MediaStreams']
     # mpv 可传递首集内封字幕选中序号，其他播放器由播放器自身规则决定。
-    sub_index, sub_inner_idx, sub_dict = subtitle_checker(media_streams, sub_index, mount_disk_mode, log=True)
+    # A local path derived from an HTTP .strm has no matching sidecar subtitle path.
+    # Keep using Emby's external subtitle URL while the video itself is played locally.
+    subtitle_disk_mode = mount_disk_mode and not use_strm_local_path
+    sub_index, sub_inner_idx, sub_dict = subtitle_checker(
+        media_streams, sub_index, subtitle_disk_mode, log=True)
     sub_jellyfin_str = '' if is_emby \
         else f'{item_id[:8]}-{item_id[8:12]}-{item_id[12:16]}-{item_id[16:20]}-{item_id[20:]}/'
     if sub_dict and sub_inner_idx == 0:
@@ -759,12 +763,17 @@ def list_episodes(data: dict):
         size = int(source_info.get('Size', 0)) or 0
 
         media_streams = source_info['MediaStreams']
-        sub_index, sub_inner_idx, sub_dict = subtitle_checker(media_streams, need_check_inner_sub, mount_disk_mode)
+        subtitle_disk_mode = mount_disk_mode and not use_strm_local_path
+        sub_index, sub_inner_idx, sub_dict = subtitle_checker(
+            media_streams, need_check_inner_sub, subtitle_disk_mode)
 
         sub_file = None
         if sub_dict and sub_inner_idx == 0:
+            sub_ext = os.path.splitext(sub_dict.get('Path') or '')[-1] \
+                      or f'.{sub_dict["Codec"]}'
             sub_file = f'{scheme}://{netloc}/Videos/{item_id}/{source_info["Id"]}/Subtitles' \
-                       f'/{sub_dict["Index"]}/Stream{os.path.splitext(sub_dict["Path"])[-1]}'
+                       f'/{sub_dict["Index"]}/Stream{sub_ext}' \
+                       f'?api_key={api_key}'
 
         result = data.copy()
         result['Type'] = item['Type']

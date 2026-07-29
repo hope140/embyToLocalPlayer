@@ -95,7 +95,7 @@ class BaseManager(BaseInit):
             #     break
             self.player_kwargs = start_player_func_dict[self.player_name](
                 cmd=[self.player_path, next_ep['media_path']], sub_file=next_ep.get('sub_file'),
-                media_title=next_media_title, mount_disk_mode=False)
+                media_title=next_media_title, mount_disk_mode=False, data=next_ep)
             activate_window_by_pid(self.player_kwargs['pid'])
             logger.info(f'auto play: {next_media_title}')
 
