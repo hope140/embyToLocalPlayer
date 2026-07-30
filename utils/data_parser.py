@@ -18,11 +18,28 @@ def strm_local_media_path(file_path, source_path):
     source_url = urllib.parse.urlparse(source_path)
     decoded_url_path = urllib.parse.unquote(source_url.path)
     media_ext = os.path.splitext(decoded_url_path)[1]
-    if not re.fullmatch(r'\.[A-Za-z0-9]{1,10}', media_ext):
+
+    def valid_media_ext(ext):
+        return (
+            bool(re.fullmatch(r'\.[A-Za-z0-9]{1,10}', ext))
+            and ext.lower() != '.strm'
+        )
+
+    # Older CMS links put the real file name in a path-like query:
+    # /d/opaque-id?/decoded-or-url-encoded-file-name.mkv
+    if not valid_media_ext(media_ext):
+        raw_query_path = source_url.query.split('&', 1)[0]
+        decoded_query_path = urllib.parse.unquote(raw_query_path)
+        if decoded_query_path.startswith(('/', '\\')):
+            query_media_ext = os.path.splitext(decoded_query_path)[1]
+            if valid_media_ext(query_media_ext):
+                media_ext = query_media_ext
+
+    if not valid_media_ext(media_ext):
         media_ext = configs.raw.get('dev', 'strm_local_fallback_ext', fallback='').strip()
         if media_ext and not media_ext.startswith('.'):
             media_ext = f'.{media_ext}'
-        if not re.fullmatch(r'\.[A-Za-z0-9]{1,10}', media_ext):
+        if not valid_media_ext(media_ext):
             media_ext = ''
 
     if not media_ext:
