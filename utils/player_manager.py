@@ -26,6 +26,9 @@ class BaseInit:
         self.playlist_total_sec = {}
         self.is_http_sub = bool(data.get('sub_file'))
         self.emby_thin = EmbyApiThin(data)
+        self.playing_feedback_stop_event = threading.Event()
+        self.playing_feedback_request_lock = threading.Lock()
+        self.playing_feedback_thread = None
 
 
 class BaseManager(BaseInit):
@@ -115,6 +118,7 @@ class BaseManager(BaseInit):
 
         # 未兼容播放器多开，暂不处理
         prefetch_data['on'] = False
+        self.stop_realtime_playing_feedback()
         prefetch_data['stop_sec_dict'].clear()
 
     def prefetch_next_ep_playback_info(self):
@@ -143,6 +147,13 @@ class BaseManager(BaseInit):
                 continue
             start_sec = ep.get('start_sec') or 0
             _stop_sec = int(_stop_sec)
+            feedback_started = ep.pop('_playing_feedback_started', False)
+            if feedback_started:
+                # 先独立关闭实时会话，后续进度逻辑即使跳过也不会残留 Now Playing。
+                realtime_playing_request_sender(
+                    data=ep, cur_sec=_stop_sec, method='end', is_paused=False)
+                # 后续需要更新进度时只补 Stopped，不能再创建新的 Playing。
+                ep['update_success'] = True
             if abs(_stop_sec - int(start_sec)) < 20:
                 logger.info(f"skip update progress, {ep['basename']} start_sec stop_sec too close")
                 continue
@@ -192,6 +203,27 @@ class BaseManager(BaseInit):
 
 class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
 
+    def start_realtime_playing_feedback(self):
+        self.playing_feedback_stop_event.clear()
+        self.playing_feedback_thread = threading.Thread(
+            target=self.realtime_playing_feedback_loop, daemon=True)
+        self.playing_feedback_thread.start()
+
+    def stop_realtime_playing_feedback(self):
+        self.playing_feedback_stop_event.set()
+        # 等待正在发送的 Progress 完成；之后所有待发送请求都会因 stop_event 被丢弃。
+        with self.playing_feedback_request_lock:
+            pass
+        if self.playing_feedback_thread:
+            self.playing_feedback_thread.join(timeout=2)
+
+    def send_realtime_playing_feedback(self, **kwargs):
+        with self.playing_feedback_request_lock:
+            if self.playing_feedback_stop_event.is_set():
+                return False
+            realtime_playing_request_sender(**kwargs)
+            return True
+
     def mpv_cache_via_nas_loop(self):
         mpv = self.player_kwargs.get('mpv')
         if not mpv or not configs.check_str_match(self.data['netloc'], 'dev', 'playing_feedback_host', log_by=True):
@@ -213,57 +245,78 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
 
     def realtime_playing_feedback_loop(self):
         mpv = self.player_kwargs.get('mpv')
-        if not mpv or not configs.check_str_match(self.data['netloc'], 'dev', 'playing_feedback_host', log_by=True):
+        if not mpv or not configs.raw.getboolean('dev', 'playing_feedback_enable', fallback=True):
+            return
+        feedback_host = configs.raw.get('dev', 'playing_feedback_host', fallback='').strip()
+        if feedback_host and not configs.check_str_match(
+                self.data['netloc'], 'dev', 'playing_feedback_host', log_by=True):
             return
         if self.data['server'] == 'plex':
             logger.info('playing_feedback not support plex, skip')
             return
-        if self.data.get('total_sec') == 3600 * 24:
-            # 会造成意外完成播放
-            logger.info('playing_feedback not support strm, skip')
+        if self.data.get('is_strm') and not (
+                self.data.get('use_strm_local_path') or self.data.get('mount_disk_mode')):
+            logger.info('playing_feedback not support network strm, skip')
             return
-        stop_sec_dict = prefetch_data['stop_sec_dict']
+
+        report_interval = max(10, configs.raw.getfloat('dev', 'playing_feedback_interval', fallback=30))
+        is_single = not self.playlist_data
         prefetch_data['on'] = True
         last_key = None
-        req_sec = 0
-        interval = 5
+        last_cur_sec = None
+        last_is_paused = None
+        req_sec = None
         pause_sec = 0
         last_ep = None
-        while prefetch_data['on']:
+        while prefetch_data['on'] and not self.playing_feedback_stop_event.is_set():
             try:
                 key = mpv.command('get_property', 'media-title')
-                speed = mpv.command('get_property', 'speed')
-                if mpv.command('get_property', 'pause'):
-                    pause_sec += interval
-                else:
-                    pause_sec = 0
+                cur_sec = mpv.command('get_property', 'time-pos')
+                is_paused = bool(mpv.command('get_property', 'pause'))
+                duration = mpv.command('get_property', 'duration')
+                speed = float(mpv.command('get_property', 'speed') or 1)
             except Exception:
                 break
-            cur_sec = stop_sec_dict.get(key)
-            ep = self.playlist_data.get(key)
-            if not all([cur_sec, ep]):
-                time.sleep(0.5)
+
+            ep = self.data if is_single else self.playlist_data.get(key)
+            if key is None or cur_sec is None or not ep:
+                time.sleep(1)
                 continue
+            if duration and ep.get('total_sec') == 3600 * 24:
+                ep['total_sec'] = duration
+
             if key != last_key:
-                if last_ep:
-                    last_sec = stop_sec_dict[last_key]
-                    logger.trace(f'updating end {last_sec=} {last_ep["basename"]}')
-                    realtime_playing_request_sender(data=last_ep, cur_sec=last_sec, method='end')
-                    last_ep['update_success'] = True
-                realtime_playing_request_sender(data=ep, cur_sec=cur_sec, method='start')
+                if last_ep and last_cur_sec is not None:
+                    logger.trace(f'updating end last_sec={last_cur_sec} {last_ep["basename"]}')
+                    if self.send_realtime_playing_feedback(
+                            data=last_ep, cur_sec=last_cur_sec, method='end', is_paused=last_is_paused):
+                        last_ep['update_success'] = True
+                if self.send_realtime_playing_feedback(
+                        data=ep, cur_sec=cur_sec, method='start', is_paused=is_paused):
+                    ep['_playing_feedback_started'] = True
                 last_ep = ep
                 last_key = key
                 req_sec = cur_sec
-                time.sleep(interval)
+                last_cur_sec = cur_sec
+                last_is_paused = is_paused
+                pause_sec = 0
                 logger.trace(f'updating start {cur_sec=} {last_ep["basename"]}')
+                time.sleep(1)
                 continue
+
+            pause_sec = pause_sec + 1 if is_paused else 0
+            pause_changed = is_paused != last_is_paused
             after_sec = cur_sec - req_sec
-            if 180 < pause_sec or 0 < after_sec < 30 * speed:  # 尽量增加汇报间隔
-                time.sleep(interval)
-                continue
-            realtime_playing_request_sender(data=ep, cur_sec=cur_sec)
-            req_sec = cur_sec
-            time.sleep(interval)
+            if pause_changed:
+                self.send_realtime_playing_feedback(data=ep, cur_sec=cur_sec, is_paused=is_paused)
+                req_sec = cur_sec
+            elif pause_sec <= 180 and not (0 <= after_sec < report_interval * speed):
+                self.send_realtime_playing_feedback(data=ep, cur_sec=cur_sec, is_paused=is_paused)
+                req_sec = cur_sec
+
+            last_cur_sec = cur_sec
+            last_is_paused = is_paused
+            time.sleep(1)
 
     def redirect_next_ep_loop(self):
         mpv = self.player_kwargs.get('mpv')
@@ -421,4 +474,4 @@ class PlayerManager(BaseManager, PrefetchManager):
         super().playlist_add(eps_data=eps_data)
         threading.Thread(target=self.prefetch_next_ep_loop, daemon=True).start()
         threading.Thread(target=self.redirect_next_ep_loop, daemon=True).start()
-        threading.Thread(target=self.realtime_playing_feedback_loop, daemon=True).start()
+        self.start_realtime_playing_feedback()

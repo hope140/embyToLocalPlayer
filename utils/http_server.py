@@ -12,7 +12,8 @@ from socketserver import ThreadingMixIn
 
 from utils.data_parser import parse_received_data_emby, parse_received_data_plex, list_episodes
 from utils.downloader import DownloadManager
-from utils.net_tools import update_server_playback_progress, sync_third_party_for_eps
+from utils.net_tools import (realtime_playing_request_sender, update_server_playback_progress,
+                             sync_third_party_for_eps)
 from utils.player_manager import PlayerManager
 from utils.players import start_player_func_dict, stop_sec_func_dict
 from utils.tools import (configs, MyLogger, open_local_folder, play_media_file,
@@ -301,11 +302,23 @@ def start_play(data):
         player_function = start_player_func_dict[player_name]
         stop_sec_kwargs = player_function(cmd=cmd, start_sec=start_sec, sub_file=sub_file, media_title=media_title,
                                           mount_disk_mode=mount_disk_mode, data=data)
+        if 'mpv' in stop_sec_kwargs:
+            feedback_manager = PlayerManager(data=data, player_name=player_name, player_path=player_path)
+            feedback_manager.player_kwargs = stop_sec_kwargs
+            feedback_manager.start_realtime_playing_feedback()
         stop_sec = stop_sec_func_dict[player_name](**stop_sec_kwargs)
+        feedback_started = False
+        if 'mpv' in stop_sec_kwargs:
+            feedback_manager.stop_realtime_playing_feedback()
+            feedback_started = data.pop('_playing_feedback_started', False)
         logger.info('stop_sec', stop_sec)
         if stop_sec is None:
             player_is_running = False
             return
+        if feedback_started:
+            realtime_playing_request_sender(
+                data=data, cur_sec=stop_sec, method='end', is_paused=False)
+            data['update_success'] = True
         total_sec = data['total_sec']
         progress_percent = stop_sec / total_sec
         if total_sec != 86400 or progress_percent > 0.9:

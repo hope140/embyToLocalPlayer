@@ -6,6 +6,7 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
 
 * 在首页也可以播放。点击原来的播放按钮就可以。可配置版本优先级（若视频多版本）。
 * 播放列表（连续播放）支持，下一集保持相同版本。
+* mpv / IINA 默认实时回传单集和连续播放的进度，暂停或恢复时立即同步状态。
 * trakt.tv bangumi.tv bgm.tv 单向标记已观看支持。
 * 本地挂载用户：可跳转到路径对应文件夹。（按钮在网页显示文件路径的上面）
 * 未适配的播放器一般也能用，只是不会回传进度。
@@ -50,7 +51,9 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
 > 前置说明
 
 * 网页闪一下是自动关闭兼容流提示。
-* 播放器要退出触发回传进度。
+* mpv / IINA 播放期间默认实时回传进度，单集和连续播放均支持；其他播放器退出时回传最终进度。
+* 实时回传可在配置文件 `[dev]` 中用 `playing_feedback_enable` 开关，
+  `playing_feedback_interval` 设置间隔（默认 30 秒，最低 10 秒），`playing_feedback_host` 可选限制服务器域名。
 * 日志出现 `serving at 127.0.0.1:58000` 为服务启动成功。
 * **碰到问题先参考下方相关 FAQ，没按要求反馈会忽略**。
 
