@@ -304,7 +304,7 @@ def change_plex_play_position(scheme, netloc, api_key, stop_sec, rating_key, cli
                     })
 
 
-def realtime_playing_request_sender(data, cur_sec, method='playing'):
+def realtime_playing_request_sender(data, cur_sec, method='playing', is_paused=None):
     is_emby = (data['server'] == 'emby')
     emby_str = '/emby' if is_emby else ''
     ticks = int(cur_sec * 10 ** 7)
@@ -327,15 +327,21 @@ def realtime_playing_request_sender(data, cur_sec, method='playing'):
         'PositionTicks': ticks,
         'RepeatMode': 'RepeatNone',
     }
-    try:
-        requests_urllib(f'{data["scheme"]}://{data["netloc"]}{emby_str}/{url_path}',
-                        params=params,
-                        _json=_json,
-                        headers=data['headers'],
-                        timeout=10)
-    except Exception:
-        time.sleep(30)
-        pass
+    if is_paused is not None:
+        _json['IsPaused'] = is_paused
+    for attempt in range(2):
+        try:
+            requests_urllib(f'{data["scheme"]}://{data["netloc"]}{emby_str}/{url_path}',
+                            params=params,
+                            _json=_json,
+                            headers=data['headers'],
+                            timeout=10,
+                            retry=1)
+            return
+        except Exception:
+            if attempt == 0:
+                time.sleep(1)
+    time.sleep(10)
 
 
 emby_last_dict = dict(watched=True, stop_sec=0, data={}, normal_file=True)
