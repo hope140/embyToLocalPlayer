@@ -962,7 +962,10 @@ class WatchTogetherCoordinator:
         if not online_playing:
             return
         if len(online_playing) == 1:
-            user_id, snapshot = online_playing[0]
+            # A room may be waiting for the second participant while the
+            # first participant is already playing.  Do not interrupt that
+            # single player's playback just because the pair is not eligible.
+            return
         else:
             previous = runtime.get("previous") or {}
             changed = {

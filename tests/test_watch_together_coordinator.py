@@ -206,6 +206,13 @@ class WatchTogetherCoordinatorTests(unittest.TestCase):
         self.coordinator.poll_once(now=3)
         self.assertEqual(self.coordinator.runtime[self.room["id"]]["state"], "waiting")
 
+    def test_single_active_player_waiting_does_not_pause(self):
+        self.api.sessions[1]["PlayState"]["IsStopped"] = True
+        self.coordinator.poll_once(now=0)
+        runtime = self.coordinator.runtime[self.room["id"]]
+        self.assertEqual(runtime["state"], "waiting")
+        self.assertEqual(self.api.commands, [])
+
     def test_pause_propagates_and_primary_wins_same_round(self):
         rid = self.room["id"]
         self.enter_watching()
