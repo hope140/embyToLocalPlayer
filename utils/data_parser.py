@@ -5,6 +5,7 @@ import re
 import urllib.parse
 
 from utils.configs import configs, MyLogger
+from utils.emby_session_api import derive_control_device_id
 from utils.net_tools import multi_thread_requests, requests_urllib, get_redirect_url
 from utils.tools import (show_version_info, main_ep_to_title, main_ep_intro_time, logger_setup, version_prefer_emby,
                          match_version_range, sub_via_other_media_version, force_disk_mode_by_path,
@@ -284,6 +285,11 @@ def parse_received_data_emby(received_data):
         media_title=media_title,
         play_session_id=play_session_id,
         device_id=device_id,
+        # Keep the browser identity for media URLs, but expose a deterministic
+        # per-playback control identity for the optional watch-together client.
+        browser_device_id=device_id,
+        watch_together_device_id=derive_control_device_id(device_id, play_session_id)
+        if is_emby else '',
         headers=headers,
         item_id=item_id,
         media_source_id=media_source_id,

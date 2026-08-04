@@ -11,6 +11,7 @@ from utils.net_tools import (get_redirect_url, requests_urllib, realtime_playing
                              update_server_playback_progress, sync_third_party_for_eps, check_miss_runtime_start_sec)
 from utils.players import start_player_func_dict, playlist_func_dict, stop_sec_func_dict, prefetch_data
 from utils.tools import activate_window_by_pid
+from utils.watch_together_client import WatchTogetherClient
 
 logger = MyLogger()
 
@@ -29,6 +30,7 @@ class BaseInit:
         self.playing_feedback_stop_event = threading.Event()
         self.playing_feedback_request_lock = threading.Lock()
         self.playing_feedback_thread = None
+        self.watch_together_client = None
 
 
 class BaseManager(BaseInit):
@@ -205,17 +207,56 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
 
     def start_realtime_playing_feedback(self):
         self.playing_feedback_stop_event.clear()
+        # When the independent control session is active it owns all
+        # real-time Playing/Progress events.  Avoid sending a second stream
+        # through the browser's captured Authorization headers.
+        self.start_watch_together()
+        if self.watch_together_client is not None:
+            return
         self.playing_feedback_thread = threading.Thread(
             target=self.realtime_playing_feedback_loop, daemon=True)
         self.playing_feedback_thread.start()
 
     def stop_realtime_playing_feedback(self):
+        # The watch-together client owns a separate Emby control session.  Send
+        # its final Stopped event before joining/closing the ordinary feedback
+        # worker so no control session is left behind.
+        self.stop_watch_together()
         self.playing_feedback_stop_event.set()
         # 等待正在发送的 Progress 完成；之后所有待发送请求都会因 stop_event 被丢弃。
         with self.playing_feedback_request_lock:
             pass
         if self.playing_feedback_thread:
             self.playing_feedback_thread.join(timeout=2)
+
+    def start_watch_together(self):
+        """Start optional remote control for the current mpv/IINA instance."""
+
+        if self.watch_together_client is not None:
+            return self.watch_together_client
+        if self.player_name not in ('mpv', 'iina') or self.data.get('server') != 'emby':
+            return None
+        mpv = self.player_kwargs.get('mpv')
+        if not mpv:
+            return None
+        try:
+            client = WatchTogetherClient(data=self.data, player=mpv)
+            if client.start():
+                self.watch_together_client = client
+            return client
+        except Exception as exc:
+            # Optional control must never prevent ordinary local playback.
+            logger.info(f'watch-together unavailable: {str(exc)[:120]}')
+            return None
+
+    def stop_watch_together(self):
+        client, self.watch_together_client = self.watch_together_client, None
+        if client is None:
+            return
+        try:
+            client.stop()
+        except Exception as exc:
+            logger.info(f'watch-together stop failed: {str(exc)[:120]}')
 
     def send_realtime_playing_feedback(self, **kwargs):
         with self.playing_feedback_request_lock:
