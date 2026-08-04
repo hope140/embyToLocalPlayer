@@ -3,7 +3,7 @@
 // @name:zh-CN   embyToLocalPlayer
 // @name:en      embyToLocalPlayer
 // @namespace    https://github.com/kjtsune/embyToLocalPlayer
-// @version      2026.08.04.2
+// @version      2026.08.04.3
 // @updateURL    https://raw.githubusercontent.com/hope140/embyToLocalPlayer/watch_together/user_script/embyToLocalPlayer.user.js
 // @downloadURL  https://raw.githubusercontent.com/hope140/embyToLocalPlayer/watch_together/user_script/embyToLocalPlayer.user.js
 // @description  Emby/Jellyfin 调用外部本地播放器，并回传播放记录。适配 Plex。
@@ -478,26 +478,72 @@
         const style = document.createElement('style');
         style.id = 'etlp-watch-together-style';
         style.textContent = `
-            #${WATCH_TOGETHER_PAGE_ID} { box-sizing:border-box; min-height:100%; padding:5.5em 1.25em 1.25em; color:currentColor; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-content { width:min(960px, 100%); margin:0 auto; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-header { display:flex; align-items:center; gap:.75em; margin-bottom:1.25em; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-title { margin:0; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-status { margin-bottom:1em; padding:.75em 1em; border:1px solid currentColor; border-radius:.35em; white-space:pre-wrap; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1em; padding:1em; border:1px solid currentColor; border-radius:.35em; }
+            #${WATCH_TOGETHER_PAGE_ID} {
+                box-sizing:border-box;
+                min-height:100%;
+                padding:5.5em 1.5em 2.5em;
+                color:currentColor;
+                --etlp-wt-border:color-mix(in srgb, currentColor 28%, transparent);
+                --etlp-wt-surface:color-mix(in srgb, currentColor 5%, transparent);
+                --etlp-wt-muted:color-mix(in srgb, currentColor 70%, transparent);
+            }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-content { width:min(1040px, 100%); margin:0 auto; display:grid; gap:1.25em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-header { display:flex; align-items:flex-start; gap:1em; margin-bottom:.25em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-header .button-link { flex:0 0 auto; margin-top:.25em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-title-group { min-width:0; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-title { margin:0; line-height:1.15; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-subtitle { margin:.35em 0 0; color:var(--etlp-wt-muted, currentColor); }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-status {
+                margin:0;
+                padding:.8em 1em;
+                border:1px solid currentColor;
+                border-color:var(--etlp-wt-border, currentColor);
+                border-radius:.45em;
+                background:transparent;
+                background:var(--etlp-wt-surface, transparent);
+                white-space:pre-wrap;
+            }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-section {
+                border:1px solid currentColor;
+                border-color:var(--etlp-wt-border, currentColor);
+                border-radius:.5em;
+                background:transparent;
+                background:var(--etlp-wt-surface, transparent);
+            }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-section-header { display:flex; align-items:baseline; justify-content:space-between; gap:1em; padding:1.1em 1.25em .9em; border-bottom:1px solid currentColor; border-bottom-color:var(--etlp-wt-border, currentColor); }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-section-title { margin:0; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-section-description { margin:.3em 0 0; color:var(--etlp-wt-muted, currentColor); }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-section-heading { min-width:0; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room-count { flex:0 0 auto; color:var(--etlp-wt-muted, currentColor); font-size:.9em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1em; padding:1.25em; border:0; }
             #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-field { display:grid; gap:.35em; min-width:0; }
             #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-field-wide { grid-column:1 / -1; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form input, #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form select { box-sizing:border-box; width:100%; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-actions { display:flex; flex-wrap:wrap; gap:.5em; margin-top:.75em; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-rooms { display:grid; gap:.75em; margin-top:1.25em; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room { padding:1em; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room h3 { margin:0 0 .5em; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room p { margin:.25em 0; }
-            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-empty { margin:1em 0 0; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-field-hint { color:var(--etlp-wt-muted, currentColor); font-size:.9em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form input, #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form select { box-sizing:border-box; width:100%; min-height:2.6em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form .button-submit { min-height:2.8em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-rooms { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:1em; padding:1.25em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room { min-width:0; padding:1.1em; border:1px solid currentColor; border-color:var(--etlp-wt-border, currentColor); border-radius:.45em; background:transparent; background:var(--etlp-wt-surface, transparent); }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room-header { display:flex; align-items:flex-start; justify-content:space-between; gap:.75em; margin-bottom:1em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room-title { min-width:0; margin:0; overflow-wrap:anywhere; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room-status { display:inline-flex; align-items:center; flex:0 0 auto; max-width:100%; padding:.3em .6em; border:1px solid currentColor; border-radius:999px; font-size:.85em; line-height:1.2; overflow-wrap:anywhere; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room-status.etlp-wt-state-watching { font-weight:700; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room-status.etlp-wt-state-error, #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room-status.etlp-wt-state-unavailable { border-style:dashed; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-meta { display:grid; gap:.35em; margin:0; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-meta-row { display:grid; grid-template-columns:auto minmax(0,1fr); gap:.75em; margin:0; padding:.45em 0; border-top:1px solid currentColor; border-top-color:var(--etlp-wt-border, currentColor); }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-meta-label { color:var(--etlp-wt-muted, currentColor); }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-meta-value { min-width:0; overflow-wrap:anywhere; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-actions { display:flex; flex-wrap:wrap; align-items:center; gap:.5em; margin-top:1em; padding-top:1em; border-top:1px solid currentColor; border-top-color:var(--etlp-wt-border, currentColor); }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-delete { margin-left:auto; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-empty { grid-column:1 / -1; margin:0; color:var(--etlp-wt-muted, currentColor); }
             #${WATCH_TOGETHER_PAGE_ID} button:disabled, #${WATCH_TOGETHER_PAGE_ID} select:disabled, #${WATCH_TOGETHER_PAGE_ID} input:disabled { cursor:wait; opacity:.55; }
             @media (max-width: 600px) {
                 #${WATCH_TOGETHER_PAGE_ID} { padding:4.5em 1em 1.5em; }
                 #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form { grid-template-columns:1fr; }
                 #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-field-wide { grid-column:auto; }
+                #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-section-header { align-items:flex-start; flex-direction:column; gap:.35em; }
+                #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-rooms { grid-template-columns:1fr; padding:1em; }
+                #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room-header { flex-direction:column; }
+                #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room-status { align-self:flex-start; }
             }
         `;
         (document.head || document.documentElement).appendChild(style);
@@ -667,10 +713,22 @@
         const backButton = watchTogetherElement('button', '返回', 'emby-button button-link');
         backButton.type = 'button';
         backButton.setAttribute('aria-label', '返回 Emby 页面');
+        const titleGroup = watchTogetherElement('div', null, 'etlp-wt-title-group');
         const heading = watchTogetherElement('h1', '同步观看', 'etlp-wt-title');
-        header.append(backButton, heading);
+        const subtitle = watchTogetherElement('p', '在不同设备之间共享播放进度，保持观看节奏一致。', 'etlp-wt-subtitle');
+        titleGroup.append(heading, subtitle);
+        header.append(backButton, titleGroup);
         const status = watchTogetherElement('div', '正在连接本地服务…', 'etlp-wt-status');
         status.setAttribute('role', 'status');
+        status.setAttribute('aria-live', 'polite');
+
+        const createSection = watchTogetherElement('section', null, 'etlp-wt-section etlp-wt-create-section');
+        const createHeader = watchTogetherElement('div', null, 'etlp-wt-section-header');
+        const createHeadingGroup = watchTogetherElement('div', null, 'etlp-wt-section-heading');
+        const createHeading = watchTogetherElement('h2', '创建房间', 'etlp-wt-section-title');
+        const createDescription = watchTogetherElement('p', '选择两位用户和初始主用户，创建一个同步观看空间。', 'etlp-wt-section-description');
+        createHeadingGroup.append(createHeading, createDescription);
+        createHeader.appendChild(createHeadingGroup);
         const form = watchTogetherElement('form', null, 'etlp-wt-form');
         const nameLabel = watchTogetherElement('label', '房间名称', 'etlp-wt-field etlp-wt-field-wide');
         const nameInput = watchTogetherElement('input');
@@ -678,7 +736,9 @@
         nameInput.type = 'text';
         nameInput.maxLength = 120;
         nameInput.required = true;
-        nameLabel.appendChild(nameInput);
+        nameInput.placeholder = '例如：周末电影';
+        const nameHint = watchTogetherElement('span', '房间名称会显示给参与者。', 'etlp-wt-field-hint');
+        nameLabel.append(nameInput, nameHint);
         const userALabel = watchTogetherElement('label', '用户 A', 'etlp-wt-field');
         const userA = watchTogetherElement('select');
         userA.className = 'emby-select';
@@ -694,9 +754,20 @@
         const createButton = watchTogetherElement('button', '创建房间', 'emby-button raised button-submit etlp-wt-field-wide');
         createButton.type = 'submit';
         form.append(nameLabel, userALabel, userBLabel, primaryLabel, createButton);
-        const roomsHeading = watchTogetherElement('h2', '已有房间');
+        createSection.append(createHeader, form);
+
+        const roomsSection = watchTogetherElement('section', null, 'etlp-wt-section etlp-wt-rooms-section');
+        const roomsHeader = watchTogetherElement('div', null, 'etlp-wt-section-header');
+        const roomsHeadingGroup = watchTogetherElement('div', null, 'etlp-wt-section-heading');
+        const roomsHeading = watchTogetherElement('h2', '已有房间', 'etlp-wt-section-title');
+        const roomsDescription = watchTogetherElement('p', '查看房间参与者和运行状态，或执行同步操作。', 'etlp-wt-section-description');
+        roomsHeadingGroup.append(roomsHeading, roomsDescription);
+        const roomCount = watchTogetherElement('span', '0 个房间', 'etlp-wt-room-count');
+        roomCount.setAttribute('aria-live', 'polite');
+        roomsHeader.append(roomsHeadingGroup, roomCount);
         const rooms = watchTogetherElement('div', null, 'etlp-wt-rooms');
-        content.append(header, status, form, roomsHeading, rooms);
+        roomsSection.append(roomsHeader, rooms);
+        content.append(header, status, createSection, roomsSection);
         page.appendChild(content);
         state.status = status;
         state.form = form;
@@ -705,6 +776,7 @@
         state.userB = userB;
         state.primary = primary;
         state.createButton = createButton;
+        state.roomCount = roomCount;
         state.rooms = rooms;
         state.close = restore => watchTogetherCleanupState(state, restore);
         state.onKeydown = event => {
@@ -805,29 +877,49 @@
         return runtimeError ? `${label}：${runtimeError}` : label;
     }
 
+    function watchTogetherStatusKey(state) {
+        const value = String(state || 'waiting').toLowerCase();
+        return ['waiting', 'barrier', 'watching', 'unavailable', 'error'].includes(value) ? value : 'unknown';
+    }
+
     function watchTogetherRenderRooms(state, roomList, runtimeList) {
         if (!watchTogetherStateIsCurrent(state)) return;
         state.runtime = Array.isArray(runtimeList) ? runtimeList : [];
         const runtimeByRoom = new Map(state.runtime.map(item => [String(item.room_id), item]));
         const usersById = new Map(state.users.map(user => [user.id, user.name]));
         state.rooms.textContent = '';
-        if (!Array.isArray(roomList) || roomList.length === 0) {
+        const validRooms = Array.isArray(roomList) ? roomList.filter(room => room && room.id) : [];
+        if (state.roomCount) state.roomCount.textContent = `${validRooms.length} 个房间`;
+        if (validRooms.length === 0) {
             state.rooms.appendChild(watchTogetherElement('p', '暂无房间，请先创建一个房间。', 'etlp-wt-empty'));
             return;
         }
-        roomList.forEach(room => {
-            if (!room || !room.id) return;
+        validRooms.forEach(room => {
             const roomId = String(room.id);
             const card = watchTogetherElement('article', null, 'etlp-wt-room');
-            const title = watchTogetherElement('h3', String(room.name || '未命名房间'));
+            const roomHeader = watchTogetherElement('div', null, 'etlp-wt-room-header');
+            const title = watchTogetherElement('h3', String(room.name || '未命名房间'), 'etlp-wt-room-title');
             const participantNames = Array.isArray(room.participant_user_ids)
                 ? room.participant_user_ids.map(userId => usersById.get(String(userId)) || String(userId))
                 : [];
-            const participants = watchTogetherElement('p', `参与者：${participantNames.join('、') || '未知'}`);
+            const participants = watchTogetherElement('p', null, 'etlp-wt-meta-row');
+            participants.append(
+                watchTogetherElement('span', '参与者：', 'etlp-wt-meta-label'),
+                watchTogetherElement('span', participantNames.join('、') || '未知', 'etlp-wt-meta-value'),
+            );
             const primaryName = usersById.get(String(room.primary_user_id)) || String(room.primary_user_id || '未知');
-            const primary = watchTogetherElement('p', `主用户：${primaryName}`);
+            const primary = watchTogetherElement('p', null, 'etlp-wt-meta-row');
+            primary.append(
+                watchTogetherElement('span', '主用户：', 'etlp-wt-meta-label'),
+                watchTogetherElement('span', primaryName, 'etlp-wt-meta-value'),
+            );
             const runtime = runtimeByRoom.get(roomId) || {};
-            const status = watchTogetherElement('p', `运行状态：${watchTogetherStatusLabel(runtime.state, runtime.error)}`);
+            const statusKey = watchTogetherStatusKey(runtime.state);
+            const status = watchTogetherElement('span', `运行状态：${watchTogetherStatusLabel(runtime.state, runtime.error)}`, `etlp-wt-room-status etlp-wt-state-${statusKey}`);
+            status.setAttribute('role', 'status');
+            roomHeader.append(title, status);
+            const meta = watchTogetherElement('div', null, 'etlp-wt-meta');
+            meta.append(participants, primary);
             const actions = watchTogetherElement('div', null, 'etlp-wt-actions');
             [['pause', '暂停'], ['resume', '继续'], ['resync', '重新同步']].forEach(([action, text]) => {
                 const button = watchTogetherElement('button', text, 'emby-button raised etlp-wt-secondary');
@@ -835,11 +927,11 @@
                 button.addEventListener('click', () => watchTogetherRoomAction(state, roomId, action, button));
                 actions.appendChild(button);
             });
-            const deleteButton = watchTogetherElement('button', '删除', 'emby-button button-link etlp-wt-secondary');
+            const deleteButton = watchTogetherElement('button', '删除', 'emby-button button-link etlp-wt-secondary etlp-wt-delete');
             deleteButton.type = 'button';
             deleteButton.addEventListener('click', () => watchTogetherDeleteRoom(state, roomId, deleteButton));
             actions.appendChild(deleteButton);
-            card.append(title, participants, primary, status, actions);
+            card.append(roomHeader, meta, actions);
             state.rooms.appendChild(card);
         });
     }
