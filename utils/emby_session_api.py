@@ -218,14 +218,13 @@ class EmbySessionApi:
         return None
 
     def declare_capabilities(self, session_id=None, *, full=True, timeout=10):
-        """Advertise only the controls handled by this client."""
+        """Advertise controls for the current device session.
 
-        session_id = session_id or self.session_id
-        if not session_id:
-            session = self.find_session(timeout=timeout)
-            session_id = self.session_id if session else None
-        if not session_id:
-            return None
+        Emby's SessionsService resolves the active session from the request
+        device headers; the capabilities endpoint is intentionally *not*
+        nested below a session id.
+        """
+
         suffix = "Capabilities/Full" if full else "Capabilities"
         payload = {
             "PlayableMediaTypes": ["Video"],
@@ -233,12 +232,12 @@ class EmbySessionApi:
             "SupportsMediaControl": True,
         }
         return self._request(
-            f"Sessions/{urllib.parse.quote(str(session_id), safe='')}/{suffix}",
+            f"Sessions/{suffix}",
             method="POST", payload=payload, timeout=timeout,
         )
 
     def _playback_payload(self, position_sec=None, *, event_name=None,
-                          is_paused=None):
+                          is_paused=None, playback_rate=1.0):
         if position_sec is None:
             position_sec = 0
         try:
@@ -253,6 +252,13 @@ class EmbySessionApi:
             "PlayMethod": "DirectStream",
             "RepeatMode": "RepeatNone",
         }
+        try:
+            playback_rate = float(playback_rate)
+        except (TypeError, ValueError):
+            playback_rate = 1.0
+        if not playback_rate > 0:
+            playback_rate = 1.0
+        payload["PlaybackRate"] = playback_rate
         if event_name:
             payload["EventName"] = event_name
         if is_paused is not None:
@@ -260,30 +266,33 @@ class EmbySessionApi:
         return payload
 
     def report_playing(self, position_sec=0, *, is_paused=False,
-                       event_name="TimeUpdate", timeout=10):
+                       event_name="TimeUpdate", playback_rate=1.0, timeout=10):
         return self._request(
             "Sessions/Playing", method="POST",
             payload=self._playback_payload(
                 position_sec, event_name=event_name, is_paused=is_paused,
+                playback_rate=playback_rate,
             ), timeout=timeout,
         )
 
     def report_progress(self, position_sec=0, *, is_paused=False,
-                        event_name="TimeUpdate", timeout=10):
+                        event_name="TimeUpdate", playback_rate=1.0, timeout=10):
         return self._request(
             "Sessions/Playing/Progress", method="POST",
             payload=self._playback_payload(
                 position_sec, event_name=event_name, is_paused=is_paused,
+                playback_rate=playback_rate,
             ), timeout=timeout,
         )
 
-    def report_stopped(self, position_sec=0, *, is_paused=False, timeout=10):
+    def report_stopped(self, position_sec=0, *, is_paused=False,
+                       playback_rate=1.0, timeout=10):
         # Emby's Stopped endpoint does not require an EventName.  Keeping the
         # payload otherwise identical makes the final position unambiguous.
         return self._request(
             "Sessions/Playing/Stopped", method="POST",
             payload=self._playback_payload(
-                position_sec, is_paused=is_paused,
+                position_sec, is_paused=is_paused, playback_rate=playback_rate,
             ), timeout=timeout,
         )
 

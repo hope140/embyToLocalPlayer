@@ -52,6 +52,7 @@ class WatchTogetherClient:
         self._last_snapshot_at = None
         self._last_position = None
         self._last_pause = None
+        self._last_playback_rate = 1.0
         self._last_heartbeat_at = None
         self._next_connect_at = 0.0
         self._backoff = self.reconnect_min
@@ -208,13 +209,10 @@ class WatchTogetherClient:
         if self._session_capabilities_declared:
             return
         try:
-            session = self.session_api.find_session()
-            session_id = getattr(self.session_api, 'session_id', None)
-            if not session_id and isinstance(session, dict):
-                session_id = session.get('Id') or session.get('SessionId')
-            if session or session_id:
-                self.session_api.declare_capabilities(session_id=session_id, full=True)
-                self._session_capabilities_declared = True
+            # SessionsService selects the current device session from the
+            # explicit headers; Capabilities/Full has no session-id segment.
+            self.session_api.declare_capabilities(full=True)
+            self._session_capabilities_declared = True
         except Exception as exc:
             logger.info(f'watch-together capabilities unavailable: {str(exc)[:120]}')
 
@@ -302,14 +300,21 @@ class WatchTogetherClient:
         except (TypeError, ValueError, AttributeError):
             return False
         paused = bool(snapshot.get('is_paused', False))
+        try:
+            playback_rate = float(snapshot.get('playback_rate', 1.0))
+        except (TypeError, ValueError):
+            playback_rate = 1.0
+        if not playback_rate > 0:
+            playback_rate = 1.0
         if self._last_snapshot is None:
             self._last_snapshot = dict(snapshot)
             self._last_position = position
             self._last_pause = paused
+            self._last_playback_rate = playback_rate
             self._last_report_at = now
             self._last_snapshot_at = now
             return self._report(
-                'report_playing', position, paused, 'TimeUpdate',
+                'report_playing', position, paused, 'TimeUpdate', playback_rate,
             )
 
         previous_position = self._last_position
@@ -322,25 +327,31 @@ class WatchTogetherClient:
                     + (0.0 if previous_pause else elapsed_since_snapshot))
         seeked = abs(position - expected) >= self.seek_threshold
         pause_changed = paused != previous_pause
+        rate_changed = playback_rate != self._last_playback_rate
         due = elapsed_since_report >= self.report_interval
         event_name = 'TimeUpdate'
         if pause_changed:
             event_name = 'Pause' if paused else 'Unpause'
-        if pause_changed or seeked or due or force:
-            result = self._report('report_progress', position, paused, event_name)
+        elif rate_changed:
+            event_name = 'PlaybackRateChange'
+        if pause_changed or rate_changed or seeked or due or force:
+            result = self._report(
+                'report_progress', position, paused, event_name, playback_rate,
+            )
             self._last_report_at = now
         else:
             result = False
         self._last_snapshot = dict(snapshot)
         self._last_position = position
         self._last_pause = paused
+        self._last_playback_rate = playback_rate
         self._last_snapshot_at = now
         return result
 
     def _report_snapshot(self, force=False):
         return self.publish_snapshot(self._snapshot(), force=force)
 
-    def _report(self, method_name, position, paused, event_name):
+    def _report(self, method_name, position, paused, event_name, playback_rate=1.0):
         with self._report_lock:
             try:
                 method = getattr(self.session_api, method_name)
@@ -348,8 +359,22 @@ class WatchTogetherClient:
                     position_sec=position,
                     is_paused=paused,
                     event_name=event_name,
+                    playback_rate=playback_rate,
                 )
                 return True
+            except TypeError:
+                # Keep compatibility with small session fakes written before
+                # PlaybackRate was added to the API.
+                try:
+                    method(
+                        position_sec=position,
+                        is_paused=paused,
+                        event_name=event_name,
+                    )
+                    return True
+                except Exception as exc:
+                    logger.info(f'watch-together {method_name} failed: {str(exc)[:120]}')
+                    return False
             except Exception as exc:
                 logger.info(f'watch-together {method_name} failed: {str(exc)[:120]}')
                 return False
@@ -362,13 +387,35 @@ class WatchTogetherClient:
             if snapshot:
                 position = snapshot.get('position_sec', self._last_position or 0)
                 paused = bool(snapshot.get('is_paused', self._last_pause or False))
+                try:
+                    playback_rate = float(snapshot.get('playback_rate', self._last_playback_rate))
+                except (TypeError, ValueError):
+                    playback_rate = self._last_playback_rate
             else:
                 position = self._last_position or 0
                 paused = bool(self._last_pause)
+                playback_rate = self._last_playback_rate
+            if not playback_rate > 0:
+                playback_rate = 1.0
             try:
-                self.session_api.report_stopped(position_sec=position, is_paused=paused)
+                self.session_api.report_stopped(
+                    position_sec=position,
+                    is_paused=paused,
+                    playback_rate=playback_rate,
+                )
                 self._stopped_reported = True
                 return True
+            except TypeError:
+                try:
+                    self.session_api.report_stopped(
+                        position_sec=position,
+                        is_paused=paused,
+                    )
+                    self._stopped_reported = True
+                    return True
+                except Exception as exc:
+                    logger.info(f'watch-together stopped report failed: {str(exc)[:120]}')
+                    return False
             except Exception as exc:
                 logger.info(f'watch-together stopped report failed: {str(exc)[:120]}')
                 return False
@@ -453,7 +500,7 @@ class WatchTogetherClient:
         text = args.get('Text') or args.get('Message') or args.get('Header')
         if text is None:
             return False
-        duration = args.get('Timeout') or args.get('Duration') or 5000
+        duration = args.get('TimeoutMs') or args.get('Timeout') or args.get('Duration') or 5000
         try:
             duration = int(duration)
         except (TypeError, ValueError):

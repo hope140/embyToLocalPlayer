@@ -49,6 +49,12 @@ def get_mpv_snapshot(mpv):
     else:
         paused = bool(paused)
     try:
+        playback_rate = float(mpv.command('get_property', 'speed') or 1.0)
+    except Exception:
+        playback_rate = 1.0
+    if not playback_rate > 0:
+        playback_rate = 1.0
+    try:
         position = float(position) if position is not None else None
     except (TypeError, ValueError):
         position = None
@@ -63,6 +69,7 @@ def get_mpv_snapshot(mpv):
         'is_paused': paused,
         'duration_sec': max(0.0, duration) if duration is not None else None,
         'media_title': media_title,
+        'playback_rate': playback_rate,
     }
 
 

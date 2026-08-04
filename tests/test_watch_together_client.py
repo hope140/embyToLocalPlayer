@@ -1,12 +1,15 @@
 import json
+import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 from utils.emby_session_api import (
     EmbySessionApi,
     derive_control_device_id,
 )
+from utils.players import get_mpv_snapshot
 from utils.watch_together_client import WatchTogetherClient
 
 
@@ -15,6 +18,7 @@ class FakePlayer:
         self.position = 10.0
         self.paused = False
         self.duration = 120.0
+        self.speed = 1.0
         self.commands = []
 
     def command(self, *args):
@@ -27,6 +31,8 @@ class FakePlayer:
             return self.duration
         if args[:2] == ('get_property', 'media-title'):
             return 'episode.mkv'
+        if args[:2] == ('get_property', 'speed'):
+            return self.speed
         if args[:2] == ('set_property', 'pause'):
             self.paused = bool(args[2])
         elif args and args[0] == 'seek':
@@ -113,6 +119,25 @@ class EmbySessionApiTests(unittest.TestCase):
         self.assertNotIn('Authorization', headers)
         self.assertNotIn('Cookie', headers)
 
+    def test_capabilities_endpoint_has_no_session_id(self):
+        requests = []
+
+        def request(url, **kwargs):
+            requests.append((url, kwargs))
+            return {}
+
+        api = EmbySessionApi({
+            'scheme': 'https', 'netloc': 'media.test', 'api_key': 'token',
+            'device_id': 'browser', 'play_session_id': 'one',
+        }, request_func=request)
+        api.declare_capabilities(session_id='must-not-be-in-url')
+        self.assertTrue(requests[0][0].endswith('/emby/Sessions/Capabilities/Full'))
+        self.assertNotIn('must-not-be-in-url', requests[0][0])
+        self.assertEqual(
+            requests[0][1]['_json']['SupportedCommands'],
+            ['Pause', 'Unpause', 'Seek', 'DisplayMessage'],
+        )
+
 
 class WatchTogetherClientTests(unittest.TestCase):
     def setUp(self):
@@ -143,7 +168,7 @@ class WatchTogetherClientTests(unittest.TestCase):
         self.assertTrue(self.client.handle_message(json.dumps({
             'MessageType': 'GeneralCommand',
             'Data': json.dumps({'Name': 'DisplayMessage',
-                                'Arguments': {'Text': 'hello', 'Timeout': 1000}}),
+                                'Arguments': {'Text': 'hello', 'TimeoutMs': 1000}}),
         })))
         self.assertIn(('show-text', 'hello', 1000), self.player.commands)
 
@@ -160,8 +185,62 @@ class WatchTogetherClientTests(unittest.TestCase):
             {'position_sec': 40, 'is_paused': True}, now=2,
         ))
         self.assertEqual(self.api.reports[-1][1]['event_name'], 'TimeUpdate')
-        self.client.stop()
-        self.assertEqual(self.api.reports[-1][0], 'stopped')
+
+    def test_playback_rate_is_reported_immediately(self):
+        self.client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False, 'playback_rate': 1.0}, now=0,
+        )
+        self.assertTrue(self.client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False, 'playback_rate': 1.5}, now=1,
+        ))
+        self.assertEqual(self.api.reports[-1][1]['event_name'], 'PlaybackRateChange')
+        self.assertEqual(self.api.reports[-1][1]['playback_rate'], 1.5)
+
+    def test_snapshot_reads_speed_and_defaults_to_one(self):
+        self.player.speed = 1.75
+        self.assertEqual(get_mpv_snapshot(self.player)['playback_rate'], 1.75)
+        self.player.speed = None
+        self.assertEqual(get_mpv_snapshot(self.player)['playback_rate'], 1.0)
+
+    def test_reconnects_after_socket_disconnect_and_stops_all_sockets(self):
+        sockets = []
+
+        class DisconnectSocket(FakeWebSocket):
+            def recv(self):
+                raise ConnectionError('closed by server')
+
+        class StableSocket(FakeWebSocket):
+            def recv(self):
+                raise TimeoutError()
+
+        def factory(*_args, **_kwargs):
+            ws = DisconnectSocket() if not sockets else StableSocket()
+            sockets.append(ws)
+            return ws
+
+        client = WatchTogetherClient(
+            {'server': 'emby', 'watch_together_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+            ws_factory=factory, reconnect_min=0.01, reconnect_max=0.02,
+            ws_timeout=0.05, heartbeat_interval=100,
+        )
+        self.assertTrue(client.start())
+        deadline = time.time() + 1
+        while len(sockets) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(len(sockets), 2)
+        client.stop(timeout=1)
+        self.assertIsNone(client.thread)
+        self.assertTrue(all(socket.closed for socket in sockets))
+
+    def test_missing_websocket_dependency_degrades_without_thread(self):
+        client = WatchTogetherClient(
+            {'server': 'emby', 'watch_together_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+        )
+        with mock.patch.dict(sys.modules, {'websocket': None}):
+            self.assertFalse(client.start())
+        self.assertIsNone(client.thread)
 
     def test_normal_progress_does_not_look_like_a_seek(self):
         self.client.publish_snapshot({'position_sec': 10, 'is_paused': False}, now=0)
