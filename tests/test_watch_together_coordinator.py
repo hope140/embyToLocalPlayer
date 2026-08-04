@@ -88,6 +88,29 @@ class WatchTogetherCoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(selected["u1"]["Id"], "s1")
 
+    def test_session_filter_accepts_legacy_identity_without_prefix(self):
+        legacy = self.api.session("u1", "legacy", 4)
+        legacy["DeviceId"] = "browser-device"
+        selected = self.coordinator.select_control_sessions(
+            [legacy, self.api.sessions[1]], ["u1", "u2"]
+        )
+        self.assertEqual(selected["u1"]["Id"], "legacy")
+
+    def test_session_filter_accepts_token_identity_and_prefix_wins(self):
+        legacy = self.api.session("u1", "legacy", 4)
+        legacy["DeviceId"] = "legacy-device"
+        legacy["LastActivityDate"] = "2026-01-01T00:00:00Z"
+        token_session = self.api.session(
+            "u1", "token", 5, device="embyToLocalPlayer"
+        )
+        token_session["Client"] = "Emby Web"
+        token_session["DeviceId"] = "etlp-wt-token"
+        token_session["LastActivityDate"] = "2025-01-01T00:00:00Z"
+        selected = self.coordinator.select_control_sessions(
+            [legacy, token_session, self.api.sessions[1]], ["u1", "u2"]
+        )
+        self.assertEqual(selected["u1"]["Id"], "token")
+
     def test_session_filter_prefers_active_older_session_over_newer_stale(self):
         active = self.api.session("u1", "active", 4)
         active["LastActivityDate"] = "2025-01-01T00:00:00Z"

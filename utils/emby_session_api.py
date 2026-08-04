@@ -18,6 +18,12 @@ logger = MyLogger()
 
 CONTROL_DEVICE_PREFIX = "etlp-wt-"
 CONTROL_DEVICE_VERSION = "1.0"
+# Emby Web access tokens carry this authentication identity.  Keep the
+# control DeviceId independent (it is still derived per playback), but use the
+# token's app/device names so HTTP check-ins and the token-bound WebSocket
+# resolve to one server-side Session.
+DEFAULT_AUTH_CLIENT_NAME = "Emby Web"
+DEFAULT_AUTH_DEVICE_NAME = "embyToLocalPlayer"
 SUPPORTED_COMMANDS = ("Pause", "Unpause", "Seek", "DisplayMessage")
 
 
@@ -92,7 +98,8 @@ class EmbySessionApi:
     """HTTP helpers for one independent Emby playback/control session."""
 
     def __init__(self, data=None, *, request_func=None, control_device_id=None,
-                 client_name="embyToLocalPlayer", device_name="watch-together",
+                 client_name=DEFAULT_AUTH_CLIENT_NAME,
+                 device_name=DEFAULT_AUTH_DEVICE_NAME,
                  client_version=CONTROL_DEVICE_VERSION, scheme="", netloc="",
                  api_key="", user_id="", item_id="", media_source_id="",
                  play_session_id="", browser_device_id="", host=""):
@@ -151,9 +158,34 @@ class EmbySessionApi:
             or data.get("control_device_id")
             or derive_control_device_id(self.browser_device_id, self.play_session_id)
         )
-        self.client_name = client_name
-        self.device_name = device_name
-        self.client_version = client_version
+        # Explicit auth identity fields are useful for Emby-compatible
+        # deployments whose token was issued by a branded client.  They are
+        # values only (never browser headers or credentials), and all HTTP/WS
+        # paths below consume the same resolved tuple.
+        self.client_name = str(
+            data.get(
+                "auth_client_name",
+                data.get("client_name", data.get("app_name", client_name)),
+            )
+            or client_name
+        )
+        self.device_name = str(
+            data.get("auth_device_name", data.get("device_name", device_name))
+            or device_name
+        )
+        self.client_version = str(
+            data.get(
+                "auth_client_version",
+                data.get(
+                    "client_version",
+                    data.get(
+                        "app_version",
+                        data.get("server_version", client_version),
+                    ),
+                ),
+            )
+            or client_version
+        )
         self.request_func = request_func or requests_urllib
         self.session_id = None
 

@@ -29,6 +29,8 @@ MAX_RUNTIME_DIFFERENCE_TICKS = 3 * TICKS_PER_SECOND
 CONTROL_CLIENT = "embyToLocalPlayer"
 CONTROL_DEVICE_NAME = "watch-together"
 CONTROL_DEVICE_PREFIX = "etlp-wt-"
+TOKEN_AUTH_CLIENT = "Emby Web"
+TOKEN_AUTH_DEVICE_NAME = "embyToLocalPlayer"
 
 
 class WatchTogetherApiError(RuntimeError):
@@ -538,13 +540,25 @@ class WatchTogetherCoordinator:
     def _is_control_session(session):
         if not isinstance(session, dict):
             return False
+        client = str(session.get("Client", ""))
+        device_name = str(session.get("DeviceName", ""))
+        device_id = str(session.get("DeviceId", ""))
+        # The deterministic control id is the strongest binding.  Keep both
+        # identity pairs for servers that omit DeviceId or retain older
+        # sessions after an upgrade from the custom client identity.
         return (
-            str(session.get("Client", "")) == CONTROL_CLIENT
-            and (
-                str(session.get("DeviceName", "")) == CONTROL_DEVICE_NAME
-                or str(session.get("DeviceId", "")).startswith(CONTROL_DEVICE_PREFIX)
-            )
+            device_id.startswith(CONTROL_DEVICE_PREFIX)
+            or (client == CONTROL_CLIENT and device_name == CONTROL_DEVICE_NAME)
+            or (client == TOKEN_AUTH_CLIENT and device_name == TOKEN_AUTH_DEVICE_NAME)
         )
+
+    @staticmethod
+    def _control_session_priority(session):
+        """Prefer a deterministic watch-together DeviceId over legacy ids."""
+
+        if not isinstance(session, dict):
+            return 0
+        return int(str(session.get("DeviceId", "")).startswith(CONTROL_DEVICE_PREFIX))
 
     @classmethod
     def _select_sessions(cls, sessions, user_ids):
@@ -628,12 +642,12 @@ class WatchTogetherCoordinator:
                 ):
                     by_session_id[session_id] = value
             values = list(by_session_id.values())
-            max_activity = max(
-                _timestamp(value.get("LastActivityDate")) for value in values
+            max_selection = max(
+                cls._session_selection_key(value) for value in values
             )
             latest = [
                 value for value in values
-                if _timestamp(value.get("LastActivityDate")) == max_activity
+                if cls._session_selection_key(value) == max_selection
             ]
             # A missing timestamp is 0.0.  It is sufficient for a lone
             # candidate, but cannot break a tie between multiple sessions.
@@ -712,7 +726,11 @@ class WatchTogetherCoordinator:
         ).lower()
         stopped = bool(play_state.get("IsStopped")) or state_name == "stopped"
         active = bool(session_id and item_id and not stopped)
-        return (1 if active else 0, _timestamp(session.get("LastActivityDate")))
+        return (
+            1 if active else 0,
+            WatchTogetherCoordinator._control_session_priority(session),
+            _timestamp(session.get("LastActivityDate")),
+        )
 
     @classmethod
     def select_control_sessions(cls, sessions, user_ids):

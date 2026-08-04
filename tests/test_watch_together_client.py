@@ -15,6 +15,7 @@ from utils.emby_session_api import (
     EmbySessionApi,
     derive_control_device_id,
 )
+from utils.data_parser import _extract_auth_identity
 from utils.players import get_mpv_snapshot
 import utils.watch_together_client as watch_together_client_module
 from utils.watch_together_client import WatchTogetherClient
@@ -153,6 +154,66 @@ class EmbySessionApiTests(unittest.TestCase):
         self.assertIn('X-Emby-User-Id: user-1', api.websocket_headers)
         api.report_playing(position_sec=1)
         self.assertEqual(requests[-1][1]['_json']['UserId'], 'user-1')
+
+    def test_http_and_websocket_share_token_auth_identity_defaults(self):
+        api = EmbySessionApi({
+            'scheme': 'https', 'netloc': 'media.test', 'api_key': 'token',
+            'play_session_id': 'one',
+        })
+        self.assertEqual(api.client_name, 'Emby Web')
+        self.assertEqual(api.device_name, 'embyToLocalPlayer')
+        self.assertEqual(api.auth_headers['X-Emby-Client'], api.client_name)
+        self.assertEqual(api.auth_headers['X-Emby-Device-Name'], api.device_name)
+        self.assertIn(
+            f'X-Emby-Client: {api.client_name}', api.websocket_headers,
+        )
+        self.assertIn(
+            f'X-Emby-Device-Name: {api.device_name}', api.websocket_headers,
+        )
+
+    def test_auth_identity_fields_override_token_compatible_fallback(self):
+        api = EmbySessionApi({
+            'scheme': 'https', 'netloc': 'media.test', 'api_key': 'token',
+            'auth_client_name': 'Brand Web',
+            'auth_device_name': 'brand-player',
+            'auth_client_version': '9.1.0',
+        })
+        self.assertEqual(api.client_name, 'Brand Web')
+        self.assertEqual(api.device_name, 'brand-player')
+        self.assertEqual(api.client_version, '9.1.0')
+        self.assertIn('Client="Brand Web"', api.auth_headers['X-Emby-Authorization'])
+        self.assertIn('Device="brand-player"', api.auth_headers['X-Emby-Authorization'])
+
+    def test_auth_identity_uses_only_scalar_api_client_metadata(self):
+        identity = _extract_auth_identity({
+            '_appName': 'Emby Web',
+            '_deviceName': 'embyToLocalPlayer',
+            '_appVersion': '',
+            '_serverVersion': '4.9.0.30',
+            '_userAuthInfo': {'AccessToken': 'not-read'},
+        })
+        self.assertEqual(identity, {
+            'auth_client_name': 'Emby Web',
+            'auth_device_name': 'embyToLocalPlayer',
+            'auth_client_version': '4.9.0.30',
+        })
+        self.assertEqual(_extract_auth_identity({
+            '_appName': {'nested': 'ignored'},
+            '_deviceName': 'bad\nheader',
+            '_appVersion': object(),
+            '_serverVersion': '1.0',
+        }), {
+            'auth_client_name': '',
+            'auth_device_name': '',
+            'auth_client_version': '1.0',
+        })
+
+    def test_server_version_is_identity_version_fallback(self):
+        api = EmbySessionApi({
+            'scheme': 'https', 'netloc': 'media.test', 'api_key': 'token',
+            'server_version': '4.9.0.30',
+        })
+        self.assertEqual(api.client_version, '4.9.0.30')
 
     def test_websocket_url_preserves_reverse_proxy_prefix(self):
         api = EmbySessionApi({

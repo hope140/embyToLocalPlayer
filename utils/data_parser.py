@@ -14,6 +14,46 @@ from utils.tools import (show_version_info, main_ep_to_title, main_ep_intro_time
 logger = MyLogger()
 
 
+_AUTH_IDENTITY_MAX_LENGTH = 128
+
+
+def _safe_auth_identity_value(value):
+    """Return one bounded, scalar auth-identity value.
+
+    ``ApiClient`` is supplied by the browser integration.  Only the three
+    non-sensitive identity fields are copied; rejecting containers and
+    control characters prevents accidental credential/header propagation.
+    """
+
+    if not isinstance(value, (str, int, float, bool)):
+        return ''
+    value = str(value).strip()
+    if not value or '\r' in value or '\n' in value:
+        return ''
+    return value[:_AUTH_IDENTITY_MAX_LENGTH]
+
+
+def _extract_auth_identity(api_client):
+    """Extract token-compatible identity metadata without reading secrets."""
+
+    if not isinstance(api_client, dict):
+        return {
+            'auth_client_name': '',
+            'auth_device_name': '',
+            'auth_client_version': '',
+        }
+    app_version = _safe_auth_identity_value(api_client.get('_appVersion'))
+    return {
+        'auth_client_name': _safe_auth_identity_value(api_client.get('_appName')),
+        'auth_device_name': _safe_auth_identity_value(api_client.get('_deviceName')),
+        # Emby Web may omit _appVersion; server version is a deterministic
+        # compatibility fallback and is still non-sensitive metadata.
+        'auth_client_version': app_version or _safe_auth_identity_value(
+            api_client.get('_serverVersion')
+        ),
+    }
+
+
 def strm_local_media_path(file_path, source_path):
     """Build the real media path from a .strm file path and its HTTP URL."""
     source_url = urllib.parse.urlparse(source_path)
@@ -101,6 +141,7 @@ def parse_received_data_emby(received_data):
     emby_title = main_ep_to_title(main_ep_info) if not playlist_info else None
     intro_time = main_ep_intro_time(main_ep_info)
     api_client = received_data['ApiClient']
+    auth_identity = _extract_auth_identity(api_client)
     url = urllib.parse.urlparse(received_data['playbackUrl'])
     headers = received_data['request'].get('headers', {})
     is_emby = True if '/emby/' in url.path else False
@@ -307,6 +348,7 @@ def parse_received_data_emby(received_data):
         intro_start=intro_time.get('intro_start'),
         intro_end=intro_time.get('intro_end'),
         server_version=server_version,
+        **auth_identity,
         is_strm=is_strm,
         strm_direct=strm_direct,
         is_http_source=is_http_source,
