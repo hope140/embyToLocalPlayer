@@ -365,13 +365,17 @@ class WatchTogetherCoordinator:
 
     def users_for_ui(self):
         if hasattr(self.api, "get_users_for_ui"):
-            return self.api.get_users_for_ui()
-        users = self._api_call("get_users")
+            users = self.api.get_users_for_ui()
+        else:
+            users = self._api_call("get_users")
         if isinstance(users, dict):
             users = users.get("Items", [])
         return [
-            {"id": str(user["Id"]), "name": str(user.get("Name") or "")}
-            for user in users if isinstance(user, dict) and user.get("Id")
+            {
+                "id": str(user.get("id") or user.get("Id")),
+                "name": str(user.get("name") or user.get("Name") or ""),
+            }
+            for user in users if isinstance(user, dict) and (user.get("id") or user.get("Id"))
         ]
 
     def current_server_id(self):
