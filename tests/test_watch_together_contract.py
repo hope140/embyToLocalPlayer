@@ -36,7 +36,11 @@ class WatchTogetherUiContractTests(unittest.TestCase):
         self.assertEqual(section.get("admin_api_key"), "")
 
     def test_userscript_metadata_menu_endpoints_and_secret_scope(self):
-        self.assertRegex(self.userscript, r"@version\s+2026\.08\.04\b")
+        self.assertRegex(self.userscript, r"@version\s+2026\.08\.04\.1\b")
+        update_url = "https://raw.githubusercontent.com/hope140/embyToLocalPlayer/watch_together/user_script/embyToLocalPlayer.user.js"
+        self.assertIn(f"// @updateURL    {update_url}", self.userscript)
+        self.assertIn(f"// @downloadURL  {update_url}", self.userscript)
+        self.assertIn("2026.08.04-watch_together.1", self.backend_path.parent.joinpath("tools.py").read_text(encoding="utf-8"))
         self.assertIn("同步观看房间", self.userscript)
         endpoints = (
             "/watch-together/auth",

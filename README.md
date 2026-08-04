@@ -39,7 +39,7 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
    [Violentmonkey](https://chrome.google.com/webstore/detail/violent-monkey/jinjaccalgkegednnccohejagnlnfdag)
    已知问题：新版 chrome 可能无法安装。
 2. 安装油猴脚本并刷新 Emby 页面。[发布页](https://greasyfork.org/zh-CN/scripts/448648-embytolocalplayer)
-3. 方案三选一，下载并解压 `.zip` 到任意英文路径。 [发布页](https://github.com/kjtsune/embyToLocalPlayer/releases)
+3. 方案三选一，下载并解压 `.zip` 到任意英文路径。正式构建仍见[发布页](https://github.com/kjtsune/embyToLocalPlayer/releases)；同步观看测试通道使用 [watch_together 分支源码 ZIP](https://github.com/hope140/embyToLocalPlayer/archive/refs/heads/watch_together.zip)。本体自动更新也固定指向该测试分支。
     * 推荐: `etlp-mpv-py-embed-win32.zip` (mpv 播放器 | Windows only | 快捷键见 FAQ)  
       无需修改配置文件，查看下方 `.bat` 运行方法。
     * `etlp-python-embed-win32.zip` (Windows only)  
@@ -182,6 +182,8 @@ https://github.com/kjtsune/embyToLocalPlayer#faq
 1. Windows: `.bat` 按 6  
    Linux / macOS：在 `.ini` 所在的文件夹打开终端，运行 `python3 utils/update.py`
 2. 查看新旧配置的差异字段。`embyToLocalPlayer_diff.ini`
+
+当前测试版本分支为 `watch_together`。`utils/update.py` 只从该分支下载并平铺更新本体，不会覆盖已有 `embyToLocalPlayer_config*` 配置文件；若使用其他历史构建，请按对应版本的更新说明操作。
 
 * 油猴脚本有时也要更新。
 

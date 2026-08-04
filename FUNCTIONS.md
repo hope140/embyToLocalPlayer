@@ -6,7 +6,7 @@
 2. 每项功能支持哪些服务器、播放器和使用方式；
 3. 后续想修改某项功能时，应先看哪些配置和模块。
 
-本文以当前 `main` 分支的代码、`README.md` 和 `embyToLocalPlayer_config.ini` 为准。它不是安装教程，也不替代 README 中的 FAQ。
+本文以当前 `watch_together` 测试分支的代码、`README.md` 和 `embyToLocalPlayer_config.ini` 为准。该分支是同步观看测试通道；它不是安装教程，也不替代 README 中的 FAQ。
 
 ## 1. 状态说明
 
@@ -245,7 +245,7 @@ flowchart LR
 - **临时目录清理**：启动时清理项目临时缓存，并按字幕缓存策略保留必要文件。
 - **日志**：`log_file` 控制日志路径；超过约 10 MB 时重置。`mix_log` 默认模糊域名和密钥等信息。
 - **配置刷新**：本地服务收到请求时会重新读取配置，部分普通配置无需重启；后台线程和监听地址相关配置仍需重启。
-- **更新工具**：`utils/update.py` 用于更新项目，并生成新旧配置差异文件。
+- **更新工具**：`utils/update.py` 固定从 `watch_together` 测试分支更新本体，并生成新旧配置差异文件；不会覆盖已有 `embyToLocalPlayer_config*` 配置文件。
 - **相关模块**：`embyToLocalPlayer.py`、`utils/configs.py`、`utils/tools.py`、`utils/update.py`。
 
 ## 5. 第三方观看记录同步
