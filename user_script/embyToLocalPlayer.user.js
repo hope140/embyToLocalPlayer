@@ -620,7 +620,10 @@
         if (state.onPopState) window.removeEventListener('popstate', state.onPopState);
         if (shouldRestoreCapturedPage) watchTogetherRestoreCapturedPages(state);
         if (state.page && state.page.parentNode) state.page.remove();
-        watchTogetherInvalidateToken(state);
+        if (watchTogetherTokenGeneration === state.generation) {
+            watchTogetherToken = null;
+            watchTogetherTokenGeneration = null;
+        }
         watchTogetherSetNavSelected(Boolean(watchTogetherActiveState && !watchTogetherActiveState.closed));
         watchTogetherScheduleNavigationSync();
     }
