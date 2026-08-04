@@ -3,7 +3,7 @@
 // @name:zh-CN   embyToLocalPlayer
 // @name:en      embyToLocalPlayer
 // @namespace    https://github.com/kjtsune/embyToLocalPlayer
-// @version      2026.02.11
+// @version      2026.08.04
 // @description  Emby/Jellyfin 调用外部本地播放器，并回传播放记录。适配 Plex。
 // @description:zh-CN Emby/Jellyfin 调用外部本地播放器，并回传播放记录。适配 Plex。
 // @description:en  Play in an external player. Update watch history to Emby/Jellyfin server. Support Plex.
@@ -220,6 +220,519 @@
 
         registerAllMenus();
     }
+
+    // --- watch-together administrator UI (Emby only; credentials stay in memory) ---
+    const WATCH_TOGETHER_BASE_URL = 'http://127.0.0.1:58000';
+    const WATCH_TOGETHER_ENDPOINTS = {
+        auth: '/watch-together/auth',
+        list: '/watch-together/rooms/list',
+        create: '/watch-together/rooms/create',
+        action: '/watch-together/rooms/action',
+        delete: '/watch-together/rooms/delete',
+    };
+    const WATCH_TOGETHER_TOKEN_HEADER = 'X-ETLP-Watch-Token';
+    const WATCH_TOGETHER_TIMEOUT_MS = 10000;
+    const WATCH_TOGETHER_MODAL_ID = 'etlp-watch-together-modal';
+    let watchTogetherToken = null;
+    let watchTogetherModalCleanup = null;
+
+    function getWatchTogetherApiClient() {
+        try {
+            if (typeof ApiClient !== 'undefined' && ApiClient) return ApiClient;
+        } catch (_) {
+            // ApiClient may not be defined on a non-Emby page.
+        }
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow.ApiClient) return unsafeWindow.ApiClient;
+        } catch (_) {
+            // Ignore access errors from the page bridge.
+        }
+        return null;
+    }
+
+    function normalizeWatchTogetherServerUrl(value) {
+        if (!value) return null;
+        try {
+            const parsed = new URL(String(value), window.location.href);
+            if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) return null;
+            if (parsed.hostname.toLowerCase() === 'app.emby.media') return null;
+            let path = parsed.pathname.replace(/\/+$/, '');
+            path = path.replace(/\/web\/index\.html$/i, '').replace(/\/web$/i, '').replace(/\/emby$/i, '');
+            return `${parsed.protocol}//${parsed.host}${path}`.replace(/\/$/, '');
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function watchTogetherReadValues(source, keys) {
+        if (!source) return [];
+        const values = [];
+        for (const key of keys) {
+            try {
+                let value = source[key];
+                if (typeof value === 'function') value = value.call(source);
+                if (value && typeof value.then !== 'function') values.push(String(value));
+            } catch (_) {
+                // Continue with the remaining compatibility fields.
+            }
+        }
+        return values;
+    }
+
+    function watchTogetherReadValue(source, keys) {
+        return watchTogetherReadValues(source, keys)[0] || null;
+    }
+
+    function getWatchTogetherApiContext() {
+        const client = getWatchTogetherApiClient();
+        if (!client) {
+            return { error: '未检测到 Emby ApiClient，请在 Emby 网页登录后刷新页面。' };
+        }
+        const appName = String(client._appName || client.appName || '').toLowerCase();
+        if (appName.includes('jellyfin') || appName.includes('plex') || serverName === 'jellyfin' || serverName === 'plex') {
+            return { error: '同步观看房间仅支持 Emby，不支持 Jellyfin 或 Plex。' };
+        }
+        if (!appName.includes('emby') && serverName !== 'emby') {
+            return { error: '请在 Emby 网页中打开同步观看房间菜单。' };
+        }
+
+        let serverInfo = client._serverInfo || null;
+        if (!serverInfo) {
+            try {
+                if (typeof client.serverInfo === 'function') serverInfo = client.serverInfo();
+                else if (typeof client.serverInfo === 'object') serverInfo = client.serverInfo;
+            } catch (_) {
+                serverInfo = null;
+            }
+        }
+        const serverCandidates = [
+            ...watchTogetherReadValues(client, ['_serverAddress']),
+            ...watchTogetherReadValues(client, ['serverAddress']),
+            ...watchTogetherReadValues(serverInfo, ['Address', 'ServerUrl', 'ServerURL', 'Url', 'RemoteAddress', 'LocalAddress']),
+            window.location.origin,
+        ];
+        const serverUrl = serverCandidates.map(normalizeWatchTogetherServerUrl).find(Boolean);
+        const userId = watchTogetherReadValue(client, ['_userId', 'getCurrentUserId'])
+            || watchTogetherReadValue(serverInfo, ['UserId', 'userId'])
+            || watchTogetherReadValue(client._userAuthInfo, ['UserId', 'userId']);
+        const accessToken = watchTogetherReadValue(client._userAuthInfo, ['AccessToken', 'accessToken'])
+            || watchTogetherReadValue(serverInfo, ['AccessToken', 'accessToken'])
+            || watchTogetherReadValue(client, ['_accessToken', 'accessToken']);
+        if (!serverUrl || !userId || !accessToken) {
+            return { error: '无法取得 Emby 服务器地址、用户或登录令牌，请重新登录并刷新页面。' };
+        }
+        return { client, serverUrl, userId, accessToken };
+    }
+
+    function makeWatchTogetherError(status, code, message) {
+        const error = new Error(message || '同步观看请求失败');
+        error.status = Number(status) || 0;
+        error.code = code || '';
+        return error;
+    }
+
+    function parseWatchTogetherResponse(response) {
+        let payload = null;
+        try {
+            payload = response.responseText ? JSON.parse(response.responseText) : {};
+        } catch (_) {
+            payload = {};
+        }
+        const status = Number(response.status) || 0;
+        if (status >= 200 && status < 300) return payload;
+        const backendError = payload && payload.error;
+        throw makeWatchTogetherError(
+            status,
+            backendError && backendError.code,
+            backendError && backendError.message || `HTTP ${status || '请求失败'}`,
+        );
+    }
+
+    function watchTogetherRequest(path, body = {}, token = null) {
+        return new Promise((resolve, reject) => {
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) headers[WATCH_TOGETHER_TOKEN_HEADER] = token;
+            let settled = false;
+            const finish = (callback, value) => {
+                if (settled) return;
+                settled = true;
+                callback(value);
+            };
+            try {
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: `${WATCH_TOGETHER_BASE_URL}${path}`,
+                    data: JSON.stringify(body || {}),
+                    headers,
+                    timeout: WATCH_TOGETHER_TIMEOUT_MS,
+                    onload: response => {
+                        try {
+                            finish(resolve, parseWatchTogetherResponse(response));
+                        } catch (error) {
+                            finish(reject, error);
+                        }
+                    },
+                    onerror: () => finish(reject, makeWatchTogetherError(0, 'network_error', '本地服务未运行或无法连接')),
+                    ontimeout: () => finish(reject, makeWatchTogetherError(0, 'timeout', '请求本地服务超时')),
+                    onabort: () => finish(reject, makeWatchTogetherError(0, 'aborted', '请求已取消')),
+                });
+            } catch (_) {
+                finish(reject, makeWatchTogetherError(0, 'network_error', '无法调用本地服务'));
+            }
+        });
+    }
+
+    async function watchTogetherAuthenticate(context) {
+        const result = await watchTogetherRequest(WATCH_TOGETHER_ENDPOINTS.auth, {
+            server_url: context.serverUrl,
+            user_id: context.userId,
+            api_key: context.accessToken,
+        });
+        if (!result || typeof result.token !== 'string' || !result.token) {
+            throw makeWatchTogetherError(503, 'invalid_auth_response', '本地服务返回的认证结果无效');
+        }
+        watchTogetherToken = result.token;
+        return result;
+    }
+
+    async function watchTogetherApiRequest(path, body, context, retried = false) {
+        if (!watchTogetherToken) await watchTogetherAuthenticate(context);
+        try {
+            return await watchTogetherRequest(path, body, watchTogetherToken);
+        } catch (error) {
+            if (Number(error && error.status) === 401 && !retried) {
+                watchTogetherToken = null;
+                await watchTogetherAuthenticate(context);
+                try {
+                    return await watchTogetherRequest(path, body, watchTogetherToken);
+                } catch (retryError) {
+                    if (Number(retryError && retryError.status) === 401) watchTogetherToken = null;
+                    throw retryError;
+                }
+            }
+            if (Number(error && error.status) === 401) watchTogetherToken = null;
+            throw error;
+        }
+    }
+
+    function watchTogetherErrorMessage(error) {
+        const status = Number(error && error.status) || 0;
+        const code = String(error && error.code || '');
+        if (code === 'timeout') return '连接本地服务超时，请确认 etlp 正在运行后重试。';
+        if (code === 'network_error' || code === 'aborted' || status === 0) return '本地服务未运行或无法连接，请启动/重启 etlp 后重试。';
+        if (status === 401) return '登录令牌已失效，请刷新 Emby 页面后重试。';
+        if (status === 403 || code === 'administrator_required') return '需要在 Emby 管理员账号页面操作，并在管理员本机配置 admin_enable。';
+        if (status === 409) return '房间状态冲突或房间文件无效，请刷新列表后重试。';
+        if (status === 503) return '同步观看服务暂不可用，请确认 enable/admin_enable 和服务器配置后重启 etlp。';
+        return String(error && error.message || '同步观看请求失败，请稍后重试。');
+    }
+
+    function watchTogetherElement(tag, text = null, className = '') {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        if (text !== null && text !== undefined) element.textContent = String(text);
+        return element;
+    }
+
+    function watchTogetherInstallStyles() {
+        if (document.getElementById('etlp-watch-together-style')) return;
+        const style = document.createElement('style');
+        style.id = 'etlp-watch-together-style';
+        style.textContent = `
+            #${WATCH_TOGETHER_MODAL_ID} { position: fixed; inset: 0; z-index: 2147483647; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(0,0,0,.62); font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-dialog { width: min(720px, 100%); max-height: min(88vh, 760px); overflow: auto; color: #202124; background: #fff; border-radius: 12px; box-shadow: 0 18px 60px rgba(0,0,0,.4); }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-header { display:flex; align-items:center; justify-content:space-between; padding: 16px 20px; border-bottom: 1px solid #e4e6e8; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-title { margin:0; font-size: 20px; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-close { border:0; background:transparent; cursor:pointer; font-size:24px; line-height:1; padding:4px 8px; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-body { padding: 16px 20px 22px; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-status { margin-bottom: 14px; padding: 10px 12px; border-radius: 6px; background:#f1f3f4; white-space:pre-wrap; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-form { display:grid; gap:10px; padding:14px; border:1px solid #e4e6e8; border-radius:8px; }
+            #${WATCH_TOGETHER_MODAL_ID} label { display:grid; gap:5px; font-size:13px; }
+            #${WATCH_TOGETHER_MODAL_ID} input, #${WATCH_TOGETHER_MODAL_ID} select { min-height:34px; padding:5px 8px; border:1px solid #bbc0c4; border-radius:5px; font:inherit; }
+            #${WATCH_TOGETHER_MODAL_ID} button { cursor:pointer; }
+            #${WATCH_TOGETHER_MODAL_ID} button:disabled { cursor:wait; opacity:.55; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-primary { border:0; border-radius:5px; padding:8px 14px; color:#fff; background:#1769aa; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-secondary { border:1px solid #bbc0c4; border-radius:5px; padding:6px 10px; color:#202124; background:#fff; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-rooms { display:grid; gap:10px; margin-top:18px; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-room { padding:13px; border:1px solid #e4e6e8; border-radius:8px; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-room h3 { margin:0 0 7px; font-size:16px; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-room p { margin:3px 0; font-size:13px; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:10px; }
+            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-empty { margin:14px 0 0; color:#5f6368; }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function watchTogetherCreateModal() {
+        if (watchTogetherModalCleanup) watchTogetherModalCleanup();
+        const previous = document.getElementById(WATCH_TOGETHER_MODAL_ID);
+        if (previous) previous.remove();
+        if (!document.body) return null;
+        watchTogetherInstallStyles();
+        const overlay = watchTogetherElement('div', null, 'etlp-wt-overlay');
+        overlay.id = WATCH_TOGETHER_MODAL_ID;
+        const dialog = watchTogetherElement('div', null, 'etlp-wt-dialog');
+        dialog.setAttribute('role', 'dialog');
+        dialog.setAttribute('aria-modal', 'true');
+        const header = watchTogetherElement('div', null, 'etlp-wt-header');
+        const heading = watchTogetherElement('h2', '同步观看房间', 'etlp-wt-title');
+        const closeButton = watchTogetherElement('button', '×', 'etlp-wt-close');
+        closeButton.type = 'button';
+        closeButton.setAttribute('aria-label', '关闭同步观看房间');
+        header.append(heading, closeButton);
+        const body = watchTogetherElement('div', null, 'etlp-wt-body');
+        const status = watchTogetherElement('div', '正在连接本地服务…', 'etlp-wt-status');
+        status.setAttribute('role', 'status');
+        const form = watchTogetherElement('form', null, 'etlp-wt-form');
+        const nameLabel = watchTogetherElement('label', '房间名称');
+        const nameInput = watchTogetherElement('input');
+        nameInput.type = 'text';
+        nameInput.maxLength = 120;
+        nameInput.required = true;
+        nameLabel.appendChild(nameInput);
+        const userALabel = watchTogetherElement('label', '用户 A');
+        const userA = watchTogetherElement('select');
+        userALabel.appendChild(userA);
+        const userBLabel = watchTogetherElement('label', '用户 B');
+        const userB = watchTogetherElement('select');
+        userBLabel.appendChild(userB);
+        const primaryLabel = watchTogetherElement('label', '主用户（初始位置/冲突优先）');
+        const primary = watchTogetherElement('select');
+        primaryLabel.appendChild(primary);
+        const createButton = watchTogetherElement('button', '创建房间', 'etlp-wt-primary');
+        createButton.type = 'submit';
+        form.append(nameLabel, userALabel, userBLabel, primaryLabel, createButton);
+        const roomsHeading = watchTogetherElement('h3', '已有房间');
+        const rooms = watchTogetherElement('div', null, 'etlp-wt-rooms');
+        body.append(status, form, roomsHeading, rooms);
+        dialog.append(header, body);
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        const state = { overlay, status, form, nameInput, userA, userB, primary, createButton, rooms, users: [], runtime: [], closed: false };
+        const close = () => {
+            if (state.closed) return;
+            state.closed = true;
+            document.removeEventListener('keydown', onKeydown, true);
+            if (overlay.parentNode) overlay.remove();
+            watchTogetherToken = null;
+            if (watchTogetherModalCleanup === close) watchTogetherModalCleanup = null;
+        };
+        const onKeydown = event => {
+            if (event.key === 'Escape') close();
+        };
+        closeButton.addEventListener('click', close);
+        overlay.addEventListener('click', event => {
+            if (event.target === overlay) close();
+        });
+        document.addEventListener('keydown', onKeydown, true);
+        watchTogetherModalCleanup = close;
+        state.close = close;
+        return state;
+    }
+
+    function watchTogetherSetStatus(state, message) {
+        if (state && state.status) state.status.textContent = String(message || '');
+    }
+
+    function watchTogetherSetFormDisabled(state, disabled) {
+        [state.nameInput, state.userA, state.userB, state.primary, state.createButton].forEach(element => {
+            if (element) element.disabled = Boolean(disabled);
+        });
+    }
+
+    function watchTogetherSyncPrimary(state) {
+        const previous = state.primary.value;
+        state.primary.textContent = '';
+        [state.userA.value, state.userB.value].filter((value, index, values) => value && values.indexOf(value) === index).forEach(userId => {
+            const option = watchTogetherElement('option');
+            option.value = userId;
+            option.textContent = state.users.find(user => user.id === userId)?.name || userId;
+            state.primary.appendChild(option);
+        });
+        if (Array.from(state.primary.options).some(option => option.value === previous)) state.primary.value = previous;
+        else if (state.primary.options.length) state.primary.selectedIndex = 0;
+    }
+
+    function watchTogetherRenderUsers(state, users) {
+        state.users = Array.isArray(users) ? users.filter(user => user && user.id).map(user => ({ id: String(user.id), name: String(user.name || user.id) })) : [];
+        [state.userA, state.userB].forEach(select => {
+            select.textContent = '';
+            state.users.forEach(user => {
+                const option = watchTogetherElement('option');
+                option.value = user.id;
+                option.textContent = user.name;
+                select.appendChild(option);
+            });
+        });
+        if (state.userB.options.length > 1) state.userB.selectedIndex = 1;
+        watchTogetherSyncPrimary(state);
+        state.userA.addEventListener('change', () => watchTogetherSyncPrimary(state));
+        state.userB.addEventListener('change', () => watchTogetherSyncPrimary(state));
+        const unavailable = state.users.length < 2;
+        state.userA.disabled = unavailable;
+        state.userB.disabled = unavailable;
+        state.primary.disabled = unavailable;
+        state.createButton.disabled = unavailable;
+    }
+
+    function watchTogetherStatusLabel(state, runtimeError) {
+        const labels = {
+            waiting: '等待两人连接',
+            barrier: '同步准备中',
+            watching: '同步观看中',
+            unavailable: '服务不可用',
+            error: '发生错误',
+        };
+        const value = String(state || 'waiting').toLowerCase();
+        const label = labels[value] || '状态未知';
+        return runtimeError ? `${label}：${runtimeError}` : label;
+    }
+
+    function watchTogetherRenderRooms(state, roomList, runtimeList) {
+        state.runtime = Array.isArray(runtimeList) ? runtimeList : [];
+        const runtimeByRoom = new Map(state.runtime.map(item => [String(item.room_id), item]));
+        const usersById = new Map(state.users.map(user => [user.id, user.name]));
+        state.rooms.textContent = '';
+        if (!Array.isArray(roomList) || roomList.length === 0) {
+            state.rooms.appendChild(watchTogetherElement('p', '暂无房间，请先创建一个房间。', 'etlp-wt-empty'));
+            return;
+        }
+        roomList.forEach(room => {
+            if (!room || !room.id) return;
+            const roomId = String(room.id);
+            const card = watchTogetherElement('article', null, 'etlp-wt-room');
+            const title = watchTogetherElement('h3', String(room.name || '未命名房间'));
+            const participantNames = Array.isArray(room.participant_user_ids)
+                ? room.participant_user_ids.map(userId => usersById.get(String(userId)) || String(userId))
+                : [];
+            const participants = watchTogetherElement('p', `参与者：${participantNames.join('、') || '未知'}`);
+            const primaryName = usersById.get(String(room.primary_user_id)) || String(room.primary_user_id || '未知');
+            const primary = watchTogetherElement('p', `主用户：${primaryName}`);
+            const runtime = runtimeByRoom.get(roomId) || {};
+            const status = watchTogetherElement('p', `运行状态：${watchTogetherStatusLabel(runtime.state, runtime.error)}`);
+            const actions = watchTogetherElement('div', null, 'etlp-wt-actions');
+            [['pause', '暂停'], ['resume', '继续'], ['resync', '重新同步']].forEach(([action, text]) => {
+                const button = watchTogetherElement('button', text, 'etlp-wt-secondary');
+                button.type = 'button';
+                button.addEventListener('click', () => watchTogetherRoomAction(state, roomId, action, button));
+                actions.appendChild(button);
+            });
+            const deleteButton = watchTogetherElement('button', '删除', 'etlp-wt-secondary');
+            deleteButton.type = 'button';
+            deleteButton.addEventListener('click', () => watchTogetherDeleteRoom(state, roomId, deleteButton));
+            actions.appendChild(deleteButton);
+            card.append(title, participants, primary, status, actions);
+            state.rooms.appendChild(card);
+        });
+    }
+
+    async function watchTogetherRefreshRooms(state, context, message = '正在加载房间…') {
+        if (!state || state.closed) return;
+        watchTogetherSetStatus(state, message);
+        try {
+            const result = await watchTogetherApiRequest(WATCH_TOGETHER_ENDPOINTS.list, {}, context);
+            if (state.closed) return;
+            watchTogetherRenderUsers(state, result && result.users);
+            watchTogetherRenderRooms(state, result && result.rooms, result && result.runtime);
+            if (!result || !Array.isArray(result.rooms) || result.rooms.length === 0) watchTogetherSetStatus(state, '暂无房间，请先创建一个房间。');
+            else watchTogetherSetStatus(state, '房间列表已更新。');
+        } catch (error) {
+            if (!state.closed) watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
+        }
+    }
+
+    async function watchTogetherRoomAction(state, roomId, action, button) {
+        if (!state || state.closed || !button) return;
+        const context = state.context;
+        button.disabled = true;
+        try {
+            await watchTogetherApiRequest(WATCH_TOGETHER_ENDPOINTS.action, { room_id: roomId, action }, context);
+            await watchTogetherRefreshRooms(state, context, '正在刷新房间状态…');
+        } catch (error) {
+            watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
+        } finally {
+            if (!state.closed) button.disabled = false;
+        }
+    }
+
+    async function watchTogetherDeleteRoom(state, roomId, button) {
+        if (!state || state.closed || !button) return;
+        if (!window.confirm('确定删除此同步观看房间吗？')) return;
+        const context = state.context;
+        button.disabled = true;
+        try {
+            await watchTogetherApiRequest(WATCH_TOGETHER_ENDPOINTS.delete, { room_id: roomId }, context);
+            await watchTogetherRefreshRooms(state, context, '正在刷新房间列表…');
+        } catch (error) {
+            watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
+        } finally {
+            if (!state.closed) button.disabled = false;
+        }
+    }
+
+    function watchTogetherBindCreate(state) {
+        state.form.addEventListener('submit', async event => {
+            event.preventDefault();
+            if (state.closed) return;
+            const name = String(state.nameInput.value || '').trim();
+            const members = [String(state.userA.value || ''), String(state.userB.value || '')];
+            const primary = String(state.primary.value || '');
+            if (!name) {
+                watchTogetherSetStatus(state, '请填写房间名称。');
+                return;
+            }
+            if (!members[0] || !members[1] || members[0] === members[1]) {
+                watchTogetherSetStatus(state, '请选择两个不同的参与者。');
+                return;
+            }
+            if (!primary || !members.includes(primary)) {
+                watchTogetherSetStatus(state, '主用户必须是已选的参与者。');
+                return;
+            }
+            watchTogetherSetFormDisabled(state, true);
+            try {
+                await watchTogetherApiRequest(WATCH_TOGETHER_ENDPOINTS.create, {
+                    name,
+                    participant_user_ids: members,
+                    primary_user_id: primary,
+                }, state.context);
+                state.nameInput.value = '';
+                await watchTogetherRefreshRooms(state, state.context, '正在刷新房间列表…');
+            } catch (error) {
+                watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
+            } finally {
+                if (!state.closed) {
+                    watchTogetherSetFormDisabled(state, false);
+                    watchTogetherRenderUsers(state, state.users);
+                }
+            }
+        });
+    }
+
+    async function openWatchTogetherMenu() {
+        const context = getWatchTogetherApiContext();
+        if (context.error) {
+            alert(context.error);
+            return;
+        }
+        const state = watchTogetherCreateModal();
+        if (!state) {
+            alert('同步观看房间需要在 Emby 页面打开，当前页面尚未准备好。');
+            return;
+        }
+        state.context = context;
+        watchTogetherBindCreate(state);
+        watchTogetherSetStatus(state, '正在验证 Emby 账号…');
+        try {
+            await watchTogetherAuthenticate(context);
+            await watchTogetherRefreshRooms(state, context);
+        } catch (error) {
+            watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
+        }
+    }
+
+    // --- end watch-together administrator UI ---
 
     function hideCurrentSeries() {
         const urlMatch = window.location.href.match(/id=(\d+)/);
@@ -950,6 +1463,11 @@
 
     setModeSwitchMenu(etlpStorageKeys.webPlayerEnable, '脚本在当前服务器 已', '', '可用', '禁用', '可用');
     setModeSwitchMenu(etlpStorageKeys.mountDiskEnable, '读取硬盘模式已经 ');
+    setCallbackMenu('同步观看房间', () => {
+        openWatchTogetherMenu().catch(() => {
+            alert('同步观看房间打开失败，请刷新 Emby 页面后重试。');
+        });
+    });
 
     function showGuiMenu() {
         sendDataToLocalServer({ 'showTaskManager': true }, 'embyToLocalPlayer');

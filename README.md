@@ -57,6 +57,20 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
 * 日志出现 `serving at 127.0.0.1:58000` 为服务启动成功。
 * **碰到问题先参考下方相关 FAQ，没按要求反馈会忽略**。
 
+> 同步观看（实验）
+
+同步观看是 etlp 自研的本地房间功能，不使用或宣传 Emby PartyService，也不提供网页播放器同步或客户端互连端口。当前版本只面向同一 Emby 服务器、恰好两名用户，以及 mpv/IINA：
+
+1. 在两台参与者机器的 `embyToLocalPlayer_config.ini` 中，将 `[watch_together]` 的 `enable = yes` 打开；在管理员本机额外设置 `admin_enable = yes`、与网页实际 Emby 相同的 `server_url` 根 URL，并填写管理员在 Emby 后台单独创建且可撤销的 `admin_api_key`。普通参与者不要填写 admin key。
+2. 在 etlp 所在目录安装 `requirements.txt` 中固定的 `websocket-client==1.8.0`（无需升级其他包）：`python -m pip install -r requirements.txt`。修改 INI 后重启两端 etlp。
+3. 两人分别用 mpv 或 IINA 打开同一视频，在 Emby 网页油猴菜单选择“同步观看房间”，管理员创建房间并选择两名参与者及主用户。列表中可暂停、继续或重新同步；两人都能暂停/继续/拖动进度（seek），主用户用于初始位置和冲突优先。
+
+限制：两端必须是同一 Emby 服务器且 `ItemId` 相同，媒体时长差不超过 3 秒，播放速度固定 1.0；允许不同 `MediaSourceId`。不会自动起播或自动播放下一集；任一端断开、停止或换片时会暂停另一方并等待。多人、邀请链接、聊天、速度/字幕/音轨/音量设置均不在范围内。
+
+安全与禁用：管理员 key 只放在管理员本机 INI，不粘贴到网页/油猴/日志，也不要提交 Git；浏览器用户 token 只用于 loopback 的短期认证，不落盘；`watch_together_rooms.json` 只保存房间元数据，不含 token。即使把本地 HTTP 配置为 LAN，watch-together endpoints 仍只接受 loopback。停用时将两端 `enable = no`，管理员同时设 `admin_enable = no` 并重启 etlp；房间文件可保留，需删除房间请使用 UI，损坏文件不会自动覆盖。
+
+该功能标记为实验，不声称已完成真实 Emby 实机测试或具备生产稳定性。
+
 > Windows
 
 1. 双击 `embyToLocalPlayer_debug.bat`
