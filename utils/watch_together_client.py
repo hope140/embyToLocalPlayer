@@ -119,6 +119,7 @@ class WatchTogetherClient:
         self._started = False
         self._stopped_reported = False
         self._session_capabilities_declared = False
+        self._initial_playing_reported = False
         self._last_snapshot = None
         self._last_report_at = None
         self._last_snapshot_at = None
@@ -283,15 +284,28 @@ class WatchTogetherClient:
             return False
 
     def _declare_capabilities(self):
-        if self._session_capabilities_declared:
+        if self._session_capabilities_declared or not self._initial_playing_reported:
             return
         try:
-            # SessionsService selects the current device session from the
-            # explicit headers; Capabilities/Full has no session-id segment.
-            self.session_api.declare_capabilities(full=True)
+            # The first Playing report creates the server-side session.  Look
+            # it up explicitly before advertising capabilities so stale
+            # control sessions cannot receive the declaration.
+            session = self.session_api.find_session(self.play_session_id)
+            if not isinstance(session, dict):
+                logger.info('watch-together capabilities unavailable: session not found')
+                return
+            session_id = session.get('Id') or session.get('SessionId')
+            if session_id is None or not str(session_id).strip():
+                logger.info('watch-together capabilities unavailable: session id missing')
+                return
+            self.session_api.declare_capabilities(
+                session_id=str(session_id).strip(), full=True,
+            )
             self._session_capabilities_declared = True
-        except Exception as exc:
-            logger.info(f'watch-together capabilities unavailable: {str(exc)[:120]}')
+        except Exception:
+            # Keep this retryable on reconnect while avoiding IDs, URLs and
+            # credentials that an exception message might contain.
+            logger.info('watch-together capabilities unavailable: declaration failed')
 
     def _schedule_reconnect(self):
         self._next_connect_at = self._clock() + self._backoff
@@ -390,9 +404,12 @@ class WatchTogetherClient:
             self._last_playback_rate = playback_rate
             self._last_report_at = now
             self._last_snapshot_at = now
-            return self._report(
+            result = self._report(
                 'report_playing', position, paused, 'TimeUpdate', playback_rate,
             )
+            if result:
+                self._initial_playing_reported = True
+            return result
 
         previous_position = self._last_position
         previous_pause = self._last_pause
@@ -497,6 +514,28 @@ class WatchTogetherClient:
                 logger.info(f'watch-together stopped report failed: {str(exc)[:120]}')
                 return False
 
+    def _finish_playstate_command(self, command, handled):
+        """Report a successfully applied remote command immediately."""
+
+        handled = bool(handled)
+        if handled:
+            try:
+                reported = bool(self._report_snapshot(force=True))
+            except Exception:
+                reported = False
+            if command == 'Stop' and not reported:
+                # A stopped player may no longer expose a snapshot.  Preserve
+                # the existing Stopped reporting path in that case.
+                try:
+                    if self._snapshot() is None:
+                        self._report_stopped()
+                except Exception:
+                    pass
+        logger.info(
+            f'watch-together command={command} handled={str(handled).lower()}'
+        )
+        return handled
+
     @staticmethod
     def _decode_message(raw_message):
         if isinstance(raw_message, bytes):
@@ -536,7 +575,13 @@ class WatchTogetherClient:
         )
         command = str(command or '').lower()
         if command in ('pause', 'unpause', 'play'):
-            return mpv_set_pause(self.player, command == 'pause')
+            try:
+                handled = mpv_set_pause(self.player, command == 'pause')
+            except Exception:
+                handled = False
+            return self._finish_playstate_command(
+                'Pause' if command == 'pause' else 'Unpause', handled,
+            )
         if command == 'seek':
             ticks = payload.get('SeekPositionTicks')
             if ticks is None:
@@ -551,13 +596,17 @@ class WatchTogetherClient:
                     position = None
             if position is None:
                 return False
-            return mpv_seek(self.player, position)
+            try:
+                handled = mpv_seek(self.player, position)
+            except Exception:
+                handled = False
+            return self._finish_playstate_command('Seek', handled)
         if command == 'stop':
             try:
-                self.player.command('stop')
-                return True
+                handled = self.player.command('stop') is not False
             except Exception:
-                return False
+                handled = False
+            return self._finish_playstate_command('Stop', handled)
         return False
 
     def _handle_general_command(self, payload):

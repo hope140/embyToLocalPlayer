@@ -220,10 +220,19 @@ class EmbySessionApi:
     def declare_capabilities(self, session_id=None, *, full=True, timeout=10):
         """Advertise controls for the current device session.
 
-        Emby's SessionsService resolves the active session from the request
-        device headers; the capabilities endpoint is intentionally *not*
-        nested below a session id.
+        Emby's SessionsService expects the concrete server-side session id as
+        the ``Id`` query parameter.  The capabilities endpoint is
+        intentionally *not* nested below a session id.
         """
+
+        # ``find_session`` stores the id for integrations that use the
+        # convenience form without an explicit argument.  Never send an
+        # unbound capability declaration: Emby may otherwise apply it to a
+        # stale control session selected by request headers.
+        requested_session_id = self.session_id if session_id is None else session_id
+        if requested_session_id is None or not str(requested_session_id).strip():
+            raise EmbySessionError("session id is required for capability declaration")
+        requested_session_id = str(requested_session_id).strip()
 
         suffix = "Capabilities/Full" if full else "Capabilities"
         payload = {
@@ -233,7 +242,8 @@ class EmbySessionApi:
         }
         return self._request(
             f"Sessions/{suffix}",
-            method="POST", payload=payload, timeout=timeout,
+            method="POST", params={"Id": requested_session_id},
+            payload=payload, timeout=timeout,
         )
 
     def _playback_payload(self, position_sec=None, *, event_name=None,

@@ -88,6 +88,18 @@ class WatchTogetherCoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(selected["u1"]["Id"], "s1")
 
+    def test_session_filter_prefers_active_older_session_over_newer_stale(self):
+        active = self.api.session("u1", "active", 4)
+        active["LastActivityDate"] = "2025-01-01T00:00:00Z"
+        stale = self.api.session("u1", "stale", 8)
+        stale["LastActivityDate"] = "2026-01-01T00:00:00Z"
+        stale["NowPlayingItem"] = {}
+        stale["PlayState"]["IsStopped"] = True
+        selected = self.coordinator.select_control_sessions(
+            [active, stale, self.api.sessions[1]], ["u1", "u2"]
+        )
+        self.assertEqual(selected["u1"]["Id"], "active")
+
     def test_barrier_runs_pause_seek_restore_in_separate_rounds(self):
         rid = self.room["id"]
         self.coordinator.poll_once(now=0)

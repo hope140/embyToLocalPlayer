@@ -11,6 +11,7 @@ from unittest import mock
 from zipfile import ZipFile
 
 from utils.emby_session_api import (
+    EmbySessionError,
     EmbySessionApi,
     derive_control_device_id,
 )
@@ -63,12 +64,15 @@ class FakeSessionApi:
         self.reports = []
         self.capabilities = []
         self.sessions = 0
+        self.calls = []
 
-    def find_session(self):
+    def find_session(self, play_session_id=None):
         self.sessions += 1
+        self.calls.append(('find_session', play_session_id))
         return {'Id': self.session_id}
 
     def declare_capabilities(self, session_id=None, full=True):
+        self.calls.append(('declare_capabilities', session_id, full))
         self.capabilities.append((session_id, full))
 
     def report_playing(self, **kwargs):
@@ -128,7 +132,7 @@ class EmbySessionApiTests(unittest.TestCase):
         self.assertNotIn('Authorization', headers)
         self.assertNotIn('Cookie', headers)
 
-    def test_capabilities_endpoint_has_no_session_id(self):
+    def test_capabilities_endpoint_uses_query_session_id(self):
         requests = []
 
         def request(url, **kwargs):
@@ -139,13 +143,44 @@ class EmbySessionApiTests(unittest.TestCase):
             'scheme': 'https', 'netloc': 'media.test', 'api_key': 'token',
             'device_id': 'browser', 'play_session_id': 'one',
         }, request_func=request)
-        api.declare_capabilities(session_id='must-not-be-in-url')
+        api.declare_capabilities(session_id='server-session')
         self.assertTrue(requests[0][0].endswith('/emby/Sessions/Capabilities/Full'))
-        self.assertNotIn('must-not-be-in-url', requests[0][0])
+        self.assertNotIn('server-session', requests[0][0])
+        self.assertEqual(requests[0][1]['params'], {'Id': 'server-session'})
         self.assertEqual(
             requests[0][1]['_json']['SupportedCommands'],
             ['Pause', 'Unpause', 'Seek', 'DisplayMessage'],
         )
+
+    def test_capabilities_endpoint_uses_query_session_id_for_non_full(self):
+        requests = []
+
+        def request(url, **kwargs):
+            requests.append((url, kwargs))
+            return {}
+
+        api = EmbySessionApi({
+            'scheme': 'https', 'netloc': 'media.test', 'api_key': 'token',
+        }, request_func=request)
+        api.declare_capabilities(session_id='server-session', full=False)
+        self.assertTrue(requests[0][0].endswith('/emby/Sessions/Capabilities'))
+        self.assertEqual(requests[0][1]['params'], {'Id': 'server-session'})
+
+    def test_capabilities_endpoint_rejects_empty_session_id_without_request(self):
+        requests = []
+
+        def request(url, **kwargs):
+            requests.append((url, kwargs))
+            return {}
+
+        api = EmbySessionApi({
+            'scheme': 'https', 'netloc': 'media.test', 'api_key': 'token',
+        }, request_func=request)
+        with self.assertRaises(EmbySessionError):
+            api.declare_capabilities(session_id='  ')
+        with self.assertRaises(EmbySessionError):
+            api.declare_capabilities()
+        self.assertEqual(requests, [])
 
 
 class WatchTogetherClientTests(unittest.TestCase):
@@ -181,6 +216,57 @@ class WatchTogetherClientTests(unittest.TestCase):
         })))
         self.assertIn(('show-text', 'hello', 1000), self.player.commands)
 
+    def test_pause_and_small_seek_force_progress_reports(self):
+        self.client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False}, now=0,
+        )
+        self.assertTrue(self.client.handle_message(json.dumps({
+            'MessageType': 'Playstate', 'Data': json.dumps({'Command': 'Pause'}),
+        })))
+        self.assertEqual(self.api.reports[-1][0], 'progress')
+        pause_report_count = len(self.api.reports)
+        self.assertTrue(self.client.handle_message(json.dumps({
+            'MessageType': 'Playstate',
+            'Data': json.dumps({'Command': 'Seek', 'SeekPositionSeconds': 11}),
+        })))
+        self.assertEqual(self.player.position, 11)
+        self.assertEqual(len(self.api.reports), pause_report_count + 1)
+        self.assertEqual(self.api.reports[-1][0], 'progress')
+
+    def test_failed_command_does_not_force_progress_report(self):
+        self.client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False}, now=0,
+        )
+        with mock.patch.object(
+            watch_together_client_module, 'mpv_set_pause', return_value=False
+        ) as set_pause, mock.patch.object(self.client, '_report_snapshot') as report:
+            self.assertFalse(self.client.handle_message(json.dumps({
+                'MessageType': 'Playstate', 'Data': json.dumps({'Command': 'Pause'}),
+            })))
+        set_pause.assert_called_once_with(self.player, True)
+        report.assert_not_called()
+
+    def test_stop_without_snapshot_keeps_stopped_report_path(self):
+        class StopWithoutSnapshot:
+            def __init__(self):
+                self.commands = []
+
+            def command(self, *args):
+                self.commands.append(args)
+                return None
+
+        player = StopWithoutSnapshot()
+        client = WatchTogetherClient(
+            {'server': 'emby', 'watch_together_enabled': True},
+            player=player, session_api=self.api, enabled=True,
+        )
+        with mock.patch.object(client, '_report_snapshot', return_value=False) as report:
+            self.assertTrue(client.handle_message(json.dumps({
+                'MessageType': 'Playstate', 'Data': json.dumps({'Command': 'Stop'}),
+            })))
+        report.assert_called_once_with(force=True)
+        self.assertEqual(self.api.reports[-1][0], 'stopped')
+
     def test_pause_seek_and_stopped_reports(self):
         self.assertTrue(self.client.publish_snapshot(
             {'position_sec': 10, 'is_paused': False}, now=0,
@@ -194,6 +280,25 @@ class WatchTogetherClientTests(unittest.TestCase):
             {'position_sec': 40, 'is_paused': True}, now=2,
         ))
         self.assertEqual(self.api.reports[-1][1]['event_name'], 'TimeUpdate')
+
+    def test_initial_playing_resolves_session_before_capabilities(self):
+        self.client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False}, now=0,
+        )
+        self.client._declare_capabilities()
+        self.assertEqual(
+            self.api.calls[:2],
+            [('find_session', 'session'), ('declare_capabilities', 'server-session', True)],
+        )
+        self.assertEqual(self.api.capabilities, [('server-session', True)])
+
+    def test_capabilities_lookup_failure_remains_retryable(self):
+        self.client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False}, now=0,
+        )
+        self.api.find_session = lambda play_session_id=None: None
+        self.client._declare_capabilities()
+        self.assertFalse(self.client._session_capabilities_declared)
 
     def test_playback_rate_is_reported_immediately(self):
         self.client.publish_snapshot(

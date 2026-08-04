@@ -564,9 +564,34 @@ class WatchTogetherCoordinator:
         for user_id, values in candidates.items():
             if values:
                 by_user[user_id] = max(
-                    values, key=lambda value: _timestamp(value.get("LastActivityDate"))
+                    values, key=cls._session_selection_key,
                 )
         return by_user
+
+    @staticmethod
+    def _session_selection_key(session):
+        """Prefer an active control session before recency.
+
+        Emby can retain a newer control session after playback has stopped.
+        Such a stale entry must not hide an older session that still has a
+        concrete item and session id.
+        """
+
+        session = session if isinstance(session, dict) else {}
+        item = session.get("NowPlayingItem") or {}
+        if not isinstance(item, dict):
+            item = {}
+        play_state = session.get("PlayState") or {}
+        if not isinstance(play_state, dict):
+            play_state = {}
+        session_id = session.get("Id") or session.get("SessionId")
+        item_id = item.get("Id")
+        state_name = str(
+            play_state.get("PlaybackState") or play_state.get("State") or ""
+        ).lower()
+        stopped = bool(play_state.get("IsStopped")) or state_name == "stopped"
+        active = bool(session_id and item_id and not stopped)
+        return (1 if active else 0, _timestamp(session.get("LastActivityDate")))
 
     @classmethod
     def select_control_sessions(cls, sessions, user_ids):
