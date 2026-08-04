@@ -531,12 +531,11 @@
     }
 
     function watchTogetherCloseMobileDrawer() {
-        const drawer = Array.from(document.querySelectorAll('.navDrawer, .navDrawerContainer'))
-            .find(element => watchTogetherIsVisible(element) && (/open|visible/i.test(element.className) || element.getAttribute('aria-hidden') === 'false'));
+        const drawer = document.querySelector('.mainDrawer.drawer-open:not(.drawer-docked)');
         if (!drawer) return;
-        const toggle = Array.from(document.querySelectorAll('.navDrawerButton, .btnNavDrawer, [data-action="togglemenu"]'))
-            .find(watchTogetherIsVisible);
-        if (toggle && typeof toggle.click === 'function') toggle.click();
+        const visibleToggles = Array.from(document.querySelectorAll('.btnToggleNavDrawer, .headerMenuButton'))
+            .filter(watchTogetherIsVisible);
+        if (visibleToggles.length === 1 && typeof visibleToggles[0].click === 'function') visibleToggles[0].click();
     }
 
     function watchTogetherSetNavSelected(selected) {
@@ -569,11 +568,16 @@
             nav.type = 'button';
             nav.setAttribute(WATCH_TOGETHER_NAV_DATA, 'true');
             nav.setAttribute('aria-label', '同步观看');
-            const imageContainer = watchTogetherElement('div', null, 'navDrawerListItemImageContainer listItemImageContainer');
-            const icon = watchTogetherElement('span', 'group', 'navDrawerListItemIcon listItemIcon md-icon');
-            const body = watchTogetherElement('div', '同步观看', 'navDrawerListItemBody listItemBody');
+            const content = watchTogetherElement('div', null, 'navMenuOption-listItem-content listItem-content listItem-content-bg listItemContent-touchzoom');
+            const imageContainer = watchTogetherElement('div', null, 'navDrawerListItemImageContainer listItemImageContainer listItemImageContainer-margin listItemImageContainer-square');
+            imageContainer.style.aspectRatio = '1';
+            const icon = watchTogetherElement('i', 'group', 'navDrawerListItemIcon listItemIcon md-icon autortl md-icon-fill');
+            const body = watchTogetherElement('div', null, 'navDrawerListItemBody listItemBody listItemBody-1-lines');
+            const bodyText = watchTogetherElement('div', '同步观看', 'listItemBodyText listItemBodyText-nowrap listItemBodyText-lf');
             imageContainer.appendChild(icon);
-            nav.append(imageContainer, body);
+            body.appendChild(bodyText);
+            content.append(imageContainer, body);
+            nav.appendChild(content);
             nav.addEventListener('click', event => {
                 event.preventDefault();
                 event.stopPropagation();
@@ -588,7 +592,8 @@
 
     function watchTogetherFindMainPages(main) {
         if (!main) return [];
-        return Array.from(main.children).filter(page => page.id !== WATCH_TOGETHER_PAGE_ID && watchTogetherIsVisible(page));
+        return Array.from(main.querySelectorAll(':scope > .view.page'))
+            .filter(page => page.id !== WATCH_TOGETHER_PAGE_ID && watchTogetherIsVisible(page));
     }
 
     function watchTogetherRestoreCapturedPages(state) {
@@ -605,13 +610,15 @@
 
     function watchTogetherCleanupState(state, restore = false) {
         if (!state || state.closed) return;
+        const hasVisibleNativePage = watchTogetherFindMainPages(state.main).length > 0;
+        const shouldRestoreCapturedPage = restore || !hasVisibleNativePage;
         state.closed = true;
         if (watchTogetherActiveState === state) watchTogetherActiveState = null;
         if (state.onKeydown) document.removeEventListener('keydown', state.onKeydown, true);
         if (state.onNativeNavigation) document.removeEventListener('click', state.onNativeNavigation, true);
         if (state.onHashChange) window.removeEventListener('hashchange', state.onHashChange);
         if (state.onPopState) window.removeEventListener('popstate', state.onPopState);
-        if (restore) watchTogetherRestoreCapturedPages(state);
+        if (shouldRestoreCapturedPage) watchTogetherRestoreCapturedPages(state);
         if (state.page && state.page.parentNode) state.page.remove();
         watchTogetherInvalidateToken(state);
         watchTogetherSetNavSelected(Boolean(watchTogetherActiveState && !watchTogetherActiveState.closed));
@@ -619,7 +626,11 @@
     }
 
     function watchTogetherCreatePage() {
-        if (watchTogetherActiveState) watchTogetherCleanupState(watchTogetherActiveState, false);
+        const existing = watchTogetherActiveState;
+        if (existing && !existing.closed && existing.page && existing.page.isConnected && existing.page.parentElement === existing.main && existing.main && existing.main.isConnected) {
+            return existing;
+        }
+        if (existing && !existing.closed) watchTogetherCleanupState(existing, true);
         const main = document.querySelector('.mainAnimatedPages.skinBody');
         if (!main) return null;
         watchTogetherInstallStyles();
@@ -634,7 +645,7 @@
             previous.element.setAttribute('aria-hidden', 'true');
         });
 
-        const page = watchTogetherElement('div', null, 'view page focuscontainer-x mainAnimatedPage');
+        const page = watchTogetherElement('div', null, 'view flex flex-direction-column page focuscontainer-x page-withFullDrawer page-withDockedDrawer');
         page.id = WATCH_TOGETHER_PAGE_ID;
         page.setAttribute('data-etlp-watch-together-page', 'true');
         page.setAttribute('tabindex', '-1');
