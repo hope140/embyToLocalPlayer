@@ -67,7 +67,7 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
 
 限制：两端必须是同一 Emby 服务器且 `ItemId` 相同，媒体时长差不超过 3 秒，播放速度固定 1.0；允许不同 `MediaSourceId`。不会自动起播或自动播放下一集；任一端断开、停止或换片时会暂停另一方并等待。多人、邀请链接、聊天、速度/字幕/音轨/音量设置均不在范围内。
 
-安全与禁用：管理员 key 只放在管理员本机 INI，不粘贴到网页/油猴/日志，也不要提交 Git；浏览器用户 token 只用于 loopback 的短期认证，不落盘；`watch_together_rooms.json` 只保存房间元数据，不含 token。即使把本地 HTTP 配置为 LAN，watch-together endpoints 仍只接受 loopback。停用时将两端 `enable = no`，管理员同时设 `admin_enable = no` 并重启 etlp；房间文件可保留，需删除房间请使用 UI，损坏文件不会自动覆盖。
+安全与禁用：管理员 key 只放在管理员本机 INI，不粘贴到网页/油猴/日志，也不要提交 Git；浏览器用户 token 只用于 loopback 的短期认证，不落盘；`watch_together_rooms.json` 只保存房间元数据，不含 token，房间会持久保留，直到通过 UI 删除房间或手动处理文件。即使把本地 HTTP 配置为 LAN，watch-together endpoints 仍只接受 loopback。停用时将两端 `enable = no`，管理员同时设 `admin_enable = no` 并重启 etlp；损坏文件不会自动覆盖。
 
 该功能标记为实验，不声称已完成真实 Emby 实机测试或具备生产稳定性。
 

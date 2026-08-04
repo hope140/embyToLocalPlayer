@@ -63,6 +63,21 @@ class WatchTogetherUiContractTests(unittest.TestCase):
         self.assertIn("textContent", watch_code)
         self.assertIn("Escape", watch_code)
         self.assertIn("event.target === overlay", watch_code)
+        self.assertIn("parsed.username", watch_code)
+        self.assertIn("parsed.password", watch_code)
+        self.assertIn("code === 'server_mismatch'", watch_code)
+        self.assertIn("当前 Emby 实际服务器与 INI", watch_code)
+
+        render_match = re.search(
+            r"function watchTogetherRenderUsers\(.*?(?=\n    function watchTogetherStatusLabel)",
+            watch_code,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(render_match)
+        self.assertNotIn("addEventListener", render_match.group(0))
+        self.assertEqual(watch_code.count("state.userA.addEventListener('change'"), 1)
+        self.assertEqual(watch_code.count("state.userB.addEventListener('change'"), 1)
+        self.assertGreaterEqual(watch_code.count("watchTogetherBindUserSelects"), 2)
 
     def test_docs_cover_setup_scope_security_and_navigation(self):
         required_readme = (

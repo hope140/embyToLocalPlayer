@@ -255,6 +255,7 @@
         try {
             const parsed = new URL(String(value), window.location.href);
             if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) return null;
+            if (parsed.username || parsed.password) return null;
             if (parsed.hostname.toLowerCase() === 'app.emby.media') return null;
             let path = parsed.pathname.replace(/\/+$/, '');
             path = path.replace(/\/web\/index\.html$/i, '').replace(/\/web$/i, '').replace(/\/emby$/i, '');
@@ -421,7 +422,9 @@
         if (code === 'timeout') return '连接本地服务超时，请确认 etlp 正在运行后重试。';
         if (code === 'network_error' || code === 'aborted' || status === 0) return '本地服务未运行或无法连接，请启动/重启 etlp 后重试。';
         if (status === 401) return '登录令牌已失效，请刷新 Emby 页面后重试。';
-        if (status === 403 || code === 'administrator_required') return '需要在 Emby 管理员账号页面操作，并在管理员本机配置 admin_enable。';
+        if (code === 'server_mismatch') return '当前 Emby 实际服务器与 INI 中的 server_url 不一致，请改为同一服务器根 URL 后重启 etlp。';
+        if (code === 'administrator_required') return '需要在 Emby 管理员账号页面操作，并在管理员本机配置 admin_enable。';
+        if (status === 403) return '本地服务拒绝了该操作，请确认当前 Emby 账号权限和管理员配置。';
         if (status === 409) return '房间状态冲突或房间文件无效，请刷新列表后重试。';
         if (status === 503) return '同步观看服务暂不可用，请确认 enable/admin_enable 和服务器配置后重启 etlp。';
         return String(error && error.message || '同步观看请求失败，请稍后重试。');
@@ -510,6 +513,7 @@
         document.body.appendChild(overlay);
 
         const state = { overlay, status, form, nameInput, userA, userB, primary, createButton, rooms, users: [], runtime: [], closed: false };
+        watchTogetherBindUserSelects(state);
         const close = () => {
             if (state.closed) return;
             state.closed = true;
@@ -531,14 +535,30 @@
         return state;
     }
 
+    function watchTogetherBindUserSelects(state) {
+        if (!state || state.userListenersBound) return;
+        state.userA.addEventListener('change', () => watchTogetherSyncPrimary(state));
+        state.userB.addEventListener('change', () => watchTogetherSyncPrimary(state));
+        state.userListenersBound = true;
+    }
+
     function watchTogetherSetStatus(state, message) {
         if (state && state.status) state.status.textContent = String(message || '');
     }
 
     function watchTogetherSetFormDisabled(state, disabled) {
-        [state.nameInput, state.userA, state.userB, state.primary, state.createButton].forEach(element => {
-            if (element) element.disabled = Boolean(disabled);
-        });
+        if (disabled) {
+            [state.nameInput, state.userA, state.userB, state.primary, state.createButton].forEach(element => {
+                if (element) element.disabled = true;
+            });
+            return;
+        }
+        state.nameInput.disabled = false;
+        const unavailable = state.users.length < 2;
+        state.userA.disabled = unavailable;
+        state.userB.disabled = unavailable;
+        state.primary.disabled = unavailable;
+        state.createButton.disabled = unavailable;
     }
 
     function watchTogetherSyncPrimary(state) {
@@ -567,8 +587,6 @@
         });
         if (state.userB.options.length > 1) state.userB.selectedIndex = 1;
         watchTogetherSyncPrimary(state);
-        state.userA.addEventListener('change', () => watchTogetherSyncPrimary(state));
-        state.userB.addEventListener('change', () => watchTogetherSyncPrimary(state));
         const unavailable = state.users.length < 2;
         state.userA.disabled = unavailable;
         state.userB.disabled = unavailable;
@@ -704,7 +722,6 @@
             } finally {
                 if (!state.closed) {
                     watchTogetherSetFormDisabled(state, false);
-                    watchTogetherRenderUsers(state, state.users);
                 }
             }
         });
