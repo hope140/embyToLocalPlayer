@@ -7,8 +7,12 @@ opt-in and all dependency/network failures are swallowed so ordinary playback
 continues exactly as before.
 """
 
+import hashlib
+import importlib
 import json
+from pathlib import Path
 import socket
+import sys
 import threading
 import time
 
@@ -18,6 +22,74 @@ from utils.players import get_mpv_snapshot, mpv_display_message, mpv_seek, mpv_s
 
 
 logger = MyLogger()
+
+
+# The wheel is kept untouched in ``third_party`` and is only used when the
+# normal import cannot find a usable websocket-client installation.  Keep this
+# digest in code so a damaged or replaced archive is never imported.
+_BUILTIN_WEBSOCKET_FILENAME = 'websocket_client-1.8.0-py3-none-any.whl'
+_BUILTIN_WEBSOCKET_SHA256 = (
+    '17b44cc997f5c498e809b22cdf2d9c7a9e71c02c8cc2b6c56e7c2d1239bfa526'
+)
+
+
+def _clear_websocket_modules():
+    """Remove a partially imported websocket package from ``sys.modules``."""
+
+    for name in tuple(sys.modules):
+        if name == 'websocket' or name.startswith('websocket.'):
+            sys.modules.pop(name, None)
+
+
+def _load_bundled_websocket():
+    """Load the verified project wheel without installing it.
+
+    The wheel path is added to ``sys.path`` only after its hard-coded digest is
+    verified.  A successful import keeps that path so websocket submodules can
+    be loaded lazily; all failure paths remove an insertion made by this call.
+    """
+
+    wheel_path = (
+        Path(__file__).resolve().parents[1]
+        / 'third_party'
+        / _BUILTIN_WEBSOCKET_FILENAME
+    )
+    if not wheel_path.is_file():
+        logger.info('watch-together disabled: bundled websocket-client wheel is missing')
+        return None
+
+    digest = hashlib.sha256()
+    try:
+        with wheel_path.open('rb') as wheel_file:
+            for chunk in iter(lambda: wheel_file.read(1024 * 1024), b''):
+                digest.update(chunk)
+    except OSError:
+        logger.info('watch-together disabled: bundled websocket-client wheel is unreadable')
+        return None
+    if digest.hexdigest().lower() != _BUILTIN_WEBSOCKET_SHA256:
+        logger.info('watch-together disabled: bundled websocket-client wheel checksum mismatch')
+        return None
+
+    wheel_entry = str(wheel_path)
+    inserted = False
+    if wheel_entry not in sys.path:
+        sys.path.insert(0, wheel_entry)
+        inserted = True
+    try:
+        # A failed system import can leave ``websocket`` and one or more of its
+        # submodules half initialized.  Clear those entries before zipimport.
+        _clear_websocket_modules()
+        importlib.invalidate_caches()
+        return importlib.import_module('websocket')
+    except Exception:
+        _clear_websocket_modules()
+        if inserted:
+            try:
+                sys.path.remove(wheel_entry)
+            except ValueError:
+                pass
+        logger.info('watch-together disabled: bundled websocket-client wheel import failed')
+        return None
 
 
 class WatchTogetherClient:
@@ -91,11 +163,16 @@ class WatchTogetherClient:
         # feature is enabled.  Missing dependency therefore cannot affect the
         # regular player startup path.
         try:
-            import websocket
-        except ImportError:
-            logger.info('watch-together disabled: websocket-client is not installed')
+            websocket = importlib.import_module('websocket')
+        except Exception:
+            websocket = _load_bundled_websocket()
+        if websocket is None:
             return None
-        return websocket.create_connection
+        factory = getattr(websocket, 'create_connection', None)
+        if not callable(factory):
+            logger.info('watch-together disabled: websocket-client create_connection unavailable')
+            return None
+        return factory
 
     def start(self):
         """Start the state/WebSocket worker, returning whether it started."""

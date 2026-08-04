@@ -45,7 +45,7 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
     * `etlp-python-embed-win32.zip` (Windows only)  
       修改配置文件：`embyToLocalPlayer_config.ini` 中的播放器路径，以及播放器选择。
     * `embyToLocalPlayer.zip` (Windows / Linux / macOS)  
-      安装 Python (勾选 add to path) [官网](https://www.python.org/downloads/)  
+      源码包运行仍需安装 Python (勾选 add to path) [官网](https://www.python.org/downloads/)
       修改配置文件：`embyToLocalPlayer_config.ini` 中的播放器路径，以及播放器选择。
 
 > 前置说明
@@ -62,7 +62,7 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
 同步观看是 etlp 自研的本地房间功能，不使用或宣传 Emby PartyService，也不提供网页播放器同步或客户端互连端口。当前版本只面向同一 Emby 服务器、恰好两名用户，以及 mpv/IINA：
 
 1. 在两台参与者机器的 `embyToLocalPlayer_config.ini` 中，将 `[watch_together]` 的 `enable = yes` 打开；在管理员本机额外设置 `admin_enable = yes`、与网页实际 Emby 相同的 `server_url` 根 URL，并填写管理员在 Emby 后台单独创建且可撤销的 `admin_api_key`。普通参与者不要填写 admin key。
-2. 在 etlp 所在目录安装 `requirements.txt` 中固定的 `websocket-client==1.8.0`（无需升级其他包）：`python -m pip install -r requirements.txt`。修改 INI 后重启两端 etlp。
+2. 发布包已内置 `websocket-client==1.8.0`，用户不需要另装 Python/pip 来安装这个依赖；Windows 便携版仍使用项目自带的嵌入式 Python。只有源码包裁剪掉 `third_party/` 时，才用实际运行 etlp 的 Python 执行 `python -m pip install -r requirements.txt`（无需升级其他包）。修改 INI 后重启两端 etlp。
 3. 两人分别用 mpv 或 IINA 打开同一视频，在 Emby 网页油猴菜单选择“同步观看房间”，管理员创建房间并选择两名参与者及主用户。列表中可暂停、继续或重新同步；两人都能暂停/继续/拖动进度（seek），主用户用于初始位置和冲突优先。
 
 限制：两端必须是同一 Emby 服务器且 `ItemId` 相同，媒体时长差不超过 3 秒，播放速度固定 1.0；允许不同 `MediaSourceId`。不会自动起播或自动播放下一集；任一端断开、停止或换片时会暂停另一方并等待。多人、邀请链接、聊天、速度/字幕/音轨/音量设置均不在范围内。

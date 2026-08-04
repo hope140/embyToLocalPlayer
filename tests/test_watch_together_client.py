@@ -1,16 +1,25 @@
+import hashlib
 import json
+import subprocess
 import sys
 import threading
 import time
 import unittest
+import types
+from pathlib import Path
 from unittest import mock
+from zipfile import ZipFile
 
 from utils.emby_session_api import (
     EmbySessionApi,
     derive_control_device_id,
 )
 from utils.players import get_mpv_snapshot
+import utils.watch_together_client as watch_together_client_module
 from utils.watch_together_client import WatchTogetherClient
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakePlayer:
@@ -238,9 +247,114 @@ class WatchTogetherClientTests(unittest.TestCase):
             {'server': 'emby', 'watch_together_enabled': True},
             player=self.player, session_api=self.api, enabled=True,
         )
-        with mock.patch.dict(sys.modules, {'websocket': None}):
-            self.assertFalse(client.start())
-        self.assertIsNone(client.thread)
+        try:
+            with mock.patch.dict(sys.modules, {'websocket': None}), mock.patch.object(
+                watch_together_client_module,
+                '_BUILTIN_WEBSOCKET_FILENAME',
+                'websocket-client-test-wheel-is-missing.whl',
+            ):
+                self.assertFalse(client.start())
+            self.assertIsNone(client.thread)
+        finally:
+            sys.modules.pop('websocket', None)
+
+    def test_bundled_websocket_wheel_metadata_and_hash(self):
+        wheel_path = ROOT / 'third_party' / 'websocket_client-1.8.0-py3-none-any.whl'
+        self.assertTrue(wheel_path.is_file())
+        digest = hashlib.sha256(wheel_path.read_bytes()).hexdigest()
+        self.assertEqual(digest, watch_together_client_module._BUILTIN_WEBSOCKET_SHA256)
+        with ZipFile(wheel_path) as wheel:
+            names = set(wheel.namelist())
+            self.assertIn('websocket/__init__.py', names)
+            metadata = wheel.read('websocket_client-1.8.0.dist-info/METADATA').decode(
+                'utf-8'
+            )
+            self.assertIn('Version: 1.8.0', metadata)
+            self.assertIn('License: Apache-2.0', metadata)
+            self.assertIn('websocket_client-1.8.0.dist-info/LICENSE', names)
+
+    def test_bundled_websocket_fallback_in_isolated_subprocess(self):
+        script = "\n".join((
+            'import sys',
+            f"sys.path.insert(0, {str(ROOT)!r})",
+            'import importlib',
+            "sys.modules['websocket'] = None",
+            'from utils.watch_together_client import WatchTogetherClient',
+            "client = WatchTogetherClient({'server': 'emby'}, player=object(), session_api=object(), enabled=True)",
+            'factory = client._load_websocket_factory()',
+            "module = importlib.import_module('websocket')",
+            "assert callable(factory)",
+            "assert factory is module.create_connection",
+            "assert module.__version__ == '1.8.0'",
+            "sys.__stdout__.write(module.__version__ + '\\n')",
+            "sys.__stdout__.flush()",
+        ))
+        result = subprocess.run(
+            [sys.executable, '-c', script],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.lstrip('\ufeff').strip(), '1.8.0')
+
+    def test_bundled_websocket_hash_mismatch_degrades_without_thread(self):
+        client = WatchTogetherClient(
+            {'server': 'emby', 'watch_together_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+        )
+        try:
+            with mock.patch.dict(sys.modules, {'websocket': None}), mock.patch.object(
+                watch_together_client_module,
+                '_BUILTIN_WEBSOCKET_SHA256',
+                '0' * 64,
+            ):
+                self.assertFalse(client.start())
+            self.assertIsNone(client.thread)
+        finally:
+            sys.modules.pop('websocket', None)
+
+    def test_bundled_websocket_import_failure_cleans_up_path_and_modules(self):
+        client = WatchTogetherClient(
+            {'server': 'emby', 'watch_together_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+        )
+        wheel_entry = str(
+            ROOT / 'third_party' / 'websocket_client-1.8.0-py3-none-any.whl'
+        )
+        try:
+            with mock.patch.dict(sys.modules, {'websocket': None}), mock.patch.object(
+                watch_together_client_module.importlib,
+                'import_module',
+                side_effect=ImportError('simulated wheel import failure'),
+            ):
+                self.assertFalse(client.start())
+            self.assertIsNone(client.thread)
+            self.assertNotIn(wheel_entry, sys.path)
+            self.assertNotIn('websocket', sys.modules)
+        finally:
+            sys.modules.pop('websocket', None)
+
+    def test_system_websocket_module_is_preferred(self):
+        fake = types.ModuleType('websocket')
+
+        def fake_factory(*_args, **_kwargs):
+            return None
+
+        fake.create_connection = fake_factory
+        wheel_entry = str(
+            ROOT / 'third_party' / 'websocket_client-1.8.0-py3-none-any.whl'
+        )
+        before = list(sys.path)
+        with mock.patch.dict(sys.modules, {'websocket': fake}):
+            client = WatchTogetherClient(
+                {'server': 'emby', 'watch_together_enabled': True},
+                player=self.player, session_api=self.api, enabled=True,
+            )
+            self.assertIs(client._load_websocket_factory(), fake.create_connection)
+        self.assertEqual(sys.path, before)
+        self.assertNotIn(wheel_entry, sys.path)
 
     def test_normal_progress_does_not_look_like_a_seek(self):
         self.client.publish_snapshot({'position_sec': 10, 'is_paused': False}, now=0)

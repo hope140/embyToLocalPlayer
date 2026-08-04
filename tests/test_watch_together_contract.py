@@ -84,6 +84,8 @@ class WatchTogetherUiContractTests(unittest.TestCase):
             "同步观看（实验）",
             "requirements.txt",
             "websocket-client==1.8.0",
+            "内置",
+            "实际运行 etlp 的 Python",
             "enable = yes",
             "admin_enable = yes",
             "admin_api_key",
