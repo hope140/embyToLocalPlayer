@@ -29,7 +29,6 @@ $excludedFilePatterns = @(
     '*_secret*', '*_secrets*', '*_key*', '*token*', '*.bak'
 )
 
-$stagingRoot = Join-Path ([IO.Path]::GetTempPath()) ("etlp-watch_together-" + [guid]::NewGuid().ToString('N'))
 $archivePath = Join-Path $outputRoot 'embyToLocalPlayer-watch_together.zip'
 
 function Test-ExcludedFile {
@@ -50,6 +49,20 @@ function Copy-PackageFile {
     New-Item -ItemType Directory -Path (Split-Path -Parent $targetPath) -Force | Out-Null
     Copy-Item -LiteralPath $sourcePath -Destination $targetPath -Force
 }
+
+function Normalize-DirectoryPath {
+    param([string]$Path)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $rootPath = [IO.Path]::GetPathRoot($fullPath)
+    if ($fullPath.Length -gt $rootPath.Length) {
+        $fullPath = $fullPath.TrimEnd('\', '/')
+    }
+    return $fullPath
+}
+
+$tempBaseResolved = Normalize-DirectoryPath ((Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())).Path)
+$stagingName = "etlp-watch_together-" + [guid]::NewGuid().ToString('N')
+$stagingRoot = [IO.Path]::GetFullPath((Join-Path $tempBaseResolved $stagingName))
 
 try {
     New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
@@ -88,6 +101,17 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $stagingRoot) {
-        Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+        if (-not (Test-Path -LiteralPath $stagingRoot -PathType Container)) {
+            throw "Refusing to remove non-directory staging path: $stagingRoot"
+        }
+        $stagingResolved = (Resolve-Path -LiteralPath $stagingRoot).Path
+        $stagingParent = Normalize-DirectoryPath ([IO.Path]::GetDirectoryName($stagingResolved))
+        $stagingLeaf = [IO.Path]::GetFileName($stagingResolved)
+        $validName = $stagingLeaf -match '^etlp-watch_together-[0-9a-fA-F]{32}$'
+        $sameParent = [string]::Equals($stagingParent, $tempBaseResolved, [StringComparison]::OrdinalIgnoreCase)
+        if (-not ($sameParent -and $validName)) {
+            throw "Refusing to remove unverified staging path: $stagingResolved"
+        }
+        Remove-Item -LiteralPath $stagingResolved -Recurse -Force
     }
 }
