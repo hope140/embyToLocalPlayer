@@ -69,7 +69,8 @@ def _command_label(value):
 
     normalized = str(value or "").strip().lower()
     if normalized in {
-        "pause", "unpause", "play", "seek", "stop", "displaymessage",
+        "pause", "unpause", "play", "playpause", "seek", "stop",
+        "displaymessage",
     }:
         return normalized
     return f"unknown_{_short_hash(normalized)}"
@@ -781,6 +782,19 @@ class WatchTogetherClient:
             return self._finish_playstate_command(
                 'Pause' if command == 'pause' else 'Unpause', handled,
             )
+        if command == 'playpause':
+            try:
+                snapshot = self._snapshot()
+                paused = (
+                    snapshot.get('is_paused') if isinstance(snapshot, dict) else None
+                )
+                if not isinstance(paused, bool):
+                    handled = False
+                else:
+                    handled = mpv_set_pause(self.player, not paused)
+            except Exception:
+                handled = False
+            return self._finish_playstate_command('PlayPause', handled)
         if command == 'seek':
             ticks = _field(payload, 'SeekPositionTicks')
             if ticks is None:

@@ -319,6 +319,43 @@ class WatchTogetherClientTests(unittest.TestCase):
         })))
         self.assertIn(('show-text', 'hello', 1000), self.player.commands)
 
+    def test_playpause_toggles_paused_player_and_reports_ack(self):
+        self.player.paused = True
+        self.client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': True}, now=0,
+        )
+        reports_before = len(self.api.reports)
+        self.assertTrue(self.client.handle_message(json.dumps({
+            'MessageType': 'Playstate',
+            'Data': json.dumps({'Command': 'PLAYPAUSE'}),
+        })))
+        self.assertFalse(self.player.paused)
+        self.assertEqual(self.api.reports[-1][0], 'progress')
+        self.assertEqual(self.api.reports[-1][1]['event_name'], 'Unpause')
+        self.assertGreater(len(self.api.reports), reports_before)
+
+        self.assertTrue(self.client.handle_message(json.dumps({
+            'MessageType': 'Playstate',
+            'Data': json.dumps({'Command': 'PlayPause'}),
+        })))
+        self.assertTrue(self.player.paused)
+        self.assertEqual(self.api.reports[-1][0], 'progress')
+        self.assertEqual(self.api.reports[-1][1]['event_name'], 'Pause')
+
+    def test_playpause_with_invalid_snapshot_fails_without_report(self):
+        reports_before = len(self.api.reports)
+        with mock.patch.object(
+            self.client, '_snapshot', side_effect=RuntimeError('snapshot failed')
+        ), mock.patch.object(
+            watch_together_client_module, 'mpv_set_pause'
+        ) as set_pause:
+            self.assertFalse(self.client.handle_message(json.dumps({
+                'MessageType': 'Playstate',
+                'Data': json.dumps({'Command': 'PlayPause'}),
+            })))
+        set_pause.assert_not_called()
+        self.assertEqual(len(self.api.reports), reports_before)
+
     def test_identity_uses_emby_pipe_delimited_data(self):
         self.assertTrue(self.client._send_identity(self.ws))
         self.assertEqual(self.ws.sent[0]['MessageType'], 'Identity')
