@@ -63,16 +63,17 @@ class EmbyAdminApi:
     def http_base_url(self):
         return f"{self.server_url}/emby" if self.server_url else ""
 
-    def _headers(self, token=None):
+    def _headers(self, token=None, user_id=None):
         # Do not put credentials in logs or response objects.  The temporary
         # user token supplied to verify_admin_user is only represented here.
         token = self.admin_api_key if token is None else str(token)
+        user_suffix = f', UserId="{user_id}"' if user_id is not None else ""
         authorization = (
             f'MediaBrowser Client="{self.client_name}", '
             f'Device="{self.device_name}", DeviceId="{self.device_id}", '
-            f'Version="1.0", Token="{token}"'
+            f'Version="1.0", Token="{token}"{user_suffix}'
         )
-        return {
+        headers = {
             "Accept": "application/json",
             "Content-Type": "application/json; charset=utf-8",
             "X-Emby-Token": token,
@@ -81,14 +82,17 @@ class EmbyAdminApi:
             "X-Emby-Device-Id": self.device_id,
             "X-Emby-Authorization": authorization,
         }
+        if user_id is not None:
+            headers["X-Emby-User-Id"] = str(user_id)
+        return headers
 
     def _request(self, path, *, method="GET", params=None, payload=None,
-                 token=None, timeout=None):
+                 token=None, user_id=None, timeout=None):
         if not self.http_base_url:
             raise WatchTogetherApiError("server_url is not configured")
         url = f"{self.http_base_url}/{str(path).lstrip('/')}"
         kwargs = {
-            "headers": self._headers(token),
+            "headers": self._headers(token, user_id=user_id),
             "method": method,
             "timeout": self.timeout if timeout is None else timeout,
             "retry": 1,
@@ -135,6 +139,7 @@ class EmbyAdminApi:
     def get_user(self, user_id, user_token):
         value = self._request(
             f"Users/{urllib.parse.quote(str(user_id), safe='')}", token=user_token,
+            user_id=user_id,
         )
         return value if isinstance(value, dict) else {}
 
@@ -215,7 +220,8 @@ class WatchTogetherCoordinator:
                  admin_api_key=None, config=None, enabled=None,
                  poll_interval=1.0, clock=None, sleeper=None, poll=None,
                  poll_func=None):
-        self.store = store or WatchTogetherStore()
+        self.store = store
+        self._store_error = None
         self.config = config or configs
         self._enabled_override = enabled
         self._server_url_override = server_url
@@ -240,6 +246,24 @@ class WatchTogetherCoordinator:
         self._stop_event = threading.Event()
         self._thread = None
         self._runtime = {}
+        self._cached_server_id = str(getattr(self.api, "server_id", "") or "") or None
+        self._identity_server_url = self.server_url
+        self._identity_checked = bool(self._cached_server_id)
+
+    def ensure_store(self):
+        if self.store is not None:
+            return self.store
+        try:
+            self.store = WatchTogetherStore()
+            self._store_error = None
+            return self.store
+        except WatchTogetherStoreError as exc:
+            self._store_error = exc
+            raise
+
+    @property
+    def store_error(self):
+        return self._store_error
 
     def _refresh_config(self):
         raw = getattr(self.config, "raw", self.config)
@@ -260,6 +284,9 @@ class WatchTogetherCoordinator:
             self.server_url = str(self._server_url_override or "").strip()
         if self._admin_api_key_override is not None:
             self.admin_api_key = str(self._admin_api_key_override or "").strip()
+        if getattr(self, "_identity_server_url", self.server_url) != self.server_url:
+            self._identity_server_url = self.server_url
+            self._identity_checked = False
         try:
             self._config_enable = bool(getbool("watch_together", "enable", fallback=False)) if getbool else False
             self._config_admin_enable = bool(getbool("watch_together", "admin_enable", fallback=False)) if getbool else False
@@ -301,6 +328,10 @@ class WatchTogetherCoordinator:
     def start(self):
         enabled, _ = self.feature_status()
         if not enabled:
+            return False
+        try:
+            self.ensure_store()
+        except WatchTogetherStoreError:
             return False
         with self._lock:
             if self._thread and self._thread.is_alive():
@@ -351,7 +382,7 @@ class WatchTogetherCoordinator:
         return runtime
 
     def list_rooms(self):
-        rooms = self.store.list_rooms()
+        rooms = self.ensure_store().list_rooms()
         with self._lock:
             summaries = []
             for room in rooms:
@@ -381,15 +412,57 @@ class WatchTogetherCoordinator:
     def current_server_id(self):
         value = getattr(self.api, "server_id", None)
         if value:
-            return str(value)
+            self._cached_server_id = str(value)
+            self._identity_checked = True
+            return self._cached_server_id
         info = self._api_call("get_system_info")
         if isinstance(info, dict):
             value = info.get("Id") or info.get("ServerId")
         if not value:
             raise WatchTogetherApiError("Emby System/Info did not return a server id")
-        return str(value)
+        self._cached_server_id = str(value)
+        self._identity_checked = True
+        return self._cached_server_id
+
+    def _ensure_server_identity(self):
+        """Resolve System/Info once per configured server, never per room poll."""
+
+        self._refresh_config()
+        advertised_id = str(getattr(self.api, "server_id", "") or "") or None
+        if advertised_id and advertised_id != self._cached_server_id:
+            self._cached_server_id = advertised_id
+            self._identity_checked = True
+        if self._identity_checked:
+            return self._cached_server_id
+        if not self.api or not self.server_url:
+            return None
+        try:
+            info = self._api_call("get_system_info")
+            value = info.get("Id") or info.get("ServerId") if isinstance(info, dict) else None
+            if not value:
+                return None
+            self._cached_server_id = str(value)
+            self._identity_checked = True
+            if hasattr(self.api, "server_id"):
+                self.api.server_id = self._cached_server_id
+            return self._cached_server_id
+        except Exception:
+            return None
+
+    def _room_matches_current_server(self, room):
+        try:
+            current_url = normalize_server_url(self.server_url)
+        except ValueError:
+            return False
+        server_id = self._ensure_server_identity()
+        return bool(
+            server_id
+            and room.get("server_id") == server_id
+            and normalize_server_url(room.get("server_url")) == current_url
+        )
 
     def create_room(self, name, participant_user_ids, primary_user_id):
+        store = self.ensure_store()
         users = {str(user["id"]): user for user in self.users_for_ui()}
         members = [str(value) for value in participant_user_ids]
         if len(members) != 2 or len(set(members)) != 2:
@@ -400,7 +473,7 @@ class WatchTogetherCoordinator:
         if primary not in members:
             raise ValueError("primary_user_id must be a participant")
         server_url = normalize_server_url(self.server_url or getattr(self.api, "server_url", ""))
-        room = self.store.create_room(
+        room = store.create_room(
             server_id=self.current_server_id(), server_url=server_url,
             name=name, participant_user_ids=members, primary_user_id=primary,
         )
@@ -409,13 +482,13 @@ class WatchTogetherCoordinator:
         return room
 
     def delete_room(self, room_id):
-        deleted = self.store.delete_room(room_id)
+        deleted = self.ensure_store().delete_room(room_id)
         with self._lock:
             self._runtime.pop(str(room_id), None)
         return deleted
 
     def action(self, room_id, action):
-        room = self.store.get_room(room_id)
+        room = self.ensure_store().get_room(room_id)
         if not room:
             raise KeyError("room not found")
         action = str(action).lower()
@@ -528,10 +601,12 @@ class WatchTogetherCoordinator:
             return False
         if not values[0]["item_id"] or values[0]["item_id"] != values[1]["item_id"]:
             return False
-        runtimes = [value["runtime_ticks"] for value in values]
-        if all(runtimes) and abs(runtimes[0] - runtimes[1]) > MAX_RUNTIME_DIFFERENCE_TICKS:
+        runtimes = [_as_float(value.get("runtime_ticks"), 0) for value in values]
+        if any(runtime <= 0 for runtime in runtimes):
             return False
-        return all(abs(value["playback_rate"] - 1.0) <= 0.01 for value in values)
+        if abs(runtimes[0] - runtimes[1]) > MAX_RUNTIME_DIFFERENCE_TICKS:
+            return False
+        return all(abs(_as_float(value.get("playback_rate"), 0) - 1.0) <= 0.010000001 for value in values)
 
     def _issue(self, runtime, user_id, snapshot, command, *, now, position_ticks=None):
         user_id = str(user_id)
@@ -608,6 +683,8 @@ class WatchTogetherCoordinator:
                 )
                 if user_id in runtime["pending"]:
                     runtime["pending"][user_id]["retries"] = 1
+                    if runtime.get("state") == "barrier" and runtime.get("barrier"):
+                        runtime["barrier"]["started_at"] = now
             else:
                 del runtime["pending"][user_id]
                 failed = True
@@ -703,28 +780,23 @@ class WatchTogetherCoordinator:
         if len(online_playing) == 1:
             user_id, snapshot = online_playing[0]
         else:
-            # When both sessions are live but their items diverge, preserve
-            # the participant whose previous item still matches and pause the
-            # other.  On the first mismatched round there is no history, so
-            # the secondary is the deterministic fallback.
             previous = runtime.get("previous") or {}
-            primary_id = room["primary_user_id"]
-            previous_item = (previous.get(primary_id) or {}).get("item_id")
-            if previous_item:
-                target = next(
-                    ((uid, snap) for uid, snap in online_playing
-                     if uid != primary_id and snap.get("item_id") != previous_item),
-                    None,
-                )
-                if target:
-                    user_id, snapshot = target
-                else:
-                    user_id, snapshot = online_playing[0]
-            else:
-                user_id, snapshot = next(
-                    ((uid, snap) for uid, snap in online_playing if uid != primary_id),
-                    online_playing[0],
-                )
+            changed = {
+                user_id for user_id, snapshot in online_playing
+                if user_id in previous and previous[user_id].get("item_id") != snapshot.get("item_id")
+            }
+            values = [snapshot for _, snapshot in online_playing]
+            item_mismatch = len({value.get("item_id") for value in values}) > 1
+            rates_ok = all(abs(_as_float(value.get("playback_rate"), 0) - 1.0) <= 0.010000001 for value in values)
+            runtimes = [_as_float(value.get("runtime_ticks"), 0) for value in values]
+            runtime_ok = len(runtimes) == 2 and all(runtime > 0 for runtime in runtimes) \
+                and abs(runtimes[0] - runtimes[1]) <= MAX_RUNTIME_DIFFERENCE_TICKS
+            counterparts = [pair for pair in online_playing if pair[0] not in changed]
+            unambiguous_item_change = item_mismatch and rates_ok and runtime_ok
+            targets = counterparts if unambiguous_item_change and len(changed) == 1 and len(counterparts) == 1 else online_playing
+            for user_id, snapshot in targets:
+                self._issue(runtime, user_id, snapshot, "Pause", now=now)
+            return
         self._issue(runtime, user_id, snapshot, "Pause", now=now)
 
     def _watching_tick(self, runtime, room, snapshots, now):
@@ -796,14 +868,41 @@ class WatchTogetherCoordinator:
             return []
         now = self.clock() if now is None else float(now)
         try:
+            rooms = self.ensure_store().list_rooms()
+        except WatchTogetherStoreError:
+            return []
+        if not rooms:
+            return []
+        valid_room_ids = set()
+        for room in rooms:
+            if self._room_matches_current_server(room):
+                valid_room_ids.add(room["id"])
+            else:
+                with self._lock:
+                    runtime = self._room_runtime(room)
+                    runtime["state"] = "unavailable"
+                    runtime["error"] = "room server is unavailable"
+                    runtime["barrier"] = None
+                    runtime["pending"] = {}
+        if not valid_room_ids:
+            return [
+                {"room_id": room["id"], "state": self._runtime[room["id"]]["state"], "eligible": False}
+                for room in rooms
+            ]
+        try:
             sessions = self.poll() if self.poll is not None else self._api_call("get_sessions")
         except Exception:
             return []
         results = []
-        rooms = self.store.list_rooms()
         with self._lock:
             for room in rooms:
                 runtime = self._room_runtime(room)
+                if room["id"] not in valid_room_ids:
+                    results.append({"room_id": room["id"], "state": runtime["state"], "eligible": False})
+                    continue
+                if runtime["state"] == "unavailable":
+                    runtime["state"] = "waiting"
+                    runtime["error"] = None
                 selected = self._select_sessions(sessions, room["participant_user_ids"])
                 snapshots = {
                     user_id: self._snapshot(session, user_id)
@@ -900,6 +999,10 @@ class WatchTogetherHttpService:
             return False, 503, "watch-together administrator service is disabled"
         if not server_url or not admin_key:
             return False, 503, "watch-together server_url/admin_api_key is missing"
+        try:
+            self.coordinator.ensure_store()
+        except WatchTogetherStoreError:
+            return False, 503, "watch-together room store is unavailable"
         return True, 0, ""
 
     def start(self):
@@ -912,7 +1015,10 @@ class WatchTogetherHttpService:
         return bool(self._available()[0])
 
     def stop(self, timeout=5.0):
-        return self.coordinator.stop(timeout=timeout)
+        try:
+            return self.coordinator.stop(timeout=timeout)
+        except Exception:
+            return None
 
     @staticmethod
     def _error(status, code, message):

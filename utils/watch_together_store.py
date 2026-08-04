@@ -164,7 +164,22 @@ class WatchTogetherStore:
             if clean["id"] in result:
                 raise WatchTogetherStoreError(f"duplicate room id: {clean['id']}")
             result[clean["id"]] = clean
+        self._validate_member_overlap(result)
         return result
+
+    @staticmethod
+    def _validate_member_overlap(rooms):
+        seen = {}
+        for room in rooms.values() if isinstance(rooms, dict) else rooms:
+            server_id = room["server_id"]
+            for user_id in room["participant_user_ids"]:
+                key = (server_id, user_id)
+                previous = seen.get(key)
+                if previous and previous != room["id"]:
+                    raise WatchTogetherStoreError(
+                        f"user {user_id} belongs to multiple rooms on server {server_id}"
+                    )
+                seen[key] = room["id"]
 
     def load(self):
         """Load from disk, preserving a damaged file for manual recovery."""
@@ -231,8 +246,16 @@ class WatchTogetherStore:
         with self._lock:
             if room["id"] in self._rooms:
                 raise WatchTogetherStoreError(f"room id already exists: {room['id']}")
-            self._rooms[room["id"]] = room
-            self._write()
+            candidate = dict(self._rooms)
+            candidate[room["id"]] = room
+            self._validate_member_overlap(candidate)
+            previous = self._rooms
+            self._rooms = candidate
+            try:
+                self._write()
+            except Exception:
+                self._rooms = previous
+                raise
             return copy.deepcopy(room)
 
     create = create_room
@@ -242,8 +265,15 @@ class WatchTogetherStore:
         with self._lock:
             if room_id not in self._rooms:
                 return False
-            del self._rooms[room_id]
-            self._write()
+            previous = self._rooms
+            candidate = dict(self._rooms)
+            del candidate[room_id]
+            self._rooms = candidate
+            try:
+                self._write()
+            except Exception:
+                self._rooms = previous
+                raise
             return True
 
     delete = delete_room

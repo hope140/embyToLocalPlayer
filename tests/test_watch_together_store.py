@@ -62,6 +62,52 @@ class WatchTogetherStoreTests(unittest.TestCase):
         with self.assertRaises(WatchTogetherStoreError):
             WatchTogetherStore(self.path)
 
+    def test_member_cannot_belong_to_two_rooms_on_same_server(self):
+        store = WatchTogetherStore(self.path)
+        store.create_room("s1", "https://one.test", "one", ["u1", "u2"], "u1")
+        with self.assertRaises(WatchTogetherStoreError):
+            store.create_room("s1", "https://one.test", "two", ["u1", "u3"], "u1")
+        # A user may participate in a room on a different Emby server.
+        store.create_room("s2", "https://two.test", "two", ["u1", "u3"], "u1")
+
+    def test_load_rejects_same_server_member_overlap(self):
+        payload = {
+            "schema_version": 1,
+            "rooms": [
+                {
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "server_id": "s", "server_url": "https://x.test", "name": "one",
+                    "participant_user_ids": ["u1", "u2"], "primary_user_id": "u1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "id": "00000000-0000-0000-0000-000000000002",
+                    "server_id": "s", "server_url": "https://x.test", "name": "two",
+                    "participant_user_ids": ["u1", "u3"], "primary_user_id": "u1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                },
+            ],
+        }
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        original = self.path.read_bytes()
+        with self.assertRaises(WatchTogetherStoreError):
+            WatchTogetherStore(self.path)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_create_and_delete_roll_back_memory_when_write_fails(self):
+        store = WatchTogetherStore(self.path)
+        original_write = store._write
+        store._write = lambda: (_ for _ in ()).throw(OSError("disk full"))
+        with self.assertRaises(Exception):
+            store.create_room("s", "https://x.test", "x", ["u1", "u2"], "u1")
+        self.assertEqual(store.list_rooms(), [])
+        store._write = original_write
+        room = store.create_room("s", "https://x.test", "x", ["u1", "u2"], "u1")
+        store._write = lambda: (_ for _ in ()).throw(OSError("disk full"))
+        with self.assertRaises(Exception):
+            store.delete_room(room["id"])
+        self.assertEqual(store.list_rooms(), [room])
+
 
 if __name__ == "__main__":
     unittest.main()

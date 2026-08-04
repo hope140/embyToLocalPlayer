@@ -1,10 +1,16 @@
 import configparser
+import json
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from utils.watch_together_coordinator import WatchTogetherCoordinator, WatchTogetherHttpService
+from utils.configs import configs
 from utils.watch_together_store import WatchTogetherStore
+from utils.http_server import ThreadingHTTPServer, UserScriptRequestHandler
 
 
 class FakeApi:
@@ -97,6 +103,132 @@ class WatchTogetherHttpTests(unittest.TestCase):
         )
         self.assertEqual(status, 503)
         self.assertEqual(body["error"]["code"], "watch_together_unavailable")
+
+    def test_disabled_corrupt_store_is_not_read_or_created(self):
+        disabled = configparser.ConfigParser()
+        disabled["watch_together"] = {
+            "enable": "false", "admin_enable": "false",
+            "server_url": "", "admin_api_key": "",
+        }
+        path = Path(configs.cwd) / "watch_together_rooms.json"
+        existed = path.exists()
+        original = path.read_bytes() if existed else None
+        try:
+            path.write_text("{broken", encoding="utf-8")
+            service = WatchTogetherHttpService(config=disabled)
+            self.assertIsNone(service.coordinator.store)
+            self.assertFalse(service.start())
+            self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
+        finally:
+            if existed:
+                path.write_bytes(original)
+            elif path.exists():
+                path.unlink()
+
+    def test_enabled_corrupt_store_returns_503_and_keeps_file(self):
+        enabled = configparser.ConfigParser()
+        enabled["watch_together"] = {
+            "enable": "true", "admin_enable": "true",
+            "server_url": "https://media.test", "admin_api_key": "admin-secret",
+        }
+        path = Path(configs.cwd) / "watch_together_rooms.json"
+        existed = path.exists()
+        original = path.read_bytes() if existed else None
+        try:
+            path.write_text('{"schema_version": 999, "rooms": []}', encoding="utf-8")
+            service = WatchTogetherHttpService(config=enabled)
+            status, body = service.handle(
+                "/watch-together/auth", {}, client_address=("127.0.0.1", 1)
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(body["error"]["code"], "watch_together_unavailable")
+            self.assertFalse(service.start())
+            self.assertEqual(path.read_bytes(), b'{"schema_version": 999, "rooms": []}')
+        finally:
+            if existed:
+                path.write_bytes(original)
+            elif path.exists():
+                path.unlink()
+
+    def test_real_http_handler_cors_204_get_compatibility_and_single_call(self):
+        class RecordingService:
+            def __init__(self):
+                self.calls = 0
+
+            def handle(self, path, body, *, headers, client_address, method):
+                self.calls += 1
+                if method == "OPTIONS":
+                    return 204, {}
+                return 200, {"ok": True}
+
+            def start(self):
+                return False
+
+            def stop(self, timeout=5):
+                return None
+
+        service = RecordingService()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), UserScriptRequestHandler)
+        server.watch_together_service = service
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            request = urllib.request.Request(
+                base + "/watch-together/rooms/list",
+                data=b"{}", method="POST", headers={"Content-Type": "application/json"},
+            )
+            response = urllib.request.urlopen(request)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.read()), {"ok": True})
+            self.assertEqual(service.calls, 1)
+
+            options = urllib.request.Request(base + "/watch-together/rooms/list", method="OPTIONS")
+            response = urllib.request.urlopen(options)
+            self.assertEqual(response.status, 204)
+            self.assertEqual(response.read(), b"")
+            self.assertEqual(response.headers.get("Content-Length"), "0")
+            self.assertIn("X-ETLP-Watch-Token", response.headers["Access-Control-Allow-Headers"])
+            self.assertEqual(service.calls, 2)
+
+            response = urllib.request.urlopen(base + "/")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b"Server is running")
+            self.assertEqual(service.calls, 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_handler_internal_type_error_is_not_retried(self):
+        class FailingService:
+            calls = 0
+
+            def handle(self, *args, **kwargs):
+                self.calls += 1
+                raise TypeError("intentional")
+
+        service = FailingService()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), UserScriptRequestHandler)
+        server.watch_together_service = service
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}/watch-together/auth",
+                data=b"{}", method="POST", headers={"Content-Type": "application/json"},
+            )
+            try:
+                response = urllib.request.urlopen(request)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            self.assertEqual(response.status, 503)
+            self.assertEqual(json.loads(response.read())["error"]["code"], "watch_together_error")
+            self.assertEqual(service.calls, 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":

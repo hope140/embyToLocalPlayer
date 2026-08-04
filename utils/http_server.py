@@ -84,7 +84,9 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         return service
 
     def _write_watch_result(self, status, payload):
-        encoded = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        encoded = b'' if status == 204 else json.dumps(
+            payload, ensure_ascii=False, separators=(',', ':')
+        ).encode('utf-8')
         self.send_response(status)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(encoded)))
@@ -108,13 +110,13 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
                 self.path, body, headers=dict(self.headers.items()),
                 client_address=self.client_address, method=method,
             )
-        except TypeError:
-            # Keep direct handler tests/fakes that predate the explicit method
-            # argument compatible without changing ordinary endpoint behavior.
-            status, payload = service.handle(
-                self.path, body, headers=dict(self.headers.items()),
-                client_address=self.client_address,
-            )
+        except Exception:
+            status, payload = 503, {
+                'error': {
+                    'code': 'watch_together_error',
+                    'message': 'watch-together service is temporarily unavailable',
+                },
+            }
         self._write_watch_result(status, payload)
         return True
 
