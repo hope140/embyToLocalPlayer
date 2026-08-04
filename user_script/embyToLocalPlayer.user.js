@@ -481,6 +481,10 @@
             #${WATCH_TOGETHER_PAGE_ID} {
                 box-sizing:border-box;
                 min-height:100%;
+                height:100%;
+                overflow-y:auto;
+                overflow-x:hidden;
+                -webkit-overflow-scrolling:touch;
                 padding:5.5em 1.5em 2.5em;
                 color:currentColor;
                 --etlp-wt-border:color-mix(in srgb, currentColor 28%, transparent);
