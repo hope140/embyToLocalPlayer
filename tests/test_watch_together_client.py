@@ -277,7 +277,7 @@ class EmbySessionApiTests(unittest.TestCase):
         self.assertEqual(requests[0][1]['params'], {'Id': 'server-session'})
         self.assertEqual(
             requests[0][1]['_json']['SupportedCommands'],
-            ['Pause', 'Unpause', 'Seek', 'DisplayMessage'],
+            ['PlayPause', 'Stop', 'Pause', 'Unpause', 'Seek', 'DisplayMessage'],
         )
 
     def test_capabilities_endpoint_uses_query_session_id_for_non_full(self):

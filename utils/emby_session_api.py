@@ -24,7 +24,14 @@ CONTROL_DEVICE_VERSION = "1.0"
 # resolve to one server-side Session.
 DEFAULT_AUTH_CLIENT_NAME = "Emby Web"
 DEFAULT_AUTH_DEVICE_NAME = "embyToLocalPlayer"
-SUPPORTED_COMMANDS = ("Pause", "Unpause", "Seek", "DisplayMessage")
+SUPPORTED_COMMANDS = (
+    "PlayPause",
+    "Stop",
+    "Pause",
+    "Unpause",
+    "Seek",
+    "DisplayMessage",
+)
 
 
 def _normalise_path(value):
