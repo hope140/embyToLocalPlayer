@@ -219,8 +219,10 @@ class WatchTogetherCoordinator:
     def __init__(self, store=None, api=None, *, server_url=None,
                  admin_api_key=None, config=None, enabled=None,
                  poll_interval=1.0, clock=None, sleeper=None, poll=None,
-                 poll_func=None):
+                 poll_func=None, store_path=None, store_factory=None):
         self.store = store
+        self.store_path = store_path
+        self.store_factory = store_factory
         self._store_error = None
         self.config = config or configs
         self._enabled_override = enabled
@@ -254,7 +256,12 @@ class WatchTogetherCoordinator:
         if self.store is not None:
             return self.store
         try:
-            self.store = WatchTogetherStore()
+            if self.store_factory is not None:
+                self.store = self.store_factory()
+            elif self.store_path is not None:
+                self.store = WatchTogetherStore(self.store_path)
+            else:
+                self.store = WatchTogetherStore()
             self._store_error = None
             return self.store
         except WatchTogetherStoreError as exc:
@@ -347,8 +354,15 @@ class WatchTogetherCoordinator:
         self._stop_event.set()
         thread = self._thread
         if thread and thread is not threading.current_thread():
-            thread.join(max(0.0, float(timeout)))
-        self._thread = None
+            try:
+                thread.join(max(0.0, float(timeout)))
+            except Exception:
+                return False
+        if thread and thread.is_alive():
+            return False
+        if self._thread is thread:
+            self._thread = None
+        return True
 
     def _run(self):
         while not self._stop_event.is_set():
@@ -959,8 +973,10 @@ class WatchTogetherHttpService:
     TOKEN_TTL = 30 * 60
 
     def __init__(self, coordinator=None, *, config=None, clock=None,
-                 token_ttl=TOKEN_TTL):
-        self.coordinator = coordinator or WatchTogetherCoordinator(config=config)
+                 token_ttl=TOKEN_TTL, store_path=None, store_factory=None):
+        self.coordinator = coordinator or WatchTogetherCoordinator(
+            config=config, store_path=store_path, store_factory=store_factory,
+        )
         self.config = config or getattr(self.coordinator, "config", configs)
         self.clock = clock or time.time
         self.token_ttl = max(1, int(token_ttl))
@@ -1006,10 +1022,13 @@ class WatchTogetherHttpService:
         return True, 0, ""
 
     def start(self):
-        available, _, _ = self._available()
-        if not available:
+        try:
+            available, _, _ = self._available()
+            if not available:
+                return False
+            return bool(self.coordinator.start())
+        except Exception:
             return False
-        return bool(self.coordinator.start())
 
     def is_enabled(self):
         return bool(self._available()[0])

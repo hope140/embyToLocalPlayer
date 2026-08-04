@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -187,14 +188,42 @@ class WatchTogetherCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.api.commands[before + 1][1], "Unpause")
 
     def test_cross_server_room_is_unavailable_and_never_commands(self):
+        self.assertTrue(self.coordinator.delete_room(self.room["id"]))
         other = self.store.create_room(
             "other-server", "https://other.test", "other", ["u1", "u2"], "u1"
         )
+        self.api.commands.clear()
         self.coordinator.poll_once(now=0)
         runtime = self.coordinator.runtime[other["id"]]
         self.assertEqual(runtime["state"], "unavailable")
         self.assertIn("unavailable", runtime["error"])
-        self.assertTrue(all(command[0] in ("s1", "s2") for command in self.api.commands))
+        self.assertEqual(self.api.commands, [])
+
+    def test_stop_timeout_retains_worker_until_it_exits(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_poll():
+            entered.set()
+            release.wait(1.0)
+            return []
+
+        coordinator = WatchTogetherCoordinator(
+            store=self.store, api=self.api, enabled=True,
+            server_url=self.api.server_url, admin_api_key="admin-secret",
+            poll_interval=0.05, poll_func=blocking_poll,
+        )
+        self.assertTrue(coordinator.start())
+        self.assertTrue(entered.wait(1.0))
+        worker = coordinator.thread
+        self.assertIsNotNone(worker)
+        self.assertFalse(coordinator.stop(timeout=0.01))
+        self.assertIs(coordinator.thread, worker)
+        self.assertTrue(worker.is_alive())
+        release.set()
+        worker.join(1.0)
+        self.assertTrue(coordinator.stop(timeout=1.0))
+        self.assertIsNone(coordinator.thread)
 
     def test_unacknowledged_command_retries_once_then_waits_without_storm(self):
         rid = self.room["id"]

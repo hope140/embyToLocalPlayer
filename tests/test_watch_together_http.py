@@ -8,7 +8,6 @@ import urllib.request
 from pathlib import Path
 
 from utils.watch_together_coordinator import WatchTogetherCoordinator, WatchTogetherHttpService
-from utils.configs import configs
 from utils.watch_together_store import WatchTogetherStore
 from utils.http_server import ThreadingHTTPServer, UserScriptRequestHandler
 
@@ -58,6 +57,37 @@ class WatchTogetherHttpTests(unittest.TestCase):
     def call(self, path, body=None, token=None, address=("127.0.0.1", 1)):
         headers = {"X-ETLP-Watch-Token": token or self.token}
         return self.service.handle(path, body, headers=headers, client_address=address)
+
+    def test_auth_response_context_and_store_exclude_credentials(self):
+        status, result = self.service.handle(
+            "/watch-together/auth",
+            {"server_url": "https://media.test", "user_id": "admin", "api_key": "browser-token"},
+            client_address=("127.0.0.1", 1),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(set(result), {"token", "expires_in"})
+        self.assertNotEqual(result["token"], "browser-token")
+        response_text = json.dumps(result)
+        self.assertNotIn("admin-secret", response_text)
+        self.assertNotIn("browser-token", response_text)
+
+        context = self.service._tokens[result["token"]]
+        self.assertEqual(set(context), {"user_id", "server_url", "expires_at"})
+        context_text = json.dumps(context)
+        self.assertNotIn("admin-secret", context_text)
+        self.assertNotIn("browser-token", context_text)
+
+        status, _ = self.service.handle(
+            "/watch-together/rooms/create",
+            {"name": "secret-check", "participant_user_ids": ["admin", "guest"],
+             "primary_user_id": "admin"},
+            headers={"X-ETLP-Watch-Token": result["token"]},
+            client_address=("127.0.0.1", 1),
+        )
+        self.assertEqual(status, 200)
+        persisted = self.coordinator.store.store_path.read_text(encoding="utf-8")
+        self.assertNotIn("admin-secret", persisted)
+        self.assertNotIn("browser-token", persisted)
 
     def test_loopback_token_cors_and_room_lifecycle(self):
         self.assertEqual(self.call("/watch-together/rooms/list")[0], 200)
@@ -110,20 +140,12 @@ class WatchTogetherHttpTests(unittest.TestCase):
             "enable": "false", "admin_enable": "false",
             "server_url": "", "admin_api_key": "",
         }
-        path = Path(configs.cwd) / "watch_together_rooms.json"
-        existed = path.exists()
-        original = path.read_bytes() if existed else None
-        try:
-            path.write_text("{broken", encoding="utf-8")
-            service = WatchTogetherHttpService(config=disabled)
-            self.assertIsNone(service.coordinator.store)
-            self.assertFalse(service.start())
-            self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
-        finally:
-            if existed:
-                path.write_bytes(original)
-            elif path.exists():
-                path.unlink()
+        path = Path(self.temp.name) / "disabled-corrupt.json"
+        path.write_text("{broken", encoding="utf-8")
+        service = WatchTogetherHttpService(config=disabled, store_path=path)
+        self.assertIsNone(service.coordinator.store)
+        self.assertFalse(service.start())
+        self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
 
     def test_enabled_corrupt_store_returns_503_and_keeps_file(self):
         enabled = configparser.ConfigParser()
@@ -131,24 +153,27 @@ class WatchTogetherHttpTests(unittest.TestCase):
             "enable": "true", "admin_enable": "true",
             "server_url": "https://media.test", "admin_api_key": "admin-secret",
         }
-        path = Path(configs.cwd) / "watch_together_rooms.json"
-        existed = path.exists()
-        original = path.read_bytes() if existed else None
+        path = Path(self.temp.name) / "enabled-corrupt.json"
+        path.write_text('{"schema_version": 999, "rooms": []}', encoding="utf-8")
+        service = WatchTogetherHttpService(config=enabled, store_path=path)
+        status, body = service.handle(
+            "/watch-together/auth", {}, client_address=("127.0.0.1", 1)
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["code"], "watch_together_unavailable")
+        self.assertFalse(service.start())
+        self.assertEqual(path.read_bytes(), b'{"schema_version": 999, "rooms": []}')
+
+    def test_start_swallows_unexpected_coordinator_error(self):
+        def fail_start():
+            raise RuntimeError("unexpected start failure")
+
+        original_start = self.coordinator.start
+        self.coordinator.start = fail_start
         try:
-            path.write_text('{"schema_version": 999, "rooms": []}', encoding="utf-8")
-            service = WatchTogetherHttpService(config=enabled)
-            status, body = service.handle(
-                "/watch-together/auth", {}, client_address=("127.0.0.1", 1)
-            )
-            self.assertEqual(status, 503)
-            self.assertEqual(body["error"]["code"], "watch_together_unavailable")
-            self.assertFalse(service.start())
-            self.assertEqual(path.read_bytes(), b'{"schema_version": 999, "rooms": []}')
+            self.assertFalse(self.service.start())
         finally:
-            if existed:
-                path.write_bytes(original)
-            elif path.exists():
-                path.unlink()
+            self.coordinator.start = original_start
 
     def test_real_http_handler_cors_204_get_compatibility_and_single_call(self):
         class RecordingService:
