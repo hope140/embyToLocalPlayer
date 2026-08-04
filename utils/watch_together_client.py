@@ -31,6 +31,7 @@ _BUILTIN_WEBSOCKET_FILENAME = 'websocket_client-1.8.0-py3-none-any.whl'
 _BUILTIN_WEBSOCKET_SHA256 = (
     '17b44cc997f5c498e809b22cdf2d9c7a9e71c02c8cc2b6c56e7c2d1239bfa526'
 )
+_CAPABILITIES_RETRY_INTERVAL = 1.0
 
 
 def _clear_websocket_modules():
@@ -120,6 +121,7 @@ class WatchTogetherClient:
         self._stopped_reported = False
         self._session_capabilities_declared = False
         self._initial_playing_reported = False
+        self._next_capabilities_attempt_at = 0.0
         self._last_snapshot = None
         self._last_report_at = None
         self._last_snapshot_at = None
@@ -258,6 +260,9 @@ class WatchTogetherClient:
         with self._ws_lock:
             self._ws = ws
         self._send_identity(ws)
+        # A new WebSocket is a fresh opportunity to resolve the server-side
+        # session immediately, even if the previous connection was throttled.
+        self._next_capabilities_attempt_at = 0.0
         self._declare_capabilities()
         self._backoff = self.reconnect_min
         self._next_connect_at = 0.0
@@ -284,8 +289,13 @@ class WatchTogetherClient:
             return False
 
     def _declare_capabilities(self):
-        if self._session_capabilities_declared or not self._initial_playing_reported:
-            return
+        now = self._clock()
+        if (
+            self._session_capabilities_declared
+            or not self._initial_playing_reported
+            or now < self._next_capabilities_attempt_at
+        ):
+            return False
         try:
             # The first Playing report creates the server-side session.  Look
             # it up explicitly before advertising capabilities so stale
@@ -293,19 +303,25 @@ class WatchTogetherClient:
             session = self.session_api.find_session(self.play_session_id)
             if not isinstance(session, dict):
                 logger.info('watch-together capabilities unavailable: session not found')
-                return
+                self._next_capabilities_attempt_at = now + _CAPABILITIES_RETRY_INTERVAL
+                return False
             session_id = session.get('Id') or session.get('SessionId')
             if session_id is None or not str(session_id).strip():
                 logger.info('watch-together capabilities unavailable: session id missing')
-                return
+                self._next_capabilities_attempt_at = now + _CAPABILITIES_RETRY_INTERVAL
+                return False
             self.session_api.declare_capabilities(
                 session_id=str(session_id).strip(), full=True,
             )
             self._session_capabilities_declared = True
+            self._next_capabilities_attempt_at = 0.0
+            return True
         except Exception:
             # Keep this retryable on reconnect while avoiding IDs, URLs and
             # credentials that an exception message might contain.
             logger.info('watch-together capabilities unavailable: declaration failed')
+            self._next_capabilities_attempt_at = now + _CAPABILITIES_RETRY_INTERVAL
+            return False
 
     def _schedule_reconnect(self):
         self._next_connect_at = self._clock() + self._backoff
@@ -360,6 +376,8 @@ class WatchTogetherClient:
                         self._schedule_reconnect()
                         ws = None
                 self._report_snapshot()
+                if ws is not None:
+                    self._declare_capabilities()
                 if ws is not None:
                     try:
                         message = self._recv_ws(ws)

@@ -65,10 +65,13 @@ class FakeSessionApi:
         self.capabilities = []
         self.sessions = 0
         self.calls = []
+        self.find_results = []
 
     def find_session(self, play_session_id=None):
         self.sessions += 1
         self.calls.append(('find_session', play_session_id))
+        if self.find_results:
+            return self.find_results.pop(0)
         return {'Id': self.session_id}
 
     def declare_capabilities(self, session_id=None, full=True):
@@ -299,6 +302,28 @@ class WatchTogetherClientTests(unittest.TestCase):
         self.api.find_session = lambda play_session_id=None: None
         self.client._declare_capabilities()
         self.assertFalse(self.client._session_capabilities_declared)
+
+    def test_capabilities_retry_is_throttled_on_same_connection(self):
+        self.client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False}, now=0,
+        )
+        self.client._ws = self.ws
+        self.api.find_results = [None, {'Id': 'server-session'}]
+        now = [0.0]
+        self.client._clock = lambda: now[0]
+
+        self.client._declare_capabilities()
+        self.assertFalse(self.client._session_capabilities_declared)
+        self.assertEqual(self.api.sessions, 1)
+        now[0] = 0.5
+        self.client._declare_capabilities()
+        self.assertEqual(self.api.sessions, 1)
+
+        now[0] = 1.0
+        self.client._declare_capabilities()
+        self.assertTrue(self.client._session_capabilities_declared)
+        self.assertEqual(self.api.sessions, 2)
+        self.assertEqual(self.api.capabilities, [('server-session', True)])
 
     def test_playback_rate_is_reported_immediately(self):
         self.client.publish_snapshot(
