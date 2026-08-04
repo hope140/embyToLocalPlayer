@@ -100,6 +100,60 @@ class WatchTogetherCoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(selected["u1"]["Id"], "active")
 
+    def test_session_filter_rejects_missing_id_item_play_state_and_stopped(self):
+        missing_id = self.api.session("u1", "missing", 2)
+        missing_id["Id"] = ""
+        missing_id.pop("SessionId", None)
+        missing_item = self.api.session("u1", "empty-item", 3)
+        missing_item["NowPlayingItem"] = {}
+        missing_state = self.api.session("u1", "empty-state", 4)
+        missing_state.pop("PlayState")
+        stopped = self.api.session("u1", "stopped", 5)
+        stopped["PlayState"]["IsStopped"] = True
+        selected = self.coordinator.select_control_sessions(
+            [missing_id, missing_item, missing_state, stopped, self.api.sessions[0], self.api.sessions[1]],
+            ["u1", "u2"],
+        )
+        self.assertEqual(selected["u1"]["Id"], "s1")
+        self.assertEqual(selected["u2"]["Id"], "s2")
+
+    def test_session_filter_does_not_guess_between_duplicate_active_ties(self):
+        first = self.api.session("u1", "first", 4)
+        second = self.api.session("u1", "second", 5)
+        first["LastActivityDate"] = second["LastActivityDate"]
+        selected = self.coordinator.select_control_sessions(
+            [first, second, self.api.sessions[1]], ["u1", "u2"]
+        )
+        self.assertIsNone(selected["u1"])
+        self.assertEqual(selected["u2"]["Id"], "s2")
+
+    def test_session_filter_prefers_current_shared_item_over_newer_other_item(self):
+        current = self.api.session("u1", "current", 4, item="item")
+        current["LastActivityDate"] = "2025-01-01T00:00:00Z"
+        stale = self.api.session("u1", "other", 5, item="other-item")
+        stale["LastActivityDate"] = "2026-01-01T00:00:00Z"
+        selected = self.coordinator.select_control_sessions(
+            [current, stale, self.api.sessions[1]], ["u1", "u2"]
+        )
+        self.assertEqual(selected["u1"]["Id"], "current")
+
+    def test_session_filter_accepts_now_viewing_item_alias(self):
+        legacy = self.api.session("u1", "legacy", 4)
+        legacy["NowViewingItem"] = legacy.pop("NowPlayingItem")
+        selected = self.coordinator.select_control_sessions(
+            [legacy, self.api.sessions[1]], ["u1", "u2"]
+        )
+        self.assertEqual(selected["u1"]["Id"], "legacy")
+
+    def test_action_does_not_send_to_ambiguous_duplicate_session(self):
+        first = self.api.session("u1", "first", 4)
+        second = self.api.session("u1", "second", 5)
+        first["LastActivityDate"] = second["LastActivityDate"]
+        self.api.sessions = [first, second, self.api.sessions[1]]
+        result = self.coordinator.action(self.room["id"], "pause")
+        self.assertEqual(result["users"], ["u2"])
+        self.assertEqual(self.api.commands, [("s2", "Pause", None)])
+
     def test_barrier_runs_pause_seek_restore_in_separate_rounds(self):
         rid = self.room["id"]
         self.coordinator.poll_once(now=0)

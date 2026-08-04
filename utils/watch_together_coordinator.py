@@ -548,25 +548,146 @@ class WatchTogetherCoordinator:
 
     @classmethod
     def _select_sessions(cls, sessions, user_ids):
+        """Select one current control session for each room participant.
+
+        ``/Sessions`` may contain records from previous browser tabs or
+        playback sessions.  A record is only eligible when it identifies the
+        control client/device, user, server session, concrete item and a
+        play-state which is not stopped.  When two eligible records have the
+        same activity timestamp there is no safe way for the coordinator to
+        tell which player is current, so that user is left unselected rather
+        than receiving a command intended for another session.
+        """
+
         if isinstance(sessions, dict):
             sessions = sessions.get("Items", sessions.get("Sessions", []))
         by_user = {str(user_id): None for user_id in user_ids}
         candidates = {user_id: [] for user_id in by_user}
+        skipped = {}
+        total = 0
         for session in sessions or []:
+            total += 1
             if not cls._is_control_session(session):
+                skipped["not_control"] = skipped.get("not_control", 0) + 1
+                continue
+            if not isinstance(session, dict):
+                skipped["invalid_session"] = skipped.get("invalid_session", 0) + 1
                 continue
             user_id = session.get("UserId")
             if not user_id and isinstance(session.get("User"), dict):
                 user_id = session["User"].get("Id")
             user_id = str(user_id or "")
-            if user_id in candidates:
-                candidates[user_id].append(session)
+            if user_id not in candidates:
+                skipped["user_mismatch"] = skipped.get("user_mismatch", 0) + 1
+                continue
+            reason = cls._session_rejection_reason(session)
+            if reason:
+                skipped[reason] = skipped.get(reason, 0) + 1
+                continue
+            candidates[user_id].append(session)
+
+        # If both participants have a single common item, prefer that item
+        # before applying recency.  This prevents a newer stale tab showing a
+        # different title from masking the session that is actually in the
+        # room.  If there is no common item we retain per-user selection so
+        # the existing mismatch handling can pause the unchanged counterpart.
+        common_items = None
+        non_empty = [
+            {
+                cls._session_item_id(value)
+                for value in values
+                if cls._session_item_id(value)
+            }
+            for values in candidates.values()
+            if values
+        ]
+        if len(non_empty) == len(candidates) and non_empty:
+            common_items = set.intersection(*non_empty)
+            if len(common_items) == 1:
+                common_item = next(iter(common_items))
+                for user_id, values in candidates.items():
+                    candidates[user_id] = [
+                        value for value in values
+                        if cls._session_item_id(value) == common_item
+                    ]
+
+        selected = 0
+        ambiguous = 0
         for user_id, values in candidates.items():
-            if values:
-                by_user[user_id] = max(
-                    values, key=cls._session_selection_key,
-                )
+            if not values:
+                continue
+            # Emby-compatible servers can repeat the same record in one
+            # response.  The same server session id is one target, not an
+            # ambiguity; retain its freshest copy before tie checking.
+            by_session_id = {}
+            for value in values:
+                session_id = str(value.get("Id") or value.get("SessionId") or "")
+                previous = by_session_id.get(session_id)
+                if previous is None or _timestamp(value.get("LastActivityDate")) > _timestamp(
+                    previous.get("LastActivityDate")
+                ):
+                    by_session_id[session_id] = value
+            values = list(by_session_id.values())
+            max_activity = max(
+                _timestamp(value.get("LastActivityDate")) for value in values
+            )
+            latest = [
+                value for value in values
+                if _timestamp(value.get("LastActivityDate")) == max_activity
+            ]
+            # A missing timestamp is 0.0.  It is sufficient for a lone
+            # candidate, but cannot break a tie between multiple sessions.
+            if len(latest) != 1:
+                ambiguous += 1
+                skipped["ambiguous_active"] = skipped.get("ambiguous_active", 0) + 1
+                continue
+            by_user[user_id] = latest[0]
+            selected += 1
+
+        reasons = ",".join(
+            f"{name}:{count}" for name, count in sorted(skipped.items())
+        ) or "none"
+        logger.debug(
+            "watch-together session selection "
+            f"sessions={total} candidates={sum(len(value) for value in candidates.values())} "
+            f"selected={selected} ambiguous={ambiguous} skipped={reasons}"
+        )
         return by_user
+
+    @classmethod
+    def _session_rejection_reason(cls, session):
+        """Return a terse reason for excluding a session from selection."""
+
+        session_id = session.get("Id") or session.get("SessionId")
+        if not str(session_id or "").strip():
+            return "missing_session_id"
+        item = cls._session_item(session)
+        if not item or not str(item.get("Id") or "").strip():
+            return "missing_item"
+        play_state = session.get("PlayState")
+        if not isinstance(play_state, dict) or not play_state:
+            return "missing_play_state"
+        state_name = str(
+            play_state.get("PlaybackState") or play_state.get("State") or ""
+        ).lower()
+        if bool(play_state.get("IsStopped")) or state_name == "stopped":
+            return "stopped"
+        return None
+
+    @staticmethod
+    def _session_item(session):
+        if not isinstance(session, dict):
+            return {}
+        item = session.get("NowPlayingItem")
+        if isinstance(item, dict) and str(item.get("Id") or "").strip():
+            return item
+        legacy_item = session.get("NowViewingItem")
+        return legacy_item if isinstance(legacy_item, dict) else {}
+
+    @classmethod
+    def _session_item_id(cls, session):
+        item = cls._session_item(session)
+        return str(item.get("Id") or "").strip() if isinstance(item, dict) else ""
 
     @staticmethod
     def _session_selection_key(session):
@@ -578,7 +699,7 @@ class WatchTogetherCoordinator:
         """
 
         session = session if isinstance(session, dict) else {}
-        item = session.get("NowPlayingItem") or {}
+        item = WatchTogetherCoordinator._session_item(session)
         if not isinstance(item, dict):
             item = {}
         play_state = session.get("PlayState") or {}
@@ -604,7 +725,7 @@ class WatchTogetherCoordinator:
         if session is None:
             return None
         play_state = session.get("PlayState") or {}
-        item = session.get("NowPlayingItem") or {}
+        item = cls._session_item(session)
         state_name = str(play_state.get("PlaybackState") or play_state.get("State") or "").lower()
         stopped = bool(play_state.get("IsStopped")) or state_name == "stopped" or not item.get("Id")
         rate = _as_float(play_state.get("PlaybackRate", session.get("PlaybackRate", 1.0)), 1.0)
@@ -653,6 +774,12 @@ class WatchTogetherCoordinator:
         if pending and pending["command"] == command:
             if command != "Seek" or abs(int(position_ticks or 0) - snapshot.get("position_ticks", 0)) <= 2 * TICKS_PER_SECOND:
                 return True
+        state_category = "stopped" if snapshot.get("stopped") else (
+            "paused" if snapshot.get("is_paused") else "playing"
+        )
+        logger.debug(
+            f"watch-together command target state={state_category} command={command}"
+        )
         try:
             method = getattr(self.api, "send_command", None) or getattr(self.api, "command_session", None)
             if method is None:
