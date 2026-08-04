@@ -34,6 +34,74 @@ _BUILTIN_WEBSOCKET_SHA256 = (
 _CAPABILITIES_RETRY_INTERVAL = 1.0
 
 
+def _short_hash(value):
+    """Return a stable short diagnostic hash without exposing an identifier."""
+
+    if value is None or value == "":
+        return "none"
+    return hashlib.sha256(str(value).encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def _safe_label(value, default="unknown", limit=32):
+    """Keep a log label bounded and free of URLs, IDs, and free-form text."""
+
+    if value is None:
+        return default
+    value = str(value)
+    label = "".join(
+        char if char.isalnum() or char in "_.-" else "_"
+        for char in value
+    )[:limit]
+    return label or default
+
+
+def _message_type_label(value):
+    """Return a known message type or a hash-only label for diagnostics."""
+
+    normalized = str(value or "").strip().lower()
+    if normalized in ("playstate", "generalcommand", "forcekeepalive"):
+        return normalized
+    return f"unknown_{_short_hash(normalized)}"
+
+
+def _command_label(value):
+    """Keep unsupported command diagnostics free of arbitrary payload text."""
+
+    normalized = str(value or "").strip().lower()
+    if normalized in {
+        "pause", "unpause", "play", "seek", "stop", "displaymessage",
+    }:
+        return normalized
+    return f"unknown_{_short_hash(normalized)}"
+
+
+def _field(mapping, name, default=None):
+    """Read Emby JSON fields case-insensitively."""
+
+    if not isinstance(mapping, dict):
+        return default
+    expected = str(name).lower()
+    for key, value in mapping.items():
+        if str(key).lower() == expected:
+            return value
+    return default
+
+
+def _decode_json_object(value):
+    """Decode a WebSocket Data value while rejecting unrelated shapes."""
+
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    if isinstance(value, str):
+        if not value:
+            return {}
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
 def _clear_websocket_modules():
     """Remove a partially imported websocket package from ``sys.modules``."""
 
@@ -229,6 +297,7 @@ class WatchTogetherClient:
             ws.close()
         except Exception:
             pass
+        logger.info('watch-together websocket status=closed')
 
     def _connect_ws(self):
         factory = self.ws_factory
@@ -259,7 +328,13 @@ class WatchTogetherClient:
             raise ConnectionError('websocket factory returned no connection')
         with self._ws_lock:
             self._ws = ws
-        self._send_identity(ws)
+        if not self._send_identity(ws):
+            self._close_ws()
+            raise ConnectionError('websocket identity send failed')
+        logger.info(
+            'watch-together websocket connected '
+            f'device_hash={_short_hash(self.session_api.control_device_id)}'
+        )
         # A new WebSocket is a fresh opportunity to resolve the server-side
         # session immediately, even if the previous connection was throttled.
         self._next_capabilities_attempt_at = 0.0
@@ -270,16 +345,24 @@ class WatchTogetherClient:
         return ws
 
     def _send_identity(self, ws):
-        identity = {
-            'Client': self.session_api.client_name,
-            'Device': self.session_api.device_name,
-            'DeviceId': self.session_api.control_device_id,
-            'Version': self.session_api.client_version,
-        }
-        self._send_ws(ws, {
+        # Emby.ApiClient's ApiWebSocket expects a pipe-delimited identity,
+        # rather than JSON in Data: ClientName|DeviceId|Version|DeviceName.
+        identity = '|'.join((
+            str(self.session_api.client_name),
+            str(self.session_api.control_device_id),
+            str(self.session_api.client_version),
+            str(self.session_api.device_name),
+        ))
+        sent = self._send_ws(ws, {
             'MessageType': 'Identity',
-            'Data': json.dumps(identity, separators=(',', ':')),
+            'Data': identity,
         })
+        logger.info(
+            'watch-together websocket identity '
+            f'status={"ok" if sent else "failed"} '
+            f'device_hash={_short_hash(self.session_api.control_device_id)}'
+        )
+        return sent
 
     def _send_ws(self, ws, payload):
         try:
@@ -300,32 +383,72 @@ class WatchTogetherClient:
             # The first Playing report creates the server-side session.  Look
             # it up explicitly before advertising capabilities so stale
             # control sessions cannot receive the declaration.
-            session = self.session_api.find_session(self.play_session_id)
-            if not isinstance(session, dict):
-                logger.info('watch-together capabilities unavailable: session not found')
-                self._next_capabilities_attempt_at = now + _CAPABILITIES_RETRY_INTERVAL
-                return False
-            session_id = session.get('Id') or session.get('SessionId')
+            find_session = getattr(self.session_api, 'find_session', None)
+            if not callable(find_session):
+                raise RuntimeError('session lookup unavailable')
+            try:
+                session = find_session(self.play_session_id)
+            except TypeError:
+                # Preserve compatibility with older small API doubles whose
+                # lookup accepted only keyword/default arguments.
+                session = find_session()
+            session_id = None
+            if isinstance(session, dict):
+                session_id = (
+                    _field(session, 'Id')
+                    or _field(session, 'SessionId')
+                )
+            elif session:
+                # Legacy lookup helpers may return a truthy sentinel while
+                # storing the concrete id on the API object.
+                session_id = getattr(self.session_api, 'session_id', None)
             if session_id is None or not str(session_id).strip():
-                logger.info('watch-together capabilities unavailable: session id missing')
+                logger.info(
+                    'watch-together capabilities '
+                    'status=unavailable reason=session_not_found'
+                )
                 self._next_capabilities_attempt_at = now + _CAPABILITIES_RETRY_INTERVAL
                 return False
-            self.session_api.declare_capabilities(
-                session_id=str(session_id).strip(), full=True,
+            session_id = str(session_id).strip()
+            declare_capabilities = getattr(
+                self.session_api, 'declare_capabilities', None
             )
+            if not callable(declare_capabilities):
+                raise RuntimeError('capability declaration unavailable')
+            try:
+                declare_capabilities(session_id=session_id, full=True)
+            except TypeError:
+                # Older clients bind through their ``session_id`` property and
+                # do not expose the explicit argument.  Keep that binding.
+                try:
+                    self.session_api.session_id = session_id
+                except Exception:
+                    pass
+                declare_capabilities(full=True)
             self._session_capabilities_declared = True
             self._next_capabilities_attempt_at = 0.0
+            logger.info(
+                'watch-together capabilities status=declared '
+                f'session_hash={_short_hash(session_id)}'
+            )
             return True
         except Exception:
             # Keep this retryable on reconnect while avoiding IDs, URLs and
             # credentials that an exception message might contain.
-            logger.info('watch-together capabilities unavailable: declaration failed')
+            logger.info(
+                'watch-together capabilities '
+                'status=failed reason=declaration_error'
+            )
             self._next_capabilities_attempt_at = now + _CAPABILITIES_RETRY_INTERVAL
             return False
 
     def _schedule_reconnect(self):
         self._next_connect_at = self._clock() + self._backoff
         self._backoff = min(self.reconnect_max, self._backoff * 2)
+        # Capabilities belong to the active Emby control connection.  A fresh
+        # socket must advertise them again, while any failed declaration stays
+        # retryable on the same socket through the throttled path above.
+        self._session_capabilities_declared = False
         self._close_ws()
 
     @staticmethod
@@ -372,7 +495,10 @@ class WatchTogetherClient:
                     try:
                         ws = self._connect_ws()
                     except Exception as exc:
-                        logger.info(f'watch-together websocket reconnect: {str(exc)[:120]}')
+                        logger.info(
+                            'watch-together websocket status=connect_failed '
+                            f'error_type={_safe_label(type(exc).__name__)}'
+                        )
                         self._schedule_reconnect()
                         ws = None
                 self._report_snapshot()
@@ -385,7 +511,10 @@ class WatchTogetherClient:
                             self.handle_message(message)
                         self._heartbeat(ws, now)
                     except Exception as exc:
-                        logger.info(f'watch-together websocket disconnected: {str(exc)[:120]}')
+                        logger.info(
+                            'watch-together websocket status=disconnected '
+                            f'error_type={_safe_label(type(exc).__name__)}'
+                        )
                         self._schedule_reconnect()
                         ws = None
                 self._stop_event.wait(0.05)
@@ -416,17 +545,25 @@ class WatchTogetherClient:
         if not playback_rate > 0:
             playback_rate = 1.0
         if self._last_snapshot is None:
-            self._last_snapshot = dict(snapshot)
-            self._last_position = position
-            self._last_pause = paused
-            self._last_playback_rate = playback_rate
-            self._last_report_at = now
-            self._last_snapshot_at = now
             result = self._report(
                 'report_playing', position, paused, 'TimeUpdate', playback_rate,
             )
             if result:
+                self._last_snapshot = dict(snapshot)
+                self._last_position = position
+                self._last_pause = paused
+                self._last_playback_rate = playback_rate
+                self._last_report_at = now
+                self._last_snapshot_at = now
                 self._initial_playing_reported = True
+            else:
+                # Keep the initial state unset so a temporary HTTP failure
+                # retries Sessions/Playing instead of being misclassified as a
+                # later Progress update.
+                logger.info(
+                    'watch-together report method=report_playing '
+                    'status=failed retry=pending'
+                )
             return result
 
         previous_position = self._last_position
@@ -450,7 +587,13 @@ class WatchTogetherClient:
             result = self._report(
                 'report_progress', position, paused, event_name, playback_rate,
             )
-            self._last_report_at = now
+            if result:
+                self._last_report_at = now
+            else:
+                logger.info(
+                    'watch-together report method=report_progress '
+                    'status=failed retry=pending'
+                )
         else:
             result = False
         self._last_snapshot = dict(snapshot)
@@ -473,6 +616,10 @@ class WatchTogetherClient:
                     event_name=event_name,
                     playback_rate=playback_rate,
                 )
+                logger.info(
+                    f'watch-together report method={_safe_label(method_name)} '
+                    'status=ok'
+                )
                 return True
             except TypeError:
                 # Keep compatibility with small session fakes written before
@@ -483,12 +630,22 @@ class WatchTogetherClient:
                         is_paused=paused,
                         event_name=event_name,
                     )
+                    logger.info(
+                        f'watch-together report method={_safe_label(method_name)} '
+                        'status=ok'
+                    )
                     return True
-                except Exception as exc:
-                    logger.info(f'watch-together {method_name} failed: {str(exc)[:120]}')
+                except Exception:
+                    logger.info(
+                        f'watch-together report method={_safe_label(method_name)} '
+                        'status=failed'
+                    )
                     return False
-            except Exception as exc:
-                logger.info(f'watch-together {method_name} failed: {str(exc)[:120]}')
+            except Exception:
+                logger.info(
+                    f'watch-together report method={_safe_label(method_name)} '
+                    'status=failed'
+                )
                 return False
 
     def _report_stopped(self):
@@ -516,6 +673,9 @@ class WatchTogetherClient:
                     playback_rate=playback_rate,
                 )
                 self._stopped_reported = True
+                logger.info(
+                    'watch-together report method=report_stopped status=ok'
+                )
                 return True
             except TypeError:
                 try:
@@ -524,12 +684,19 @@ class WatchTogetherClient:
                         is_paused=paused,
                     )
                     self._stopped_reported = True
+                    logger.info(
+                        'watch-together report method=report_stopped status=ok'
+                    )
                     return True
-                except Exception as exc:
-                    logger.info(f'watch-together stopped report failed: {str(exc)[:120]}')
+                except Exception:
+                    logger.info(
+                        'watch-together report method=report_stopped status=failed'
+                    )
                     return False
-            except Exception as exc:
-                logger.info(f'watch-together stopped report failed: {str(exc)[:120]}')
+            except Exception:
+                logger.info(
+                    'watch-together report method=report_stopped status=failed'
+                )
                 return False
 
     def _finish_playstate_command(self, command, handled):
@@ -569,29 +736,43 @@ class WatchTogetherClient:
             return None, {}
         if not isinstance(message, dict):
             return None, {}
-        message_type = message.get('MessageType') or message.get('messageType')
-        payload = message.get('Data', message.get('data', {}))
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload) if payload else {}
-            except (TypeError, ValueError):
-                payload = {'Text': payload}
-        if not isinstance(payload, dict):
-            payload = {}
+        message_type = _field(message, 'MessageType')
+        payload = _decode_json_object(_field(message, 'Data', {}))
+        # A few Emby-compatible WebSocket wrappers add one extra Data or
+        # Playstate/GeneralCommand object.  Unwrap only those known containers;
+        # arbitrary nested objects are not treated as commands.
+        for nested_name in ('Data', 'Playstate', 'PlayState', 'GeneralCommand'):
+            nested = _field(payload, nested_name)
+            if isinstance(nested, (dict, str, bytes)):
+                decoded = _decode_json_object(nested)
+                if decoded:
+                    payload = decoded
+                    break
         return message_type, payload
 
     def _belongs_to_playback(self, payload):
-        message_session = payload.get('PlaySessionId') or payload.get('playSessionId')
-        return not message_session or str(message_session) == str(self.play_session_id)
+        message_session = _field(payload, 'PlaySessionId')
+        if message_session is None:
+            return True
+        if self.play_session_id and str(message_session) == str(self.play_session_id):
+            return True
+        logger.info(
+            'watch-together command filtered '
+            'reason=play_session_mismatch '
+            f'expected_hash={_short_hash(self.play_session_id)} '
+            f'received_hash={_short_hash(message_session)}'
+        )
+        return False
 
     def _handle_playstate(self, payload):
         if not self._belongs_to_playback(payload):
             return False
         command = (
-            payload.get('Command') or payload.get('command')
-            or payload.get('PlaystateCommand') or payload.get('Name')
+            _field(payload, 'Command')
+            or _field(payload, 'PlaystateCommand')
+            or _field(payload, 'Name')
         )
-        command = str(command or '').lower()
+        command = str(command or '').strip().lower()
         if command in ('pause', 'unpause', 'play'):
             try:
                 handled = mpv_set_pause(self.player, command == 'pause')
@@ -601,18 +782,22 @@ class WatchTogetherClient:
                 'Pause' if command == 'pause' else 'Unpause', handled,
             )
         if command == 'seek':
-            ticks = payload.get('SeekPositionTicks')
+            ticks = _field(payload, 'SeekPositionTicks')
             if ticks is None:
-                ticks = payload.get('PositionTicks')
-            position = payload.get('SeekPosition')
+                ticks = _field(payload, 'PositionTicks')
+            position = _field(payload, 'SeekPosition')
             if position is None:
-                position = payload.get('SeekPositionSeconds')
+                position = _field(payload, 'SeekPositionSeconds')
             if ticks is not None:
                 try:
                     position = float(ticks) / 10 ** 7
                 except (TypeError, ValueError):
                     position = None
             if position is None:
+                logger.info(
+                    'watch-together command filtered '
+                    'reason=seek_position_missing'
+                )
                 return False
             try:
                 handled = mpv_seek(self.player, position)
@@ -625,45 +810,77 @@ class WatchTogetherClient:
             except Exception:
                 handled = False
             return self._finish_playstate_command('Stop', handled)
+        logger.info(
+            'watch-together command filtered '
+            f'reason=unsupported_playstate command={_command_label(command)}'
+        )
         return False
 
     def _handle_general_command(self, payload):
         if not self._belongs_to_playback(payload):
             return False
-        name = payload.get('Name') or payload.get('Command') or payload.get('name')
+        name = _field(payload, 'Name') or _field(payload, 'Command')
         if str(name or '').lower() != 'displaymessage':
+            logger.info(
+                'watch-together command filtered '
+                f'reason=unsupported_general command={_command_label(name)}'
+            )
             return False
-        args = payload.get('Arguments') or payload.get('arguments') or payload
+        args = _field(payload, 'Arguments') or payload
         if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except (TypeError, ValueError):
-                args = {'Text': args}
+            args = _decode_json_object(args)
         if not isinstance(args, dict):
             args = {}
-        text = args.get('Text') or args.get('Message') or args.get('Header')
+        text = (
+            _field(args, 'Text')
+            or _field(args, 'Message')
+            or _field(args, 'Header')
+        )
         if text is None:
+            logger.info(
+                'watch-together command filtered '
+                'reason=displaymessage_payload_missing'
+            )
             return False
-        duration = args.get('TimeoutMs') or args.get('Timeout') or args.get('Duration') or 5000
+        duration = (
+            _field(args, 'TimeoutMs')
+            or _field(args, 'Timeout')
+            or _field(args, 'Duration')
+            or 5000
+        )
         try:
             duration = int(duration)
         except (TypeError, ValueError):
             duration = 5000
-        return mpv_display_message(self.player, text, duration)
+        try:
+            handled = bool(mpv_display_message(self.player, text, duration))
+        except Exception:
+            handled = False
+        logger.info(
+            'watch-together command=DisplayMessage '
+            f'handled={str(handled).lower()}'
+        )
+        return handled
 
     def handle_message(self, raw_message):
         """Parse one Emby WebSocket message and apply supported commands."""
 
         message_type, payload = self._decode_message(raw_message)
-        message_type = str(message_type or '').lower()
-        if message_type == 'playstate':
+        message_type_label = _message_type_label(message_type)
+        logger.info(
+            f'watch-together websocket message type={message_type_label}'
+        )
+        if message_type_label == 'playstate':
             return self._handle_playstate(payload)
-        if message_type == 'generalcommand':
+        if message_type_label == 'generalcommand':
             return self._handle_general_command(payload)
-        if message_type == 'forcekeepalive':
+        if message_type_label == 'forcekeepalive':
             # The next loop iteration sends a ping/KeepAlive promptly.
             self._last_heartbeat_at = 0
             return True
+        logger.info(
+            f'watch-together websocket message ignored type={message_type_label}'
+        )
         return False
 
     # Keep a couple of descriptive aliases for small integrations and test

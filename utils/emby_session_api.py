@@ -21,6 +21,31 @@ CONTROL_DEVICE_VERSION = "1.0"
 SUPPORTED_COMMANDS = ("Pause", "Unpause", "Seek", "DisplayMessage")
 
 
+def _normalise_path(value):
+    """Return a URL path without a query/fragment and with one leading slash."""
+
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    # ``urlsplit`` also keeps paths passed as ``/proxy?query`` predictable.
+    value = urllib.parse.urlsplit(value).path
+    if not value or value == "/":
+        return ""
+    return "/" + "/".join(part for part in value.split("/") if part)
+
+
+def _mapping_value(mapping, name, default=None):
+    """Read a mapping field using Emby's case-insensitive JSON conventions."""
+
+    if not isinstance(mapping, dict):
+        return default
+    expected = str(name).lower()
+    for key, value in mapping.items():
+        if str(key).lower() == expected:
+            return value
+    return default
+
+
 def derive_control_device_id(browser_device_id, play_session_id, prefix=CONTROL_DEVICE_PREFIX):
     """Return a stable, short device id for one playback control session.
 
@@ -73,15 +98,40 @@ class EmbySessionApi:
                  play_session_id="", browser_device_id="", host=""):
         data = data or {}
         host = str(data.get("host", data.get("server_address", host)) or host).strip()
-        if host and "://" in host and not (data.get("scheme") or scheme):
-            parsed_host = urllib.parse.urlsplit(host)
-            scheme, netloc = parsed_host.scheme, parsed_host.netloc
-        self.scheme = str(data.get("scheme", scheme) or scheme).strip().rstrip("/")
+        configured_scheme = data.get("scheme", scheme) or scheme
+        configured_netloc = data.get("netloc", netloc) or netloc
+        configured_path = data.get(
+            "server_path",
+            data.get("base_path", data.get("path", "")),
+        ) or ""
+
+        # Keep a genuine reverse-proxy prefix while still accepting the
+        # historical ``scheme`` + ``netloc`` fields.  The latter occasionally
+        # contain a path even though the name says ``netloc``.
+        if host:
+            parsed_host = urllib.parse.urlsplit(
+                host if "://" in host else f"//{host}"
+            )
+            if parsed_host.scheme and not data.get("scheme") and not scheme:
+                configured_scheme = parsed_host.scheme
+            if parsed_host.netloc and not data.get("netloc") and not netloc:
+                configured_netloc = parsed_host.netloc
+            if parsed_host.path and not configured_path:
+                configured_path = parsed_host.path
+
+        parsed_netloc = urllib.parse.urlsplit(
+            f"//{str(configured_netloc or '').strip()}"
+        )
+        if parsed_netloc.netloc:
+            configured_netloc = parsed_netloc.netloc
+            if parsed_netloc.path and not configured_path:
+                configured_path = parsed_netloc.path
+
+        self.scheme = str(configured_scheme).strip().rstrip("/")
         self.scheme = self.scheme[:-3] if self.scheme.endswith("://") else self.scheme
-        self.scheme = self.scheme.rstrip(":")
-        self.netloc = str(data.get("netloc", netloc) or netloc).strip("/")
-        if self.netloc.endswith("/emby"):
-            self.netloc = self.netloc[:-5].rstrip("/")
+        self.scheme = self.scheme.rstrip(":").lower()
+        self.netloc = str(configured_netloc or "").strip().strip("/")
+        self.server_path = _normalise_path(configured_path)
         self.api_key = str(data.get("api_key", api_key) or api_key)
         self.user_id = str(data.get("user_id", user_id) or user_id)
         self.item_id = str(data.get("item_id", item_id) or item_id)
@@ -111,18 +161,32 @@ class EmbySessionApi:
     def base_url(self):
         if not self.scheme or not self.netloc:
             return ""
-        return f"{self.scheme}://{self.netloc}".rstrip("/")
+        return f"{self.scheme}://{self.netloc}{self.server_path}".rstrip("/")
 
     @property
     def http_base_url(self):
-        return f"{self.base_url}/emby" if self.base_url else ""
+        if not self.base_url:
+            return ""
+        # ``server_path=/proxy/emby`` is already the API root.  For a normal
+        # server (or a reverse-proxy prefix such as ``/proxy``), Emby REST
+        # endpoints live below an ``/emby`` suffix.
+        if self.server_path.lower().endswith("/emby"):
+            return self.base_url
+        return f"{self.base_url}/emby"
 
     @property
     def websocket_url(self):
         """Build the Emby WebSocket endpoint for the control device."""
 
+        if not self.base_url:
+            return ""
         scheme = {"http": "ws", "https": "wss"}.get(self.scheme, self.scheme)
-        base = f"{scheme}://{self.netloc}".rstrip("/")
+        websocket_path = self.server_path
+        # When callers pass an API root ending in ``/emby``, the WebSocket is a
+        # sibling endpoint (``/embywebsocket``), not ``/emby/embywebsocket``.
+        if websocket_path.lower().endswith("/emby"):
+            websocket_path = websocket_path[:-5].rstrip("/")
+        base = f"{scheme}://{self.netloc}{websocket_path}".rstrip("/")
         params = {
             "api_key": self.api_key,
             "deviceId": self.control_device_id,
@@ -140,7 +204,7 @@ class EmbySessionApi:
             f'Version="{self.client_version}", '
             f'Token="{self.api_key}"'
         )
-        return {
+        headers = {
             "Accept": "application/json",
             "Content-Type": "application/json; charset=utf-8",
             "X-Emby-Token": self.api_key,
@@ -149,18 +213,30 @@ class EmbySessionApi:
             "X-Emby-Device-Id": self.control_device_id,
             "X-Emby-Authorization": authorization,
         }
+        if self.user_id:
+            # Emby's session and capabilities endpoints resolve a user from
+            # the request context.  Keep this explicit so Playing, REST
+            # capabilities and the WebSocket all bind to one user/session.
+            headers["X-Emby-User-Id"] = self.user_id
+            headers["X-Emby-Authorization"] = (
+                f'{authorization}, UserId="{self.user_id}"'
+            )
+        return headers
 
     @property
     def websocket_headers(self):
         """Headers accepted by websocket-client's ``create_connection``."""
 
-        return [
+        headers = [
             f"X-Emby-Token: {self.api_key}",
             f"X-Emby-Client: {self.client_name}",
             f"X-Emby-Device-Name: {self.device_name}",
             f"X-Emby-Device-Id: {self.control_device_id}",
             f"X-Emby-Authorization: {self.auth_headers['X-Emby-Authorization']}",
         ]
+        if self.user_id:
+            headers.append(f"X-Emby-User-Id: {self.user_id}")
+        return headers
 
     def _request(self, path, *, method="GET", params=None, payload=None,
                  timeout=10):
@@ -187,10 +263,11 @@ class EmbySessionApi:
     @staticmethod
     def _session_items(response):
         if isinstance(response, dict):
-            if isinstance(response.get("Items"), list):
-                return response["Items"]
+            items = _mapping_value(response, "Items")
+            if isinstance(items, list):
+                return items
             # A few test doubles and Emby-compatible servers return one object.
-            if response.get("Id") or response.get("PlayState"):
+            if _mapping_value(response, "Id") or _mapping_value(response, "PlayState"):
                 return [response]
         return response if isinstance(response, list) else []
 
@@ -202,18 +279,55 @@ class EmbySessionApi:
 
         target = str(play_session_id or self.play_session_id or "")
         sessions = self.get_sessions(timeout=timeout)
+        target_matches = []
+        exact_matches = []
         for session in sessions:
-            play_state = session.get("PlayState") or {}
+            if not isinstance(session, dict):
+                continue
+            play_state = _mapping_value(session, "PlayState") or {}
             ids = (
-                play_state.get("PlaySessionId"),
-                session.get("PlaySessionId"),
+                _mapping_value(play_state, "PlaySessionId"),
+                _mapping_value(session, "PlaySessionId"),
             )
-            if target and target in [str(value) for value in ids if value is not None]:
-                self.session_id = session.get("Id") or session.get("SessionId")
+            if not target or target not in [
+                str(value) for value in ids if value is not None
+            ]:
+                continue
+            session_device = _mapping_value(session, "DeviceId")
+            if session_device and str(session_device) != self.control_device_id:
+                # A matching PlaySessionId from another device must never win
+                # capability binding for this control client.
+                continue
+            session_user = _mapping_value(session, "UserId")
+            if self.user_id and session_user and str(session_user) != self.user_id:
+                continue
+            if session_device and str(session_device) == self.control_device_id:
+                exact_matches.append(session)
+            else:
+                # Some Emby-compatible servers omit DeviceId in Sessions
+                # responses.  A unique PlaySessionId remains a safe fallback.
+                target_matches.append(session)
+        for session in exact_matches + target_matches:
+            self.session_id = (
+                _mapping_value(session, "Id")
+                or _mapping_value(session, "SessionId")
+            )
+            if self.session_id:
                 return session
         for session in sessions:
-            if str(session.get("DeviceId", "")) == self.control_device_id:
-                self.session_id = session.get("Id") or session.get("SessionId")
+            if not isinstance(session, dict):
+                continue
+            session_device = _mapping_value(session, "DeviceId")
+            session_user = _mapping_value(session, "UserId")
+            if str(session_device or "") != self.control_device_id:
+                continue
+            if self.user_id and session_user and str(session_user) != self.user_id:
+                continue
+            self.session_id = (
+                _mapping_value(session, "Id")
+                or _mapping_value(session, "SessionId")
+            )
+            if self.session_id:
                 return session
         return None
 
@@ -233,6 +347,7 @@ class EmbySessionApi:
         if requested_session_id is None or not str(requested_session_id).strip():
             raise EmbySessionError("session id is required for capability declaration")
         requested_session_id = str(requested_session_id).strip()
+        self.session_id = requested_session_id
 
         suffix = "Capabilities/Full" if full else "Capabilities"
         payload = {
@@ -262,6 +377,8 @@ class EmbySessionApi:
             "PlayMethod": "DirectStream",
             "RepeatMode": "RepeatNone",
         }
+        if self.user_id:
+            payload["UserId"] = self.user_id
         try:
             playback_rate = float(playback_rate)
         except (TypeError, ValueError):
@@ -277,34 +394,59 @@ class EmbySessionApi:
 
     def report_playing(self, position_sec=0, *, is_paused=False,
                        event_name="TimeUpdate", playback_rate=1.0, timeout=10):
-        return self._request(
+        result = self._request(
             "Sessions/Playing", method="POST",
             payload=self._playback_payload(
                 position_sec, event_name=event_name, is_paused=is_paused,
                 playback_rate=playback_rate,
             ), timeout=timeout,
         )
+        self._capture_session_id(result)
+        return result
 
     def report_progress(self, position_sec=0, *, is_paused=False,
                         event_name="TimeUpdate", playback_rate=1.0, timeout=10):
-        return self._request(
+        result = self._request(
             "Sessions/Playing/Progress", method="POST",
             payload=self._playback_payload(
                 position_sec, event_name=event_name, is_paused=is_paused,
                 playback_rate=playback_rate,
             ), timeout=timeout,
         )
+        self._capture_session_id(result)
+        return result
 
     def report_stopped(self, position_sec=0, *, is_paused=False,
                        playback_rate=1.0, timeout=10):
         # Emby's Stopped endpoint does not require an EventName.  Keeping the
         # payload otherwise identical makes the final position unambiguous.
-        return self._request(
+        result = self._request(
             "Sessions/Playing/Stopped", method="POST",
             payload=self._playback_payload(
                 position_sec, is_paused=is_paused, playback_rate=playback_rate,
             ), timeout=timeout,
         )
+        self._capture_session_id(result)
+        return result
+
+    def _capture_session_id(self, response):
+        """Remember a server session id when an Emby response provides one."""
+
+        if not isinstance(response, dict):
+            return
+        candidate = (
+            _mapping_value(response, "SessionId")
+            or _mapping_value(response, "Id")
+        )
+        if candidate is None:
+            nested = _mapping_value(response, "Session")
+            if isinstance(nested, dict):
+                candidate = (
+                    _mapping_value(nested, "SessionId")
+                    or _mapping_value(nested, "Id")
+                )
+        if candidate is not None and str(candidate).strip():
+            self.session_id = str(candidate).strip()
 
     # Concise aliases for small integrations and test doubles.
     get_session = find_session

@@ -135,6 +135,45 @@ class EmbySessionApiTests(unittest.TestCase):
         self.assertNotIn('Authorization', headers)
         self.assertNotIn('Cookie', headers)
 
+    def test_headers_bind_explicit_user_context(self):
+        requests = []
+
+        def request(url, **kwargs):
+            requests.append((url, kwargs))
+            return {'Items': []}
+
+        api = EmbySessionApi({
+            'scheme': 'https', 'netloc': 'media.test', 'api_key': 'token',
+            'user_id': 'user-1', 'play_session_id': 'one',
+        }, request_func=request)
+        api.get_sessions()
+        headers = requests[0][1]['headers']
+        self.assertEqual(headers['X-Emby-User-Id'], 'user-1')
+        self.assertIn('UserId="user-1"', headers['X-Emby-Authorization'])
+        self.assertIn('X-Emby-User-Id: user-1', api.websocket_headers)
+        api.report_playing(position_sec=1)
+        self.assertEqual(requests[-1][1]['_json']['UserId'], 'user-1')
+
+    def test_websocket_url_preserves_reverse_proxy_prefix(self):
+        api = EmbySessionApi({
+            'host': 'https://media.test/media', 'api_key': 'token',
+            'device_id': 'browser', 'play_session_id': 'one',
+        })
+        self.assertTrue(api.websocket_url.startswith(
+            'wss://media.test/media/embywebsocket?'
+        ))
+        self.assertTrue(api.http_base_url.endswith('/media/emby'))
+
+    def test_websocket_url_handles_explicit_emby_api_root(self):
+        api = EmbySessionApi({
+            'host': 'https://media.test/media/emby', 'api_key': 'token',
+            'device_id': 'browser', 'play_session_id': 'one',
+        })
+        self.assertTrue(api.websocket_url.startswith(
+            'wss://media.test/media/embywebsocket?'
+        ))
+        self.assertTrue(api.http_base_url.endswith('/media/emby'))
+
     def test_capabilities_endpoint_uses_query_session_id(self):
         requests = []
 
@@ -219,6 +258,40 @@ class WatchTogetherClientTests(unittest.TestCase):
         })))
         self.assertIn(('show-text', 'hello', 1000), self.player.commands)
 
+    def test_identity_uses_emby_pipe_delimited_data(self):
+        self.assertTrue(self.client._send_identity(self.ws))
+        self.assertEqual(self.ws.sent[0]['MessageType'], 'Identity')
+        self.assertEqual(
+            self.ws.sent[0]['Data'],
+            'embyToLocalPlayer|%s|1.0|watch-together'
+            % self.api.control_device_id,
+        )
+
+    def test_playstate_accepts_case_insensitive_actual_data_fields(self):
+        self.assertTrue(self.client.handle_message(json.dumps({
+            'messagetype': 'PLAYSTATE',
+            'data': json.dumps({
+                'command': 'PAUSE', 'playsessionid': 'session',
+            }),
+        })))
+        self.assertTrue(self.player.paused)
+
+    def test_playstate_session_mismatch_logs_safe_reason_and_does_not_execute(self):
+        with mock.patch.object(watch_together_client_module.logger, 'info') as info:
+            self.assertFalse(self.client.handle_message(json.dumps({
+                'MessageType': 'Playstate',
+                'Data': json.dumps({
+                    'Command': 'Pause', 'PlaySessionId': 'other-session',
+                }),
+            })))
+        self.assertFalse(self.player.paused)
+        log_text = ' '.join(
+            ' '.join(str(arg) for arg in call.args)
+            for call in info.call_args_list
+        )
+        self.assertIn('play_session_mismatch', log_text)
+        self.assertNotIn('other-session', log_text)
+
     def test_pause_and_small_seek_force_progress_reports(self):
         self.client.publish_snapshot(
             {'position_sec': 10, 'is_paused': False}, now=0,
@@ -302,6 +375,25 @@ class WatchTogetherClientTests(unittest.TestCase):
         self.api.find_session = lambda play_session_id=None: None
         self.client._declare_capabilities()
         self.assertFalse(self.client._session_capabilities_declared)
+
+    def test_initial_playing_failure_retries_playing_before_progress(self):
+        attempts = []
+
+        def report_playing(**kwargs):
+            attempts.append(kwargs)
+            if len(attempts) == 1:
+                raise TimeoutError('temporary request failure')
+
+        self.api.report_playing = report_playing
+        self.assertFalse(self.client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False}, now=0,
+        ))
+        self.assertIsNone(self.client._last_snapshot)
+        self.assertTrue(self.client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False}, now=1,
+        ))
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(self.client._initial_playing_reported)
 
     def test_capabilities_retry_is_throttled_on_same_connection(self):
         self.client.publish_snapshot(
