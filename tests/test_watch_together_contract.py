@@ -36,7 +36,7 @@ class WatchTogetherUiContractTests(unittest.TestCase):
         self.assertEqual(section.get("admin_api_key"), "")
 
     def test_userscript_metadata_menu_endpoints_and_secret_scope(self):
-        self.assertRegex(self.userscript, r"@version\s+2026\.08\.04\.1\b")
+        self.assertRegex(self.userscript, r"@version\s+2026\.08\.04\.2\b")
         update_url = "https://raw.githubusercontent.com/hope140/embyToLocalPlayer/watch_together/user_script/embyToLocalPlayer.user.js"
         self.assertIn(f"// @updateURL    {update_url}", self.userscript)
         self.assertIn(f"// @downloadURL  {update_url}", self.userscript)
@@ -66,11 +66,40 @@ class WatchTogetherUiContractTests(unittest.TestCase):
         self.assertNotIn("innerHTML", watch_code)
         self.assertIn("textContent", watch_code)
         self.assertIn("Escape", watch_code)
-        self.assertIn("event.target === overlay", watch_code)
         self.assertIn("parsed.username", watch_code)
         self.assertIn("parsed.password", watch_code)
         self.assertIn("code === 'server_mismatch'", watch_code)
         self.assertIn("当前 Emby 实际服务器与 INI", watch_code)
+
+        # Native Emby navigation/page integration replaces the old modal and
+        # never invents a hash route or a full-screen overlay.
+        self.assertIn("WATCH_TOGETHER_NAV_ID", watch_code)
+        self.assertIn("WATCH_TOGETHER_PAGE_ID", watch_code)
+        self.assertIn("data-etlp-watch-together-nav", watch_code)
+        self.assertIn("listItem listItem-autoactive itemAction listItemCursor listItem-hoverable navMenuOption navDrawerListItem", watch_code)
+        self.assertIn("navDrawerListItemImageContainer listItemImageContainer", watch_code)
+        self.assertIn("navDrawerListItemIcon listItemIcon md-icon", watch_code)
+        self.assertIn("navDrawerListItemBody listItemBody", watch_code)
+        self.assertIn("mainAnimatedPages.skinBody", watch_code)
+        self.assertIn("view page focuscontainer-x", watch_code)
+        self.assertIn("navMenuOption-selected", watch_code)
+        self.assertNotIn("WATCH_TOGETHER_MODAL_ID", watch_code)
+        self.assertNotIn("etlp-wt-overlay", watch_code)
+        self.assertNotRegex(watch_code, r"position\s*:\s*fixed|z-index\s*:|background\s*:\s*#fff|background\s*:\s*white|background\s*:\s*rgba|font-family\s*:")
+
+        # A single persistent observer is throttled through RAF and can
+        # reconcile SPA redraws without multiplying navigation listeners.
+        self.assertEqual(watch_code.count("new MutationObserver("), 1)
+        self.assertIn("requestAnimationFrame", watch_code)
+        self.assertIn("watchTogetherScheduleNavigationSync", watch_code)
+        self.assertIn("watchTogetherCleanupState", watch_code)
+        self.assertIn("watchTogetherStateIsCurrent", watch_code)
+        self.assertIn("window.addEventListener('hashchange'", watch_code)
+        self.assertIn("window.addEventListener('popstate'", watch_code)
+        self.assertIn("document.addEventListener('click', state.onNativeNavigation, true)", watch_code)
+        self.assertIn("state.close(true)", watch_code)
+        self.assertIn("state.close(false)", watch_code)
+        self.assertIn("watchTogetherTokenGeneration", watch_code)
 
         render_match = re.search(
             r"function watchTogetherRenderUsers\(.*?(?=\n    function watchTogetherStatusLabel)",
@@ -100,6 +129,9 @@ class WatchTogetherUiContractTests(unittest.TestCase):
             "watch_together_rooms.json",
             "loopback",
             "admin key",
+            "Emby 左侧导航",
+            "同步观看",
+            "油猴菜单“同步观看房间”",
         )
         for phrase in required_readme:
             self.assertIn(phrase, self.readme)

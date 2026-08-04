@@ -3,7 +3,7 @@
 // @name:zh-CN   embyToLocalPlayer
 // @name:en      embyToLocalPlayer
 // @namespace    https://github.com/kjtsune/embyToLocalPlayer
-// @version      2026.08.04.1
+// @version      2026.08.04.2
 // @updateURL    https://raw.githubusercontent.com/hope140/embyToLocalPlayer/watch_together/user_script/embyToLocalPlayer.user.js
 // @downloadURL  https://raw.githubusercontent.com/hope140/embyToLocalPlayer/watch_together/user_script/embyToLocalPlayer.user.js
 // @description  Emby/Jellyfin 调用外部本地播放器，并回传播放记录。适配 Plex。
@@ -234,9 +234,16 @@
     };
     const WATCH_TOGETHER_TOKEN_HEADER = 'X-ETLP-Watch-Token';
     const WATCH_TOGETHER_TIMEOUT_MS = 10000;
-    const WATCH_TOGETHER_MODAL_ID = 'etlp-watch-together-modal';
+    const WATCH_TOGETHER_NAV_ID = 'etlp-watch-together-nav';
+    const WATCH_TOGETHER_PAGE_ID = 'etlp-watch-together-page';
+    const WATCH_TOGETHER_NAV_DATA = 'data-etlp-watch-together-nav';
     let watchTogetherToken = null;
-    let watchTogetherModalCleanup = null;
+    let watchTogetherTokenGeneration = null;
+    let watchTogetherActiveState = null;
+    let watchTogetherSessionGeneration = 0;
+    let watchTogetherNavigationObserver = null;
+    let watchTogetherNavigationFrame = 0;
+    let watchTogetherNavigationStarted = false;
 
     function getWatchTogetherApiClient() {
         try {
@@ -385,35 +392,62 @@
         });
     }
 
-    async function watchTogetherAuthenticate(context) {
+    function watchTogetherStateIsCurrent(state, generation = state && state.generation) {
+        if (!state) return true;
+        return watchTogetherActiveState === state && !state.closed && state.generation === generation;
+    }
+
+    function watchTogetherInvalidateToken(state = null) {
+        if (!state || watchTogetherTokenGeneration === state.generation) {
+            watchTogetherToken = null;
+            watchTogetherTokenGeneration = null;
+        }
+    }
+
+    async function watchTogetherAuthenticate(context, state = null) {
+        const generation = state && state.generation;
+        if (!watchTogetherStateIsCurrent(state, generation)) return null;
         const result = await watchTogetherRequest(WATCH_TOGETHER_ENDPOINTS.auth, {
             server_url: context.serverUrl,
             user_id: context.userId,
             api_key: context.accessToken,
         });
+        if (!watchTogetherStateIsCurrent(state, generation)) return null;
         if (!result || typeof result.token !== 'string' || !result.token) {
             throw makeWatchTogetherError(503, 'invalid_auth_response', '本地服务返回的认证结果无效');
         }
         watchTogetherToken = result.token;
+        watchTogetherTokenGeneration = generation;
         return result;
     }
 
-    async function watchTogetherApiRequest(path, body, context, retried = false) {
-        if (!watchTogetherToken) await watchTogetherAuthenticate(context);
+    async function watchTogetherApiRequest(path, body, context, state = null, retried = false) {
+        const generation = state && state.generation;
+        if (!watchTogetherStateIsCurrent(state, generation)) return null;
+        if (!watchTogetherToken || watchTogetherTokenGeneration !== generation) {
+            await watchTogetherAuthenticate(context, state);
+            if (!watchTogetherStateIsCurrent(state, generation)) return null;
+        }
         try {
-            return await watchTogetherRequest(path, body, watchTogetherToken);
+            const response = await watchTogetherRequest(path, body, watchTogetherToken);
+            if (!watchTogetherStateIsCurrent(state, generation)) return null;
+            return response;
         } catch (error) {
+            if (!watchTogetherStateIsCurrent(state, generation)) return null;
             if (Number(error && error.status) === 401 && !retried) {
-                watchTogetherToken = null;
-                await watchTogetherAuthenticate(context);
+                watchTogetherInvalidateToken(state);
+                await watchTogetherAuthenticate(context, state);
+                if (!watchTogetherStateIsCurrent(state, generation)) return null;
                 try {
-                    return await watchTogetherRequest(path, body, watchTogetherToken);
+                    const retryResponse = await watchTogetherRequest(path, body, watchTogetherToken);
+                    if (!watchTogetherStateIsCurrent(state, generation)) return null;
+                    return retryResponse;
                 } catch (retryError) {
-                    if (Number(retryError && retryError.status) === 401) watchTogetherToken = null;
+                    if (Number(retryError && retryError.status) === 401) watchTogetherInvalidateToken(state);
                     throw retryError;
                 }
             }
-            if (Number(error && error.status) === 401) watchTogetherToken = null;
+            if (Number(error && error.status) === 401) watchTogetherInvalidateToken(state);
             throw error;
         }
     }
@@ -444,96 +478,240 @@
         const style = document.createElement('style');
         style.id = 'etlp-watch-together-style';
         style.textContent = `
-            #${WATCH_TOGETHER_MODAL_ID} { position: fixed; inset: 0; z-index: 2147483647; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(0,0,0,.62); font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-dialog { width: min(720px, 100%); max-height: min(88vh, 760px); overflow: auto; color: #202124; background: #fff; border-radius: 12px; box-shadow: 0 18px 60px rgba(0,0,0,.4); }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-header { display:flex; align-items:center; justify-content:space-between; padding: 16px 20px; border-bottom: 1px solid #e4e6e8; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-title { margin:0; font-size: 20px; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-close { border:0; background:transparent; cursor:pointer; font-size:24px; line-height:1; padding:4px 8px; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-body { padding: 16px 20px 22px; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-status { margin-bottom: 14px; padding: 10px 12px; border-radius: 6px; background:#f1f3f4; white-space:pre-wrap; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-form { display:grid; gap:10px; padding:14px; border:1px solid #e4e6e8; border-radius:8px; }
-            #${WATCH_TOGETHER_MODAL_ID} label { display:grid; gap:5px; font-size:13px; }
-            #${WATCH_TOGETHER_MODAL_ID} input, #${WATCH_TOGETHER_MODAL_ID} select { min-height:34px; padding:5px 8px; border:1px solid #bbc0c4; border-radius:5px; font:inherit; }
-            #${WATCH_TOGETHER_MODAL_ID} button { cursor:pointer; }
-            #${WATCH_TOGETHER_MODAL_ID} button:disabled { cursor:wait; opacity:.55; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-primary { border:0; border-radius:5px; padding:8px 14px; color:#fff; background:#1769aa; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-secondary { border:1px solid #bbc0c4; border-radius:5px; padding:6px 10px; color:#202124; background:#fff; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-rooms { display:grid; gap:10px; margin-top:18px; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-room { padding:13px; border:1px solid #e4e6e8; border-radius:8px; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-room h3 { margin:0 0 7px; font-size:16px; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-room p { margin:3px 0; font-size:13px; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:10px; }
-            #${WATCH_TOGETHER_MODAL_ID} .etlp-wt-empty { margin:14px 0 0; color:#5f6368; }
+            #${WATCH_TOGETHER_PAGE_ID} { box-sizing:border-box; min-height:100%; padding:1.25em; color:currentColor; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-content { width:min(960px, 100%); margin:0 auto; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-header { display:flex; align-items:center; gap:.75em; margin-bottom:1.25em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-title { margin:0; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-status { margin-bottom:1em; padding:.75em 1em; border:1px solid currentColor; border-radius:.35em; white-space:pre-wrap; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1em; padding:1em; border:1px solid currentColor; border-radius:.35em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-field { display:grid; gap:.35em; min-width:0; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-field-wide { grid-column:1 / -1; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form input, #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form select { box-sizing:border-box; width:100%; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-actions { display:flex; flex-wrap:wrap; gap:.5em; margin-top:.75em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-rooms { display:grid; gap:.75em; margin-top:1.25em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room { padding:1em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room h3 { margin:0 0 .5em; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-room p { margin:.25em 0; }
+            #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-empty { margin:1em 0 0; }
+            #${WATCH_TOGETHER_PAGE_ID} button:disabled, #${WATCH_TOGETHER_PAGE_ID} select:disabled, #${WATCH_TOGETHER_PAGE_ID} input:disabled { cursor:wait; opacity:.55; }
+            @media (max-width: 600px) {
+                #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form { grid-template-columns:1fr; }
+                #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-field-wide { grid-column:auto; }
+            }
         `;
         (document.head || document.documentElement).appendChild(style);
     }
 
-    function watchTogetherCreateModal() {
-        if (watchTogetherModalCleanup) watchTogetherModalCleanup();
-        const previous = document.getElementById(WATCH_TOGETHER_MODAL_ID);
-        if (previous) previous.remove();
-        if (!document.body) return null;
+    function watchTogetherIsVisible(element) {
+        if (!element || !(element instanceof Element)) return false;
+        const style = window.getComputedStyle(element);
+        return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+    }
+
+    function watchTogetherPlatformName() {
+        const client = getWatchTogetherApiClient();
+        let name = '';
+        try {
+            name = String(client && (client._appName || client.appName) || serverName || '').toLowerCase();
+        } catch (_) {
+            name = String(serverName || '').toLowerCase();
+        }
+        if (name.includes('jellyfin')) return 'jellyfin';
+        if (name.includes('plex')) return 'plex';
+        if (name.includes('emby')) return 'emby';
+        return null;
+    }
+
+    function watchTogetherFindNavContainer() {
+        const containers = Array.from(document.querySelectorAll('.navDrawerItemsContainer.collapseContent'))
+            .filter(watchTogetherIsVisible);
+        if (!containers.length) return null;
+        const metadataContainer = containers.find(container => /元数据管理器|metadata manager|metadata/i.test(String(container.textContent || '')));
+        return metadataContainer || containers[0];
+    }
+
+    function watchTogetherCloseMobileDrawer() {
+        const drawer = Array.from(document.querySelectorAll('.navDrawer, .navDrawerContainer'))
+            .find(element => watchTogetherIsVisible(element) && (/open|visible/i.test(element.className) || element.getAttribute('aria-hidden') === 'false'));
+        if (!drawer) return;
+        const toggle = Array.from(document.querySelectorAll('.navDrawerButton, .btnNavDrawer, [data-action="togglemenu"]'))
+            .find(watchTogetherIsVisible);
+        if (toggle && typeof toggle.click === 'function') toggle.click();
+    }
+
+    function watchTogetherSetNavSelected(selected) {
+        document.querySelectorAll(`[${WATCH_TOGETHER_NAV_DATA}]`).forEach(nav => {
+            nav.classList.toggle('navMenuOption-selected', Boolean(selected && nav.id === WATCH_TOGETHER_NAV_ID));
+        });
+    }
+
+    function watchTogetherEnsureNavigation() {
+        if (watchTogetherPlatformName() !== 'emby') {
+            document.querySelectorAll(`[${WATCH_TOGETHER_NAV_DATA}]`).forEach(nav => nav.remove());
+            return;
+        }
+        const container = watchTogetherFindNavContainer();
+        if (!container) {
+            document.querySelectorAll(`[${WATCH_TOGETHER_NAV_DATA}]`).forEach(nav => nav.remove());
+            return;
+        }
+        let nav = document.getElementById(WATCH_TOGETHER_NAV_ID);
+        if (nav && nav.parentElement !== container) {
+            nav.remove();
+            nav = null;
+        }
+        document.querySelectorAll(`[${WATCH_TOGETHER_NAV_DATA}]`).forEach(candidate => {
+            if (candidate !== nav) candidate.remove();
+        });
+        if (!nav) {
+            nav = watchTogetherElement('button', null, 'listItem listItem-autoactive itemAction listItemCursor listItem-hoverable navMenuOption navDrawerListItem');
+            nav.id = WATCH_TOGETHER_NAV_ID;
+            nav.type = 'button';
+            nav.setAttribute(WATCH_TOGETHER_NAV_DATA, 'true');
+            nav.setAttribute('aria-label', '同步观看');
+            const imageContainer = watchTogetherElement('div', null, 'navDrawerListItemImageContainer listItemImageContainer');
+            const icon = watchTogetherElement('span', 'group', 'navDrawerListItemIcon listItemIcon md-icon');
+            const body = watchTogetherElement('div', '同步观看', 'navDrawerListItemBody listItemBody');
+            imageContainer.appendChild(icon);
+            nav.append(imageContainer, body);
+            nav.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+                watchTogetherCloseMobileDrawer();
+                openWatchTogetherMenu().catch(() => alert('同步观看房间打开失败，请刷新 Emby 页面后重试。'));
+            });
+            container.appendChild(nav);
+        }
+        watchTogetherSetNavSelected(Boolean(watchTogetherActiveState && !watchTogetherActiveState.closed));
+    }
+
+    function watchTogetherFindMainPages(main) {
+        if (!main) return [];
+        return Array.from(main.children).filter(page => page.id !== WATCH_TOGETHER_PAGE_ID && watchTogetherIsVisible(page));
+    }
+
+    function watchTogetherRestoreCapturedPages(state) {
+        if (!state || !Array.isArray(state.previousPages)) return;
+        state.previousPages.forEach(previous => {
+            if (!previous.element || !previous.element.isConnected) return;
+            previous.element.style.display = previous.display;
+            if (previous.hidden) previous.element.setAttribute('hidden', '');
+            else previous.element.removeAttribute('hidden');
+            if (previous.ariaHidden === null) previous.element.removeAttribute('aria-hidden');
+            else previous.element.setAttribute('aria-hidden', previous.ariaHidden);
+        });
+    }
+
+    function watchTogetherCleanupState(state, restore = false) {
+        if (!state || state.closed) return;
+        state.closed = true;
+        if (watchTogetherActiveState === state) watchTogetherActiveState = null;
+        if (state.onKeydown) document.removeEventListener('keydown', state.onKeydown, true);
+        if (state.onNativeNavigation) document.removeEventListener('click', state.onNativeNavigation, true);
+        if (state.onHashChange) window.removeEventListener('hashchange', state.onHashChange);
+        if (state.onPopState) window.removeEventListener('popstate', state.onPopState);
+        if (restore) watchTogetherRestoreCapturedPages(state);
+        if (state.page && state.page.parentNode) state.page.remove();
+        watchTogetherInvalidateToken(state);
+        watchTogetherSetNavSelected(Boolean(watchTogetherActiveState && !watchTogetherActiveState.closed));
+        watchTogetherScheduleNavigationSync();
+    }
+
+    function watchTogetherCreatePage() {
+        if (watchTogetherActiveState) watchTogetherCleanupState(watchTogetherActiveState, false);
+        const main = document.querySelector('.mainAnimatedPages.skinBody');
+        if (!main) return null;
         watchTogetherInstallStyles();
-        const overlay = watchTogetherElement('div', null, 'etlp-wt-overlay');
-        overlay.id = WATCH_TOGETHER_MODAL_ID;
-        const dialog = watchTogetherElement('div', null, 'etlp-wt-dialog');
-        dialog.setAttribute('role', 'dialog');
-        dialog.setAttribute('aria-modal', 'true');
+        const previousPages = watchTogetherFindMainPages(main).map(element => ({
+            element,
+            display: element.style.display,
+            hidden: element.hasAttribute('hidden'),
+            ariaHidden: element.getAttribute('aria-hidden'),
+        }));
+        previousPages.forEach(previous => {
+            previous.element.style.display = 'none';
+            previous.element.setAttribute('aria-hidden', 'true');
+        });
+
+        const page = watchTogetherElement('div', null, 'view page focuscontainer-x mainAnimatedPage');
+        page.id = WATCH_TOGETHER_PAGE_ID;
+        page.setAttribute('data-etlp-watch-together-page', 'true');
+        page.setAttribute('tabindex', '-1');
+        const state = {
+            generation: ++watchTogetherSessionGeneration,
+            main,
+            page,
+            previousPages,
+            users: [],
+            runtime: [],
+            closed: false,
+        };
+        const content = watchTogetherElement('div', null, 'etlp-wt-content');
         const header = watchTogetherElement('div', null, 'etlp-wt-header');
-        const heading = watchTogetherElement('h2', '同步观看房间', 'etlp-wt-title');
-        const closeButton = watchTogetherElement('button', '×', 'etlp-wt-close');
-        closeButton.type = 'button';
-        closeButton.setAttribute('aria-label', '关闭同步观看房间');
-        header.append(heading, closeButton);
-        const body = watchTogetherElement('div', null, 'etlp-wt-body');
+        const backButton = watchTogetherElement('button', '返回', 'emby-button button-link');
+        backButton.type = 'button';
+        backButton.setAttribute('aria-label', '返回 Emby 页面');
+        const heading = watchTogetherElement('h1', '同步观看', 'etlp-wt-title');
+        header.append(backButton, heading);
         const status = watchTogetherElement('div', '正在连接本地服务…', 'etlp-wt-status');
         status.setAttribute('role', 'status');
         const form = watchTogetherElement('form', null, 'etlp-wt-form');
-        const nameLabel = watchTogetherElement('label', '房间名称');
+        const nameLabel = watchTogetherElement('label', '房间名称', 'etlp-wt-field etlp-wt-field-wide');
         const nameInput = watchTogetherElement('input');
+        nameInput.className = 'emby-input';
         nameInput.type = 'text';
         nameInput.maxLength = 120;
         nameInput.required = true;
         nameLabel.appendChild(nameInput);
-        const userALabel = watchTogetherElement('label', '用户 A');
+        const userALabel = watchTogetherElement('label', '用户 A', 'etlp-wt-field');
         const userA = watchTogetherElement('select');
+        userA.className = 'emby-select';
         userALabel.appendChild(userA);
-        const userBLabel = watchTogetherElement('label', '用户 B');
+        const userBLabel = watchTogetherElement('label', '用户 B', 'etlp-wt-field');
         const userB = watchTogetherElement('select');
+        userB.className = 'emby-select';
         userBLabel.appendChild(userB);
-        const primaryLabel = watchTogetherElement('label', '主用户（初始位置/冲突优先）');
+        const primaryLabel = watchTogetherElement('label', '主用户（初始位置/冲突优先）', 'etlp-wt-field etlp-wt-field-wide');
         const primary = watchTogetherElement('select');
+        primary.className = 'emby-select';
         primaryLabel.appendChild(primary);
-        const createButton = watchTogetherElement('button', '创建房间', 'etlp-wt-primary');
+        const createButton = watchTogetherElement('button', '创建房间', 'emby-button raised button-submit etlp-wt-field-wide');
         createButton.type = 'submit';
         form.append(nameLabel, userALabel, userBLabel, primaryLabel, createButton);
-        const roomsHeading = watchTogetherElement('h3', '已有房间');
+        const roomsHeading = watchTogetherElement('h2', '已有房间');
         const rooms = watchTogetherElement('div', null, 'etlp-wt-rooms');
-        body.append(status, form, roomsHeading, rooms);
-        dialog.append(header, body);
-        overlay.appendChild(dialog);
-        document.body.appendChild(overlay);
-
-        const state = { overlay, status, form, nameInput, userA, userB, primary, createButton, rooms, users: [], runtime: [], closed: false };
+        content.append(header, status, form, roomsHeading, rooms);
+        page.appendChild(content);
+        state.status = status;
+        state.form = form;
+        state.nameInput = nameInput;
+        state.userA = userA;
+        state.userB = userB;
+        state.primary = primary;
+        state.createButton = createButton;
+        state.rooms = rooms;
+        state.close = restore => watchTogetherCleanupState(state, restore);
+        state.onKeydown = event => {
+            if (event.key === 'Escape') state.close(true);
+        };
+        state.onNativeNavigation = event => {
+            const target = event.target;
+            const nativeNav = target && typeof target.closest === 'function' ? target.closest('.navMenuOption') : null;
+            if (nativeNav && nativeNav.id !== WATCH_TOGETHER_NAV_ID) state.close(false);
+        };
+        state.onHashChange = () => state.close(false);
+        state.onPopState = () => state.close(false);
+        backButton.addEventListener('click', () => state.close(true));
+        document.addEventListener('keydown', state.onKeydown, true);
+        document.addEventListener('click', state.onNativeNavigation, true);
+        window.addEventListener('hashchange', state.onHashChange);
+        window.addEventListener('popstate', state.onPopState);
+        watchTogetherActiveState = state;
+        main.appendChild(page);
         watchTogetherBindUserSelects(state);
-        const close = () => {
-            if (state.closed) return;
-            state.closed = true;
-            document.removeEventListener('keydown', onKeydown, true);
-            if (overlay.parentNode) overlay.remove();
-            watchTogetherToken = null;
-            if (watchTogetherModalCleanup === close) watchTogetherModalCleanup = null;
-        };
-        const onKeydown = event => {
-            if (event.key === 'Escape') close();
-        };
-        closeButton.addEventListener('click', close);
-        overlay.addEventListener('click', event => {
-            if (event.target === overlay) close();
-        });
-        document.addEventListener('keydown', onKeydown, true);
-        watchTogetherModalCleanup = close;
-        state.close = close;
+        watchTogetherBindCreate(state);
+        watchTogetherSetNavSelected(true);
         return state;
     }
 
@@ -545,10 +723,11 @@
     }
 
     function watchTogetherSetStatus(state, message) {
-        if (state && state.status) state.status.textContent = String(message || '');
+        if (watchTogetherStateIsCurrent(state) && state.status) state.status.textContent = String(message || '');
     }
 
     function watchTogetherSetFormDisabled(state, disabled) {
+        if (!watchTogetherStateIsCurrent(state)) return;
         if (disabled) {
             [state.nameInput, state.userA, state.userB, state.primary, state.createButton].forEach(element => {
                 if (element) element.disabled = true;
@@ -564,6 +743,7 @@
     }
 
     function watchTogetherSyncPrimary(state) {
+        if (!watchTogetherStateIsCurrent(state)) return;
         const previous = state.primary.value;
         state.primary.textContent = '';
         [state.userA.value, state.userB.value].filter((value, index, values) => value && values.indexOf(value) === index).forEach(userId => {
@@ -577,6 +757,7 @@
     }
 
     function watchTogetherRenderUsers(state, users) {
+        if (!watchTogetherStateIsCurrent(state)) return;
         state.users = Array.isArray(users) ? users.filter(user => user && user.id).map(user => ({ id: String(user.id), name: String(user.name || user.id) })) : [];
         [state.userA, state.userB].forEach(select => {
             select.textContent = '';
@@ -610,6 +791,7 @@
     }
 
     function watchTogetherRenderRooms(state, roomList, runtimeList) {
+        if (!watchTogetherStateIsCurrent(state)) return;
         state.runtime = Array.isArray(runtimeList) ? runtimeList : [];
         const runtimeByRoom = new Map(state.runtime.map(item => [String(item.room_id), item]));
         const usersById = new Map(state.users.map(user => [user.id, user.name]));
@@ -633,12 +815,12 @@
             const status = watchTogetherElement('p', `运行状态：${watchTogetherStatusLabel(runtime.state, runtime.error)}`);
             const actions = watchTogetherElement('div', null, 'etlp-wt-actions');
             [['pause', '暂停'], ['resume', '继续'], ['resync', '重新同步']].forEach(([action, text]) => {
-                const button = watchTogetherElement('button', text, 'etlp-wt-secondary');
+                const button = watchTogetherElement('button', text, 'emby-button raised etlp-wt-secondary');
                 button.type = 'button';
                 button.addEventListener('click', () => watchTogetherRoomAction(state, roomId, action, button));
                 actions.appendChild(button);
             });
-            const deleteButton = watchTogetherElement('button', '删除', 'etlp-wt-secondary');
+            const deleteButton = watchTogetherElement('button', '删除', 'emby-button button-link etlp-wt-secondary');
             deleteButton.type = 'button';
             deleteButton.addEventListener('click', () => watchTogetherDeleteRoom(state, roomId, deleteButton));
             actions.appendChild(deleteButton);
@@ -648,53 +830,55 @@
     }
 
     async function watchTogetherRefreshRooms(state, context, message = '正在加载房间…') {
-        if (!state || state.closed) return;
+        if (!watchTogetherStateIsCurrent(state)) return;
         watchTogetherSetStatus(state, message);
         try {
-            const result = await watchTogetherApiRequest(WATCH_TOGETHER_ENDPOINTS.list, {}, context);
-            if (state.closed) return;
+            const result = await watchTogetherApiRequest(WATCH_TOGETHER_ENDPOINTS.list, {}, context, state);
+            if (!watchTogetherStateIsCurrent(state)) return;
             watchTogetherRenderUsers(state, result && result.users);
             watchTogetherRenderRooms(state, result && result.rooms, result && result.runtime);
             if (!result || !Array.isArray(result.rooms) || result.rooms.length === 0) watchTogetherSetStatus(state, '暂无房间，请先创建一个房间。');
             else watchTogetherSetStatus(state, '房间列表已更新。');
         } catch (error) {
-            if (!state.closed) watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
+            if (watchTogetherStateIsCurrent(state)) watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
         }
     }
 
     async function watchTogetherRoomAction(state, roomId, action, button) {
-        if (!state || state.closed || !button) return;
+        if (!watchTogetherStateIsCurrent(state) || !button) return;
         const context = state.context;
         button.disabled = true;
         try {
-            await watchTogetherApiRequest(WATCH_TOGETHER_ENDPOINTS.action, { room_id: roomId, action }, context);
+            await watchTogetherApiRequest(WATCH_TOGETHER_ENDPOINTS.action, { room_id: roomId, action }, context, state);
+            if (!watchTogetherStateIsCurrent(state)) return;
             await watchTogetherRefreshRooms(state, context, '正在刷新房间状态…');
         } catch (error) {
             watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
         } finally {
-            if (!state.closed) button.disabled = false;
+            if (watchTogetherStateIsCurrent(state)) button.disabled = false;
         }
     }
 
     async function watchTogetherDeleteRoom(state, roomId, button) {
-        if (!state || state.closed || !button) return;
+        if (!watchTogetherStateIsCurrent(state) || !button) return;
         if (!window.confirm('确定删除此同步观看房间吗？')) return;
         const context = state.context;
         button.disabled = true;
         try {
-            await watchTogetherApiRequest(WATCH_TOGETHER_ENDPOINTS.delete, { room_id: roomId }, context);
+            await watchTogetherApiRequest(WATCH_TOGETHER_ENDPOINTS.delete, { room_id: roomId }, context, state);
+            if (!watchTogetherStateIsCurrent(state)) return;
             await watchTogetherRefreshRooms(state, context, '正在刷新房间列表…');
         } catch (error) {
             watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
         } finally {
-            if (!state.closed) button.disabled = false;
+            if (watchTogetherStateIsCurrent(state)) button.disabled = false;
         }
     }
 
     function watchTogetherBindCreate(state) {
         state.form.addEventListener('submit', async event => {
             event.preventDefault();
-            if (state.closed) return;
+            if (!watchTogetherStateIsCurrent(state)) return;
             const name = String(state.nameInput.value || '').trim();
             const members = [String(state.userA.value || ''), String(state.userB.value || '')];
             const primary = String(state.primary.value || '');
@@ -716,13 +900,14 @@
                     name,
                     participant_user_ids: members,
                     primary_user_id: primary,
-                }, state.context);
+                }, state.context, state);
+                if (!watchTogetherStateIsCurrent(state)) return;
                 state.nameInput.value = '';
                 await watchTogetherRefreshRooms(state, state.context, '正在刷新房间列表…');
             } catch (error) {
                 watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
             } finally {
-                if (!state.closed) {
+                if (watchTogetherStateIsCurrent(state)) {
                     watchTogetherSetFormDisabled(state, false);
                 }
             }
@@ -735,20 +920,51 @@
             alert(context.error);
             return;
         }
-        const state = watchTogetherCreateModal();
+        const state = watchTogetherCreatePage();
         if (!state) {
             alert('同步观看房间需要在 Emby 页面打开，当前页面尚未准备好。');
             return;
         }
         state.context = context;
-        watchTogetherBindCreate(state);
         watchTogetherSetStatus(state, '正在验证 Emby 账号…');
         try {
-            await watchTogetherAuthenticate(context);
+            await watchTogetherAuthenticate(context, state);
+            if (!watchTogetherStateIsCurrent(state)) return;
             await watchTogetherRefreshRooms(state, context);
         } catch (error) {
-            watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
+            if (watchTogetherStateIsCurrent(state)) watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
         }
+    }
+
+    function watchTogetherScheduleNavigationSync() {
+        if (watchTogetherNavigationFrame) return;
+        const schedule = () => {
+            watchTogetherNavigationFrame = 0;
+            watchTogetherEnsureNavigation();
+            const state = watchTogetherActiveState;
+            if (!state || state.closed) return;
+            if (!state.page.isConnected || watchTogetherFindMainPages(state.main).length) state.close(false);
+        };
+        if (typeof window.requestAnimationFrame === 'function') watchTogetherNavigationFrame = window.requestAnimationFrame(schedule);
+        else watchTogetherNavigationFrame = window.setTimeout(schedule, 0);
+    }
+
+    function watchTogetherStartNavigationObserver() {
+        if (watchTogetherNavigationStarted) return;
+        watchTogetherNavigationStarted = true;
+        const start = () => {
+            watchTogetherScheduleNavigationSync();
+            if (!document.documentElement || watchTogetherNavigationObserver) return;
+            watchTogetherNavigationObserver = new MutationObserver(() => watchTogetherScheduleNavigationSync());
+            watchTogetherNavigationObserver.observe(document.documentElement, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['class', 'style', 'hidden', 'aria-hidden'],
+            });
+        };
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+        start();
     }
 
     // --- end watch-together administrator UI ---
@@ -1479,6 +1695,7 @@
     }
 
     initXMLHttpRequest();
+    watchTogetherStartNavigationObserver();
 
     setModeSwitchMenu(etlpStorageKeys.webPlayerEnable, '脚本在当前服务器 已', '', '可用', '禁用', '可用');
     setModeSwitchMenu(etlpStorageKeys.mountDiskEnable, '读取硬盘模式已经 ');
@@ -1502,10 +1719,4 @@
         setCallbackMenu('继续播放: 重置隐藏设置', resetHiddenSeries);
     }
 
-    // let debounceTimer; # 有的 css 选择器比较宽泛，播放后再检测比较稳妥。
-    // const observer = new MutationObserver(() => {
-    //     clearTimeout(debounceTimer);
-    //     debounceTimer = setTimeout(removeErrorWindows, 100);
-    // });
-    // observer.observe(document.body, { childList: true, subtree: true });
 })();
