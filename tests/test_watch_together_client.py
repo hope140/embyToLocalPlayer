@@ -286,18 +286,12 @@ class WatchTogetherClientTests(unittest.TestCase):
             "assert callable(factory)",
             "assert factory is module.create_connection",
             "assert module.__version__ == '1.8.0'",
-            "sys.__stdout__.write(module.__version__ + '\\n')",
-            "sys.__stdout__.flush()",
         ))
         result = subprocess.run(
             [sys.executable, '-c', script],
             cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.lstrip('\ufeff').strip(), '1.8.0')
+        self.assertEqual(result.returncode, 0)
 
     def test_bundled_websocket_hash_mismatch_degrades_without_thread(self):
         client = WatchTogetherClient(
