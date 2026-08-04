@@ -51,6 +51,31 @@ class FakePlayer:
         return None
 
 
+class DelayedPausePlayer(FakePlayer):
+    """Fake mpv whose pause property settles after several reads."""
+
+    def __init__(self, pause_apply_after_reads):
+        super().__init__()
+        self.pause_apply_after_reads = pause_apply_after_reads
+        self._pending_pause = None
+        self._pause_reads = 0
+
+    def command(self, *args):
+        if args[:2] == ('set_property', 'pause'):
+            self.commands.append(args)
+            self._pending_pause = bool(args[2])
+            self._pause_reads = 0
+            return None
+        if args[:2] == ('get_property', 'pause'):
+            if self._pending_pause is not None:
+                self._pause_reads += 1
+                if self._pause_reads >= self.pause_apply_after_reads:
+                    self.paused = self._pending_pause
+                    self._pending_pause = None
+            return self.paused
+        return super().command(*args)
+
+
 class FakeSessionApi:
     client_name = 'embyToLocalPlayer'
     device_name = 'watch-together'
@@ -355,6 +380,48 @@ class WatchTogetherClientTests(unittest.TestCase):
             })))
         set_pause.assert_not_called()
         self.assertEqual(len(self.api.reports), reports_before)
+
+    def test_pause_confirmation_uses_delayed_state_for_report(self):
+        player = DelayedPausePlayer(pause_apply_after_reads=3)
+        api = FakeSessionApi()
+        client = WatchTogetherClient(
+            {'server': 'emby', 'watch_together_enabled': True},
+            player=player, session_api=api, enabled=True,
+        )
+        self.assertTrue(client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False}, now=0,
+        ))
+        self.assertTrue(client.handle_message(json.dumps({
+            'MessageType': 'Playstate',
+            'Data': json.dumps({'Command': 'Pause'}),
+        })))
+        self.assertTrue(player.paused)
+        self.assertEqual(api.reports[-1][0], 'progress')
+        self.assertTrue(api.reports[-1][1]['is_paused'])
+        self.assertEqual(api.reports[-1][1]['event_name'], 'Pause')
+
+    def test_pause_confirmation_timeout_does_not_report_old_state(self):
+        player = DelayedPausePlayer(pause_apply_after_reads=1000000)
+        api = FakeSessionApi()
+        client = WatchTogetherClient(
+            {'server': 'emby', 'watch_together_enabled': True},
+            player=player, session_api=api, enabled=True,
+        )
+        self.assertTrue(client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False}, now=0,
+        ))
+        reports_before = len(api.reports)
+        with mock.patch.object(
+            watch_together_client_module, '_PAUSE_CONFIRM_TIMEOUT', 0.03,
+        ), mock.patch.object(
+            watch_together_client_module, '_PAUSE_CONFIRM_INTERVAL', 0.005,
+        ):
+            self.assertFalse(client.handle_message(json.dumps({
+                'MessageType': 'Playstate',
+                'Data': json.dumps({'Command': 'Pause'}),
+            })))
+        self.assertFalse(player.paused)
+        self.assertEqual(len(api.reports), reports_before)
 
     def test_identity_uses_emby_pipe_delimited_data(self):
         self.assertTrue(self.client._send_identity(self.ws))

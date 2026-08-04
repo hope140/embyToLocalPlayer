@@ -32,6 +32,8 @@ _BUILTIN_WEBSOCKET_SHA256 = (
     '17b44cc997f5c498e809b22cdf2d9c7a9e71c02c8cc2b6c56e7c2d1239bfa526'
 )
 _CAPABILITIES_RETRY_INTERVAL = 1.0
+_PAUSE_CONFIRM_TIMEOUT = 0.5
+_PAUSE_CONFIRM_INTERVAL = 0.02
 
 
 def _short_hash(value):
@@ -604,8 +606,10 @@ class WatchTogetherClient:
         self._last_snapshot_at = now
         return result
 
-    def _report_snapshot(self, force=False):
-        return self.publish_snapshot(self._snapshot(), force=force)
+    def _report_snapshot(self, force=False, snapshot=None):
+        if snapshot is None:
+            snapshot = self._snapshot()
+        return self.publish_snapshot(snapshot, force=force)
 
     def _report(self, method_name, position, paused, event_name, playback_rate=1.0):
         with self._report_lock:
@@ -700,13 +704,40 @@ class WatchTogetherClient:
                 )
                 return False
 
-    def _finish_playstate_command(self, command, handled):
+    def _confirm_pause_state(self, target_paused, timeout=None):
+        """Poll mpv until a pause-state command is visible or times out."""
+
+        timeout = _PAUSE_CONFIRM_TIMEOUT if timeout is None else max(0.0, float(timeout))
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                snapshot = self._snapshot()
+            except Exception:
+                snapshot = None
+            if (
+                isinstance(snapshot, dict)
+                and isinstance(snapshot.get('is_paused'), bool)
+                and snapshot['is_paused'] == bool(target_paused)
+            ):
+                return snapshot
+            if time.monotonic() >= deadline or self._stop_event.is_set():
+                return None
+            self._stop_event.wait(
+                min(_PAUSE_CONFIRM_INTERVAL, max(0.0, deadline - time.monotonic()))
+            )
+
+    def _finish_playstate_command(self, command, handled, snapshot=None):
         """Report a successfully applied remote command immediately."""
 
         handled = bool(handled)
         if handled:
             try:
-                reported = bool(self._report_snapshot(force=True))
+                if snapshot is None:
+                    reported = bool(self._report_snapshot(force=True))
+                else:
+                    reported = bool(
+                        self._report_snapshot(force=True, snapshot=snapshot)
+                    )
             except Exception:
                 reported = False
             if command == 'Stop' and not reported:
@@ -775,12 +806,18 @@ class WatchTogetherClient:
         )
         command = str(command or '').strip().lower()
         if command in ('pause', 'unpause', 'play'):
+            target_paused = command == 'pause'
             try:
-                handled = mpv_set_pause(self.player, command == 'pause')
+                handled = mpv_set_pause(self.player, target_paused)
             except Exception:
                 handled = False
+            confirmed_snapshot = (
+                self._confirm_pause_state(target_paused) if handled else None
+            )
+            handled = bool(handled and confirmed_snapshot is not None)
             return self._finish_playstate_command(
                 'Pause' if command == 'pause' else 'Unpause', handled,
+                snapshot=confirmed_snapshot,
             )
         if command == 'playpause':
             try:
@@ -790,11 +827,21 @@ class WatchTogetherClient:
                 )
                 if not isinstance(paused, bool):
                     handled = False
+                    confirmed_snapshot = None
                 else:
-                    handled = mpv_set_pause(self.player, not paused)
+                    target_paused = not paused
+                    handled = mpv_set_pause(self.player, target_paused)
+                    confirmed_snapshot = (
+                        self._confirm_pause_state(target_paused)
+                        if handled else None
+                    )
+                    handled = bool(handled and confirmed_snapshot is not None)
             except Exception:
                 handled = False
-            return self._finish_playstate_command('PlayPause', handled)
+                confirmed_snapshot = None
+            return self._finish_playstate_command(
+                'PlayPause', handled, snapshot=confirmed_snapshot,
+            )
         if command == 'seek':
             ticks = _field(payload, 'SeekPositionTicks')
             if ticks is None:
