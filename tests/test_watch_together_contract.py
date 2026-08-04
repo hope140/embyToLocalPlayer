@@ -111,6 +111,9 @@ class WatchTogetherUiContractTests(unittest.TestCase):
         self.assertIn("return existing", watch_code)
         self.assertIn("shouldRestoreCapturedPage", watch_code)
         self.assertIn("hasVisibleNativePage", watch_code)
+        self.assertIn("padding:5.5em 1.25em 1.25em", watch_code)
+        self.assertIn("padding:4.5em 1em 1.5em", watch_code)
+        self.assertIn("@media (max-width: 600px)", watch_code)
 
         render_match = re.search(
             r"function watchTogetherRenderUsers\(.*?(?=\n    function watchTogetherStatusLabel)",

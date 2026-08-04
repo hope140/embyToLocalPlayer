@@ -478,7 +478,7 @@
         const style = document.createElement('style');
         style.id = 'etlp-watch-together-style';
         style.textContent = `
-            #${WATCH_TOGETHER_PAGE_ID} { box-sizing:border-box; min-height:100%; padding:1.25em; color:currentColor; }
+            #${WATCH_TOGETHER_PAGE_ID} { box-sizing:border-box; min-height:100%; padding:5.5em 1.25em 1.25em; color:currentColor; }
             #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-content { width:min(960px, 100%); margin:0 auto; }
             #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-header { display:flex; align-items:center; gap:.75em; margin-bottom:1.25em; }
             #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-title { margin:0; }
@@ -495,6 +495,7 @@
             #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-empty { margin:1em 0 0; }
             #${WATCH_TOGETHER_PAGE_ID} button:disabled, #${WATCH_TOGETHER_PAGE_ID} select:disabled, #${WATCH_TOGETHER_PAGE_ID} input:disabled { cursor:wait; opacity:.55; }
             @media (max-width: 600px) {
+                #${WATCH_TOGETHER_PAGE_ID} { padding:4.5em 1em 1.5em; }
                 #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-form { grid-template-columns:1fr; }
                 #${WATCH_TOGETHER_PAGE_ID} .etlp-wt-field-wide { grid-column:auto; }
             }
