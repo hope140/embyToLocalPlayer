@@ -51,6 +51,8 @@ def normalize_server_url(value: str) -> str:
     parsed = urlsplit(value)
     if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
         raise ValueError("server_url must be an absolute http(s) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("server_url must not contain user credentials")
     path = parsed.path.rstrip("/")
     lower_path = path.lower()
     for suffix in ("/web/index.html", "/web", "/emby"):
