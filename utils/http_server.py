@@ -20,6 +20,7 @@ from utils.tools import (configs, MyLogger, open_local_folder, play_media_file,
                          activate_window_by_pid, get_player_cmd, ThreadWithReturnValue,
                          create_sparse_file)
 from utils.trakt_sync import trakt_api_client
+from utils.watch_together_coordinator import WatchTogetherHttpService
 
 player_is_running = False
 logger = MyLogger()
@@ -42,16 +43,80 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle requests in a separate thread."""
 
 
-def run_server(ip='127.0.0.1', port=58000):
+def run_server(ip='127.0.0.1', port=58000, *, watch_service=None, server_class=None,
+               service=None):
     if not configs.raw.getboolean('dev', 'listen_on_localhost', fallback=True):
         ip = get_machine_ip()
     server_address = (ip, port)
-    httpd = ThreadingHTTPServer(server_address, UserScriptRequestHandler)
+    server_class = server_class or ThreadingHTTPServer
+    watch_service = watch_service or service or WatchTogetherHttpService()
+    httpd = server_class(server_address, UserScriptRequestHandler)
+    # Inject through the server instance rather than a global so tests can
+    # provide a fake service and multiple HTTP servers remain independent.
+    httpd.watch_together_service = watch_service
     logger.info('serving at http://%s:%d' % server_address)
-    httpd.serve_forever()
+    try:
+        watch_service.start()
+        httpd.serve_forever()
+    finally:
+        try:
+            watch_service.stop()
+        finally:
+            close = getattr(httpd, 'server_close', None)
+            if close:
+                close()
 
 
 class UserScriptRequestHandler(BaseHTTPRequestHandler):
+
+    _watch_cors_headers = {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, X-ETLP-Watch-Token',
+    }
+
+    def _watch_service(self):
+        service = getattr(self.server, 'watch_together_service', None)
+        if service is None:
+            # Direct handler tests may construct a server without run_server.
+            service = WatchTogetherHttpService()
+            self.server.watch_together_service = service
+        return service
+
+    def _write_watch_result(self, status, payload):
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(encoded)))
+        for key, value in self._watch_cors_headers.items():
+            self.send_header(key, value)
+        self.end_headers()
+        if encoded:
+            self.wfile.write(encoded)
+
+    def _handle_watch_together(self, method):
+        body = None
+        if method == 'POST':
+            try:
+                length = int(self.headers.get('content-length', 0))
+            except (TypeError, ValueError):
+                length = 0
+            body = self.rfile.read(max(0, length))
+        service = self._watch_service()
+        try:
+            status, payload = service.handle(
+                self.path, body, headers=dict(self.headers.items()),
+                client_address=self.client_address, method=method,
+            )
+        except TypeError:
+            # Keep direct handler tests/fakes that predate the explicit method
+            # argument compatible without changing ordinary endpoint behavior.
+            status, payload = service.handle(
+                self.path, body, headers=dict(self.headers.items()),
+                client_address=self.client_address,
+            )
+        self._write_watch_result(status, payload)
+        return True
 
     def _post_resopne(self, msg=None, status=200):
         self.send_response(status)
@@ -62,6 +127,8 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(msg).encode('utf-8'))
 
     def do_POST(self):
+        if self.path.startswith('/watch-together'):
+            return self._handle_watch_together('POST')
         length = int(self.headers.get('content-length'))
         data = json.loads(self.rfile.read(length))
         configs.update()
@@ -131,9 +198,12 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self._post_resopne({'msg': f'{self.path} not allow'})
 
     def do_OPTIONS(self):
-        pass
+        if self.path.startswith('/watch-together'):
+            return self._handle_watch_together('OPTIONS')
 
     def do_GET(self):
+        if self.path.startswith('/watch-together'):
+            return self._handle_watch_together('GET')
         if self.path in ['/', '/favicon.ico']:
             self.send_response(200)
             self.end_headers()

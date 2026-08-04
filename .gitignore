@@ -9,3 +9,5 @@ mpv_embed/
 python_embed/
 log.txt
 trakt_token.json
+/watch_together_rooms.json
+/watch_together_rooms.json.*
