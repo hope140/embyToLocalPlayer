@@ -921,7 +921,7 @@
     }
 
     function watchTogetherRenderRooms(state, roomList, runtimeList) {
-        if (!watchTogetherStateIsCurrent(state)) return;
+        if (!watchTogetherStateIsCurrent(state) || state.participantMode) return;
         state.runtime = Array.isArray(runtimeList) ? runtimeList : [];
         const runtimeByRoom = new Map(state.runtime.map(item => [String(item.room_id), item]));
         const usersById = new Map(state.users.map(user => [user.id, user.name]));
@@ -975,7 +975,7 @@
     }
 
     async function watchTogetherRefreshRooms(state, context, message = '正在加载房间…') {
-        if (!watchTogetherStateIsCurrent(state)) return;
+        if (!watchTogetherStateIsCurrent(state) || state.participantMode) return;
         watchTogetherSetStatus(state, message);
         try {
             const result = await watchTogetherApiRequest(WATCH_TOGETHER_ENDPOINTS.list, {}, context, state);
