@@ -1,7 +1,7 @@
 # Bundled third-party dependency
 
 This directory carries an unmodified distribution wheel for the optional
-watch-together WebSocket client.  `embyToLocalPlayer` is not the upstream
+Emby remote-control WebSocket client.  `embyToLocalPlayer` is not the upstream
 `websocket-client` project; the wheel is only a fallback for installations
 where the user has not installed that dependency separately.
 
@@ -26,6 +26,6 @@ Do not edit the wheel by hand.  To update it, download the `py3-none-any`
 wheel for the intended version directly from the matching official PyPI
 release, verify it with `Get-FileHash -Algorithm SHA256` (or
 `hashlib.sha256`), replace the file unchanged, and update the filename,
-hard-coded digest in `utils/watch_together_client.py`, tests, and this note.
+hard-coded digest in `utils/remote_control_client.py`, tests, and this note.
 Keep `requirements.txt` pinned to the same version until the replacement has
 been reviewed.

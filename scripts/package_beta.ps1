@@ -14,6 +14,9 @@ if (-not $OutputDirectory) {
 $staging = Join-Path $OutputDirectory 'etlp-remote-control-beta'
 $archivePath = Join-Path $OutputDirectory 'etlp-remote-control-beta.zip'
 
+if (Test-Path -LiteralPath $staging) {
+    [System.IO.Directory]::Delete($staging, $true)
+}
 New-Item -ItemType Directory -Path $staging -Force | Out-Null
 
 $rootFiles = @(
@@ -29,8 +32,16 @@ foreach ($file in $rootFiles) {
 }
 
 foreach ($dir in @('utils', 'third_party', 'user_script')) {
-    Copy-Item -LiteralPath (Join-Path $root $dir) -Destination (Join-Path $staging $dir) -Recurse -Force
+    Copy-Item -Path (Join-Path $root $dir) -Destination $staging -Recurse -Force
 }
+
+# Remove bytecode caches and other non-runtime files from the package.
+Get-ChildItem -LiteralPath $staging -Recurse -Directory |
+    Where-Object { $_.Name -eq '__pycache__' } |
+    ForEach-Object { [System.IO.Directory]::Delete($_.FullName, $true) }
+Get-ChildItem -LiteralPath $staging -Recurse -File |
+    Where-Object { $_.Extension -in '.pyc', '.pyo' } |
+    ForEach-Object { [System.IO.File]::Delete($_.FullName) }
 
 if (Test-Path -LiteralPath $archivePath) {
     [System.IO.File]::Delete($archivePath)
