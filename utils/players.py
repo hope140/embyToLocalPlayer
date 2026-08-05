@@ -27,6 +27,93 @@ def prepare_subtitle(sub_file, data=None):
     return sub_file
 
 
+def get_mpv_snapshot(mpv):
+    """Read the small, stable property set used by remote playback control.
+
+    Both mpv and IINA expose these properties through the existing JSON IPC
+    wrapper.  Keeping the reads in one helper also gives the optional
+    watch-together client a narrow seam for fake players in tests.
+    """
+
+    if not mpv:
+        return None
+    try:
+        position = mpv.command('get_property', 'time-pos')
+        paused = mpv.command('get_property', 'pause')
+        duration = mpv.command('get_property', 'duration')
+        media_title = mpv.command('get_property', 'media-title')
+    except Exception:
+        return None
+    if isinstance(paused, str):
+        paused = paused.strip().lower() in ('1', 'true', 'yes', 'on')
+    else:
+        paused = bool(paused)
+    try:
+        playback_rate = float(mpv.command('get_property', 'speed') or 1.0)
+    except Exception:
+        playback_rate = 1.0
+    if not playback_rate > 0:
+        playback_rate = 1.0
+    try:
+        position = float(position) if position is not None else None
+    except (TypeError, ValueError):
+        position = None
+    try:
+        duration = float(duration) if duration is not None else None
+    except (TypeError, ValueError):
+        duration = None
+    if position is None:
+        return None
+    return {
+        'position_sec': max(0.0, position),
+        'is_paused': paused,
+        'duration_sec': max(0.0, duration) if duration is not None else None,
+        'media_title': media_title,
+        'playback_rate': playback_rate,
+    }
+
+
+def mpv_set_pause(mpv, paused):
+    """Set pause state on the current mpv/IINA instance."""
+
+    if not mpv:
+        return False
+    try:
+        mpv.command('set_property', 'pause', bool(paused))
+        return True
+    except Exception:
+        return False
+
+
+def mpv_seek(mpv, position_sec):
+    """Seek to an absolute position on the current mpv/IINA instance."""
+
+    if not mpv:
+        return False
+    try:
+        position_sec = max(0.0, float(position_sec))
+    except (TypeError, ValueError):
+        return False
+    try:
+        # ``seek absolute`` is understood by both mpv and IINA's mpv core.
+        mpv.command('seek', position_sec, 'absolute')
+        return True
+    except Exception:
+        return False
+
+
+def mpv_display_message(mpv, message, duration_ms=5000):
+    """Display a short remote message using mpv's OSD."""
+
+    if not mpv or message is None:
+        return False
+    try:
+        mpv.command('show-text', str(message), int(duration_ms))
+        return True
+    except Exception:
+        return False
+
+
 # *_player_start 返回获取播放时间等操作所需参数字典
 # stop_sec_* 接收字典参数
 
