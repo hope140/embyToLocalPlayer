@@ -299,6 +299,57 @@ def select_player_by_path(file_path, data=None):
     return False
 
 
+def _preheat_local_media_path(media_path, read_bytes, timeout_seconds, *,
+                               open_func=open, monotonic_func=time.monotonic):
+    """Open and read a small prefix of a mounted local media path.
+
+    The read runs in a daemon thread so a slow filesystem/provider cannot block
+    playback longer than the configured timeout. A timed-out read is allowed to
+    finish in the background and does not change the caller's path decision.
+    """
+    if timeout_seconds <= 0:
+        _logger.warn(
+            f'strm local path preheat timed out before read, timeout={timeout_seconds:g}s, '
+            f'{media_path}')
+        return False
+
+    result = {}
+
+    def read_prefix():
+        try:
+            with open_func(media_path, 'rb') as media_file:
+                media_file.read(read_bytes)
+        except OSError as error:
+            result['error'] = error
+            return
+        result['ok'] = True
+
+    started = monotonic_func()
+    worker = threading.Thread(
+        target=read_prefix, name='etlp-strm-local-preheat', daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    elapsed = monotonic_func() - started
+
+    if worker.is_alive():
+        _logger.warn(
+            f'strm local path preheat timed out after {elapsed:.2f}s, '
+            f'timeout={timeout_seconds:g}s, {media_path}')
+        return False
+
+    if error := result.get('error'):
+        _logger.warn(f'strm local path preheat failed, {media_path}, error={error!r}')
+        return False
+    if not result.get('ok'):
+        _logger.warn(f'strm local path preheat failed, {media_path}, no read result')
+        return False
+
+    _logger.info(
+        f'strm local path preheated, bytes={read_bytes}, elapsed={elapsed:.2f}s, '
+        f'{media_path}')
+    return True
+
+
 def get_player_cmd(media_path, file_path, data=None):
     # emby source_path 是 strm 的内容
     config = configs.raw
@@ -312,8 +363,10 @@ def get_player_cmd(media_path, file_path, data=None):
         exe = config['exe'][player_by_path]
     result = [exe, media_path]
     _logger.info('command line:', result)
-    media_path_exists = media_path.startswith('http') or os.path.exists(media_path)
-    if not media_path_exists and data and data.get('use_strm_local_path'):
+    is_http_path = media_path.startswith('http')
+    media_path_exists = is_http_path or os.path.exists(media_path)
+    use_local_strm_path = bool(data and data.get('use_strm_local_path'))
+    if not media_path_exists and use_local_strm_path:
         try:
             retry_seconds = max(
                 0, config.getfloat('dev', 'strm_local_path_retry_seconds', fallback=8))
@@ -343,6 +396,26 @@ def get_player_cmd(media_path, file_path, data=None):
                 _logger.info(f'strm local path ready after {elapsed:.2f}s')
                 break
             retry_interval = min(retry_interval * 2, 4)
+
+    if use_local_strm_path and media_path_exists and not is_http_path:
+        try:
+            preheat_enabled = config.getboolean(
+                'dev', 'strm_local_path_preheat', fallback=True)
+        except ValueError:
+            preheat_enabled = True
+        if preheat_enabled:
+            try:
+                preheat_bytes = max(
+                    1, config.getint('dev', 'strm_local_path_preheat_bytes', fallback=65536))
+            except ValueError:
+                preheat_bytes = 65536
+            try:
+                preheat_timeout = max(
+                    0, config.getfloat(
+                        'dev', 'strm_local_path_preheat_timeout_seconds', fallback=3))
+            except ValueError:
+                preheat_timeout = 3
+            _preheat_local_media_path(media_path, preheat_bytes, preheat_timeout)
 
     if not media_path_exists:
         raise FileNotFoundError(f'{media_path}\nmay need to disable read disk mode, '
