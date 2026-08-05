@@ -1,7 +1,7 @@
 name = "luna_worker"
 description = "执行由主线程设计完成、边界明确、可验证且可回滚的编码 Stack；不得用于需求分析、架构决策、跨 Stack 集成或发布。"
 model = "gpt-5.6-luna"
-model_reasoning_effort = "ultra"
+model_reasoning_effort = "max"
 sandbox_mode = "workspace-write"
 developer_instructions = """
 你是本项目的 Luna 实现代理，只执行主线程已经明确设计好的实现任务。
