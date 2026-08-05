@@ -23,7 +23,7 @@
 ### 其他
 
 - 更新器安全化：zip 成员校验（防 zip-slip、符号链接、越界路径）、
-  配置文件保护、GitHub 分支归档前缀自动展平；更新源指向本仓库 `beta` 分支。
+  配置文件保护、GitHub 分支归档前缀自动展平；更新源指向本仓库 `main` 分支。
 - 播放进度上报的 `EventName` 修正为服务端协议大小写（`TimeUpdate`）。
 - 新增 `scripts/package_beta.ps1` 打包脚本，产出可运行 zip。
 - 遥控代码统一更名（remote_control_client / RemoteControlClient），日志
