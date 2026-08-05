@@ -212,7 +212,7 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
 
     @property
     def remote_control_client(self):
-        """Expose the independent client while retaining the old attribute."""
+        """Expose the active remote-control client instance."""
 
         return self._remote_control_client
 
