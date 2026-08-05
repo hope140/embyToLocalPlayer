@@ -2,6 +2,9 @@
 
 ## 2026.08.05-remote_control.1（beta → main）
 
+> 本次发布基于 main 分支合并：除下述遥控功能外，同时包含上游同步内容与
+> `simkl` 标记支持（README 特性区已更新为 bangumi/bgm/simkl/trakt）。
+
 ### 新增：Emby 控制台远程控制（mpv/IINA）
 
 - 独立的 `[remote_control] enable = yes`（默认开启）控制通道：当前 mpv/IINA
