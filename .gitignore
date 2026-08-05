@@ -10,3 +10,4 @@ python_embed/
 log.txt
 trakt_token.json
 __pycache__/
+dist/
