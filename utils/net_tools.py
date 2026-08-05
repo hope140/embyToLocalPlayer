@@ -319,7 +319,9 @@ def realtime_playing_request_sender(data, cur_sec, method='playing', is_paused=N
         'X-Emby-Device-Name': 'embyToLocalPlayer',
     }
     _json = {
-        'EventName': 'timeupdate',
+        # Emby uses these event names case-sensitively.  Keep the existing
+        # feedback path compatible while matching the server's protocol.
+        'EventName': 'TimeUpdate',
         'ItemId': data['item_id'],
         'MediaSourceId': data['media_source_id'],
         'PlayMethod': 'DirectStream',

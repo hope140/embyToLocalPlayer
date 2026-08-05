@@ -57,6 +57,15 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
 * 日志出现 `serving at 127.0.0.1:58000` 为服务启动成功。
 * **碰到问题先参考下方相关 FAQ，没按要求反馈会忽略**。
 
+> Emby 远程控制（实验）
+
+本分支（`beta`）内置 Emby 控制台对当前 mpv/IINA 播放器的独立控制通道，
+不含同步观看房间功能。`[remote_control] enable = yes`（默认开启）时，播放器
+会以独立 Emby 会话身份建立控制 WebSocket，并声明 Pause/Unpause/PlayPause/
+Seek/Stop/DisplayMessage 能力；Emby 网页的控制台可对当前播放暂停、继续、
+seek 或发送消息。只控制当前机器，不建房、不互相跟随。显式设为 `no` 可关闭。
+控制台按钮是否显示取决于服务端是否识别到该活动会话及其能力声明。
+
 > Windows
 
 1. 双击 `embyToLocalPlayer_debug.bat`
