@@ -1,7 +1,7 @@
-"""Small Emby session client used by the optional watch-together control path.
+"""Small Emby session client used by the optional remote-control control path.
 
 The regular playback code intentionally keeps using the browser device id.  A
-watch-together client is a second Emby device, however, so this module builds a
+remote-control client is a second Emby device, however, so this module builds a
 new id from the browser device id and the playback session id and uses explicit
 headers for every request.  In particular, request headers captured from the
 browser are never forwarded here.
@@ -16,7 +16,7 @@ from utils.net_tools import requests_urllib
 
 logger = MyLogger()
 
-CONTROL_DEVICE_PREFIX = "etlp-wt-"
+CONTROL_DEVICE_PREFIX = "etlp-rc-"
 CONTROL_DEVICE_VERSION = "1.0"
 # Emby Web access tokens carry this authentication identity.  Keep the
 # control DeviceId independent (it is still derived per playback), but use the
@@ -77,26 +77,6 @@ def derive_control_device_id(browser_device_id, play_session_id, prefix=CONTROL_
     return (str(prefix) + digest[:24])[:32]
 
 
-def watch_together_enabled(data=None, override=None):
-    """Read the opt-in switch without making a missing section an error.
-
-    ``override`` and the explicitly named ``watch_together_enabled`` data field
-    are useful to tests and to callers that already resolved configuration.
-    The user-facing switch is always ``[watch_together] enable``.
-    """
-
-    if override is None and isinstance(data, dict):
-        override = data.get("watch_together_enabled")
-    if override is not None:
-        if isinstance(override, str):
-            return override.strip().lower() in ("1", "true", "yes", "on")
-        return bool(override)
-    try:
-        return configs.raw.getboolean("watch_together", "enable", fallback=False)
-    except (ValueError, TypeError, AttributeError):
-        return False
-
-
 def _coerce_enabled(value, default=False):
     """Convert INI/data switch values without treating arbitrary text as true."""
 
@@ -112,13 +92,10 @@ def remote_control_enabled(data=None, override=None):
 
     ``remote_control_enabled`` is the preferred per-playback data field and
     ``override`` is used by callers/tests that already resolved configuration.
-    The historical ``watch_together_enabled`` data field remains a compatibility
-    fallback so older playback payloads keep their previous behaviour.  When a
-    new payload does not carry either field, ``[remote_control] enable`` is
+    When the payload does not carry the field, ``[remote_control] enable`` is
     consulted.  A missing remote-control section defaults to enabled because
-    remote control is useful outside a room; users can opt out explicitly with
-    ``[remote_control] enable = no``.  The old room switch is intentionally not
-    consulted here so turning off room coordination does not disable controls.
+    remote control is useful on its own; users can opt out explicitly with
+    ``[remote_control] enable = no``.
     """
 
     if override is not None:
@@ -130,8 +107,6 @@ def remote_control_enabled(data=None, override=None):
         # the documented data field above as the canonical form.
         if "remote_control_enable" in data:
             return _coerce_enabled(data.get("remote_control_enable"))
-        if "watch_together_enabled" in data:
-            return _coerce_enabled(data.get("watch_together_enabled"))
 
     try:
         raw = configs.raw
@@ -206,7 +181,7 @@ class EmbySessionApi:
         )
         self.control_device_id = str(
             control_device_id
-            or data.get("watch_together_device_id")
+            or data.get("remote_control_device_id")
             or data.get("control_device_id")
             or derive_control_device_id(self.browser_device_id, self.play_session_id)
         )

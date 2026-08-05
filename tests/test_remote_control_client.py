@@ -19,8 +19,8 @@ from utils.emby_session_api import (
 from utils.data_parser import _extract_auth_identity
 from utils.players import get_mpv_snapshot
 from utils.player_manager import PrefetchManager
-import utils.watch_together_client as watch_together_client_module
-from utils.watch_together_client import WatchTogetherClient
+import utils.remote_control_client as remote_control_client_module
+from utils.remote_control_client import RemoteControlClient
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,7 +80,7 @@ class DelayedPausePlayer(FakePlayer):
 
 class FakeSessionApi:
     client_name = 'embyToLocalPlayer'
-    device_name = 'watch-together'
+    device_name = 'remote-control'
     client_version = '1.0'
     control_device_id = derive_control_device_id('browser', 'session')
     play_session_id = 'session'
@@ -138,18 +138,10 @@ class FakeWebSocket:
 
 
 class EmbySessionApiTests(unittest.TestCase):
-    def test_remote_control_switch_is_independent_and_legacy_data_compatible(self):
+    def test_remote_control_switch_is_independent(self):
         self.assertTrue(remote_control_enabled({"server": "emby"}))
-        self.assertTrue(remote_control_enabled({
-            "remote_control_enabled": True,
-            "watch_together_enabled": False,
-        }))
-        self.assertFalse(remote_control_enabled({
-            "remote_control_enabled": False,
-            "watch_together_enabled": True,
-        }))
-        self.assertFalse(remote_control_enabled({"watch_together_enabled": False}))
-        self.assertTrue(remote_control_enabled({"watch_together_enabled": True}))
+        self.assertFalse(remote_control_enabled({"remote_control_enabled": False}))
+        self.assertTrue(remote_control_enabled({"remote_control_enabled": True}))
 
     def test_remote_control_constructor_override_wins(self):
         self.assertFalse(remote_control_enabled(
@@ -331,13 +323,13 @@ class EmbySessionApiTests(unittest.TestCase):
         self.assertEqual(requests, [])
 
 
-class WatchTogetherClientTests(unittest.TestCase):
+class RemoteControlClientTests(unittest.TestCase):
     def setUp(self):
         self.player = FakePlayer()
         self.api = FakeSessionApi()
         self.ws = FakeWebSocket()
-        self.client = WatchTogetherClient(
-            {'server': 'emby', 'watch_together_enabled': True},
+        self.client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
             player=self.player, session_api=self.api, enabled=True,
             ws_factory=lambda *args, **kwargs: self.ws,
             report_interval=10, heartbeat_interval=100,
@@ -392,7 +384,7 @@ class WatchTogetherClientTests(unittest.TestCase):
         with mock.patch.object(
             self.client, '_snapshot', side_effect=RuntimeError('snapshot failed')
         ), mock.patch.object(
-            watch_together_client_module, 'mpv_set_pause'
+            remote_control_client_module, 'mpv_set_pause'
         ) as set_pause:
             self.assertFalse(self.client.handle_message(json.dumps({
                 'MessageType': 'Playstate',
@@ -404,8 +396,8 @@ class WatchTogetherClientTests(unittest.TestCase):
     def test_pause_confirmation_uses_delayed_state_for_report(self):
         player = DelayedPausePlayer(pause_apply_after_reads=3)
         api = FakeSessionApi()
-        client = WatchTogetherClient(
-            {'server': 'emby', 'watch_together_enabled': True},
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
             player=player, session_api=api, enabled=True,
         )
         self.assertTrue(client.publish_snapshot(
@@ -423,8 +415,8 @@ class WatchTogetherClientTests(unittest.TestCase):
     def test_pause_confirmation_timeout_does_not_report_old_state(self):
         player = DelayedPausePlayer(pause_apply_after_reads=1000000)
         api = FakeSessionApi()
-        client = WatchTogetherClient(
-            {'server': 'emby', 'watch_together_enabled': True},
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
             player=player, session_api=api, enabled=True,
         )
         self.assertTrue(client.publish_snapshot(
@@ -432,9 +424,9 @@ class WatchTogetherClientTests(unittest.TestCase):
         ))
         reports_before = len(api.reports)
         with mock.patch.object(
-            watch_together_client_module, '_PAUSE_CONFIRM_TIMEOUT', 0.03,
+            remote_control_client_module, '_PAUSE_CONFIRM_TIMEOUT', 0.03,
         ), mock.patch.object(
-            watch_together_client_module, '_PAUSE_CONFIRM_INTERVAL', 0.005,
+            remote_control_client_module, '_PAUSE_CONFIRM_INTERVAL', 0.005,
         ):
             self.assertFalse(client.handle_message(json.dumps({
                 'MessageType': 'Playstate',
@@ -448,7 +440,7 @@ class WatchTogetherClientTests(unittest.TestCase):
         self.assertEqual(self.ws.sent[0]['MessageType'], 'Identity')
         self.assertEqual(
             self.ws.sent[0]['Data'],
-            'embyToLocalPlayer|%s|1.0|watch-together'
+            'embyToLocalPlayer|%s|1.0|remote-control'
             % self.api.control_device_id,
         )
 
@@ -462,7 +454,7 @@ class WatchTogetherClientTests(unittest.TestCase):
         self.assertTrue(self.player.paused)
 
     def test_playstate_session_mismatch_logs_safe_reason_and_does_not_execute(self):
-        with mock.patch.object(watch_together_client_module.logger, 'info') as info:
+        with mock.patch.object(remote_control_client_module.logger, 'info') as info:
             self.assertFalse(self.client.handle_message(json.dumps({
                 'MessageType': 'Playstate',
                 'Data': json.dumps({
@@ -499,7 +491,7 @@ class WatchTogetherClientTests(unittest.TestCase):
             {'position_sec': 10, 'is_paused': False}, now=0,
         )
         with mock.patch.object(
-            watch_together_client_module, 'mpv_set_pause', return_value=False
+            remote_control_client_module, 'mpv_set_pause', return_value=False
         ) as set_pause, mock.patch.object(self.client, '_report_snapshot') as report:
             self.assertFalse(self.client.handle_message(json.dumps({
                 'MessageType': 'Playstate', 'Data': json.dumps({'Command': 'Pause'}),
@@ -517,8 +509,8 @@ class WatchTogetherClientTests(unittest.TestCase):
                 return None
 
         player = StopWithoutSnapshot()
-        client = WatchTogetherClient(
-            {'server': 'emby', 'watch_together_enabled': True},
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
             player=player, session_api=self.api, enabled=True,
         )
         with mock.patch.object(client, '_report_snapshot', return_value=False) as report:
@@ -634,8 +626,8 @@ class WatchTogetherClientTests(unittest.TestCase):
             sockets.append(ws)
             return ws
 
-        client = WatchTogetherClient(
-            {'server': 'emby', 'watch_together_enabled': True},
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
             player=self.player, session_api=self.api, enabled=True,
             ws_factory=factory, reconnect_min=0.01, reconnect_max=0.02,
             ws_timeout=0.05, heartbeat_interval=100,
@@ -650,13 +642,13 @@ class WatchTogetherClientTests(unittest.TestCase):
         self.assertTrue(all(socket.closed for socket in sockets))
 
     def test_missing_websocket_dependency_degrades_without_thread(self):
-        client = WatchTogetherClient(
-            {'server': 'emby', 'watch_together_enabled': True},
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
             player=self.player, session_api=self.api, enabled=True,
         )
         try:
             with mock.patch.dict(sys.modules, {'websocket': None}), mock.patch.object(
-                watch_together_client_module,
+                remote_control_client_module,
                 '_BUILTIN_WEBSOCKET_FILENAME',
                 'websocket-client-test-wheel-is-missing.whl',
             ):
@@ -669,7 +661,7 @@ class WatchTogetherClientTests(unittest.TestCase):
         wheel_path = ROOT / 'third_party' / 'websocket_client-1.8.0-py3-none-any.whl'
         self.assertTrue(wheel_path.is_file())
         digest = hashlib.sha256(wheel_path.read_bytes()).hexdigest()
-        self.assertEqual(digest, watch_together_client_module._BUILTIN_WEBSOCKET_SHA256)
+        self.assertEqual(digest, remote_control_client_module._BUILTIN_WEBSOCKET_SHA256)
         with ZipFile(wheel_path) as wheel:
             names = set(wheel.namelist())
             self.assertIn('websocket/__init__.py', names)
@@ -686,8 +678,8 @@ class WatchTogetherClientTests(unittest.TestCase):
             f"sys.path.insert(0, {str(ROOT)!r})",
             'import importlib',
             "sys.modules['websocket'] = None",
-            'from utils.watch_together_client import WatchTogetherClient',
-            "client = WatchTogetherClient({'server': 'emby'}, player=object(), session_api=object(), enabled=True)",
+            'from utils.remote_control_client import RemoteControlClient',
+            "client = RemoteControlClient({'server': 'emby'}, player=object(), session_api=object(), enabled=True)",
             'factory = client._load_websocket_factory()',
             "module = importlib.import_module('websocket')",
             "assert callable(factory)",
@@ -701,13 +693,13 @@ class WatchTogetherClientTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
 
     def test_bundled_websocket_hash_mismatch_degrades_without_thread(self):
-        client = WatchTogetherClient(
-            {'server': 'emby', 'watch_together_enabled': True},
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
             player=self.player, session_api=self.api, enabled=True,
         )
         try:
             with mock.patch.dict(sys.modules, {'websocket': None}), mock.patch.object(
-                watch_together_client_module,
+                remote_control_client_module,
                 '_BUILTIN_WEBSOCKET_SHA256',
                 '0' * 64,
             ):
@@ -717,8 +709,8 @@ class WatchTogetherClientTests(unittest.TestCase):
             sys.modules.pop('websocket', None)
 
     def test_bundled_websocket_import_failure_cleans_up_path_and_modules(self):
-        client = WatchTogetherClient(
-            {'server': 'emby', 'watch_together_enabled': True},
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
             player=self.player, session_api=self.api, enabled=True,
         )
         wheel_entry = str(
@@ -726,7 +718,7 @@ class WatchTogetherClientTests(unittest.TestCase):
         )
         try:
             with mock.patch.dict(sys.modules, {'websocket': None}), mock.patch.object(
-                watch_together_client_module.importlib,
+                remote_control_client_module.importlib,
                 'import_module',
                 side_effect=ImportError('simulated wheel import failure'),
             ):
@@ -749,8 +741,8 @@ class WatchTogetherClientTests(unittest.TestCase):
         )
         before = list(sys.path)
         with mock.patch.dict(sys.modules, {'websocket': fake}):
-            client = WatchTogetherClient(
-                {'server': 'emby', 'watch_together_enabled': True},
+            client = RemoteControlClient(
+                {'server': 'emby', 'remote_control_enabled': True},
                 player=self.player, session_api=self.api, enabled=True,
             )
             self.assertIs(client._load_websocket_factory(), fake.create_connection)
@@ -783,21 +775,21 @@ class WatchTogetherClientTests(unittest.TestCase):
         self.assertEqual(self.api.reports[-1][0], 'stopped')
 
     def test_missing_player_or_disabled_is_safe(self):
-        disabled = WatchTogetherClient(
-            {'server': 'emby', 'watch_together_enabled': False},
+        disabled = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': False},
             player=self.player, session_api=self.api,
         )
         self.assertFalse(disabled.start())
-        self.assertFalse(WatchTogetherClient(
-            {'server': 'emby', 'watch_together_enabled': True},
+        self.assertFalse(RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
             player=None, session_api=self.api, enabled=True,
         ).start())
 
     def test_remote_control_starts_when_room_sync_is_disabled(self):
-        client = WatchTogetherClient(
+        client = RemoteControlClient(
             {
                 'server': 'emby',
-                'watch_together_enabled': False,
+                'remote_control_enabled': False,
                 'remote_control_enabled': True,
             },
             player=self.player, session_api=self.api, enabled=None,
@@ -812,10 +804,10 @@ class WatchTogetherClientTests(unittest.TestCase):
         client.stop(timeout=1)
 
     def test_remote_control_explicitly_disabled_does_not_start(self):
-        client = WatchTogetherClient(
+        client = RemoteControlClient(
             {
                 'server': 'emby',
-                'watch_together_enabled': True,
+                'remote_control_enabled': True,
                 'remote_control_enabled': False,
             },
             player=self.player, session_api=self.api, enabled=None,
@@ -834,15 +826,15 @@ class WatchTogetherClientTests(unittest.TestCase):
         manager.player_kwargs = {'mpv': self.player}
         fake_client = mock.Mock()
         fake_client.start.return_value = True
-        with mock.patch('utils.player_manager.WatchTogetherClient', return_value=fake_client) as factory:
+        with mock.patch('utils.player_manager.RemoteControlClient', return_value=fake_client) as factory:
             manager.start_realtime_playing_feedback()
             manager.start_realtime_playing_feedback()
             self.assertEqual(factory.call_count, 1)
-            self.assertIs(manager.watch_together_client, fake_client)
+            self.assertIs(manager.remote_control_client, fake_client)
             self.assertIs(manager.remote_control_client, fake_client)
             manager.stop_realtime_playing_feedback()
             self.assertEqual(fake_client.stop.call_count, 1)
-            self.assertIsNone(manager.watch_together_client)
+            self.assertIsNone(manager.remote_control_client)
 
 
 if __name__ == '__main__':

@@ -130,7 +130,7 @@ def _load_bundled_websocket():
         / _BUILTIN_WEBSOCKET_FILENAME
     )
     if not wheel_path.is_file():
-        logger.info('watch-together disabled: bundled websocket-client wheel is missing')
+        logger.info('remote-control disabled: bundled websocket-client wheel is missing')
         return None
 
     digest = hashlib.sha256()
@@ -139,10 +139,10 @@ def _load_bundled_websocket():
             for chunk in iter(lambda: wheel_file.read(1024 * 1024), b''):
                 digest.update(chunk)
     except OSError:
-        logger.info('watch-together disabled: bundled websocket-client wheel is unreadable')
+        logger.info('remote-control disabled: bundled websocket-client wheel is unreadable')
         return None
     if digest.hexdigest().lower() != _BUILTIN_WEBSOCKET_SHA256:
-        logger.info('watch-together disabled: bundled websocket-client wheel checksum mismatch')
+        logger.info('remote-control disabled: bundled websocket-client wheel checksum mismatch')
         return None
 
     wheel_entry = str(wheel_path)
@@ -163,11 +163,11 @@ def _load_bundled_websocket():
                 sys.path.remove(wheel_entry)
             except ValueError:
                 pass
-        logger.info('watch-together disabled: bundled websocket-client wheel import failed')
+        logger.info('remote-control disabled: bundled websocket-client wheel import failed')
         return None
 
 
-class WatchTogetherClient:
+class RemoteControlClient:
     """Control and state bridge for one Emby playback session."""
 
     def __init__(self, data=None, player=None, *, mpv=None, session_api=None,
@@ -260,7 +260,7 @@ class WatchTogetherClient:
             return None
         factory = getattr(websocket, 'create_connection', None)
         if not callable(factory):
-            logger.info('watch-together disabled: websocket-client create_connection unavailable')
+            logger.info('remote-control disabled: websocket-client create_connection unavailable')
             return None
         return factory
 
@@ -276,7 +276,7 @@ class WatchTogetherClient:
         self._stopped_reported = False
         self._started = True
         self._thread = threading.Thread(
-            target=self._run, name='emby-watch-together', daemon=True,
+            target=self._run, name='emby-remote-control', daemon=True,
         )
         self._thread.start()
         return True
@@ -316,7 +316,7 @@ class WatchTogetherClient:
             ws.close()
         except Exception:
             pass
-        logger.info('watch-together websocket status=closed')
+        logger.info('remote-control websocket status=closed')
 
     def _connect_ws(self):
         factory = self.ws_factory
@@ -351,7 +351,7 @@ class WatchTogetherClient:
             self._close_ws()
             raise ConnectionError('websocket identity send failed')
         logger.info(
-            'watch-together websocket connected '
+            'remote-control websocket connected '
             f'device_hash={_short_hash(self.session_api.control_device_id)}'
         )
         # A new WebSocket is a fresh opportunity to resolve the server-side
@@ -377,7 +377,7 @@ class WatchTogetherClient:
             'Data': identity,
         })
         logger.info(
-            'watch-together websocket identity '
+            'remote-control websocket identity '
             f'status={"ok" if sent else "failed"} '
             f'device_hash={_short_hash(self.session_api.control_device_id)}'
         )
@@ -423,7 +423,7 @@ class WatchTogetherClient:
                 session_id = getattr(self.session_api, 'session_id', None)
             if session_id is None or not str(session_id).strip():
                 logger.info(
-                    'watch-together capabilities '
+                    'remote-control capabilities '
                     'status=unavailable reason=session_not_found'
                 )
                 self._next_capabilities_attempt_at = now + _CAPABILITIES_RETRY_INTERVAL
@@ -447,7 +447,7 @@ class WatchTogetherClient:
             self._session_capabilities_declared = True
             self._next_capabilities_attempt_at = 0.0
             logger.info(
-                'watch-together capabilities status=declared '
+                'remote-control capabilities status=declared '
                 f'session_hash={_short_hash(session_id)}'
             )
             return True
@@ -455,7 +455,7 @@ class WatchTogetherClient:
             # Keep this retryable on reconnect while avoiding IDs, URLs and
             # credentials that an exception message might contain.
             logger.info(
-                'watch-together capabilities '
+                'remote-control capabilities '
                 'status=failed reason=declaration_error'
             )
             self._next_capabilities_attempt_at = now + _CAPABILITIES_RETRY_INTERVAL
@@ -499,7 +499,7 @@ class WatchTogetherClient:
         if not sent:
             sent = self._send_ws(ws, {'MessageType': 'KeepAlive', 'Data': ''})
         if not sent:
-            raise ConnectionError('watch-together heartbeat failed')
+            raise ConnectionError('remote-control heartbeat failed')
         self._last_heartbeat_at = now
 
     def _run(self):
@@ -515,7 +515,7 @@ class WatchTogetherClient:
                         ws = self._connect_ws()
                     except Exception as exc:
                         logger.info(
-                            'watch-together websocket status=connect_failed '
+                            'remote-control websocket status=connect_failed '
                             f'error_type={_safe_label(type(exc).__name__)}'
                         )
                         self._schedule_reconnect()
@@ -531,7 +531,7 @@ class WatchTogetherClient:
                         self._heartbeat(ws, now)
                     except Exception as exc:
                         logger.info(
-                            'watch-together websocket status=disconnected '
+                            'remote-control websocket status=disconnected '
                             f'error_type={_safe_label(type(exc).__name__)}'
                         )
                         self._schedule_reconnect()
@@ -580,7 +580,7 @@ class WatchTogetherClient:
                 # retries Sessions/Playing instead of being misclassified as a
                 # later Progress update.
                 logger.info(
-                    'watch-together report method=report_playing '
+                    'remote-control report method=report_playing '
                     'status=failed retry=pending'
                 )
             return result
@@ -610,7 +610,7 @@ class WatchTogetherClient:
                 self._last_report_at = now
             else:
                 logger.info(
-                    'watch-together report method=report_progress '
+                    'remote-control report method=report_progress '
                     'status=failed retry=pending'
                 )
         else:
@@ -638,7 +638,7 @@ class WatchTogetherClient:
                     playback_rate=playback_rate,
                 )
                 logger.info(
-                    f'watch-together report method={_safe_label(method_name)} '
+                    f'remote-control report method={_safe_label(method_name)} '
                     'status=ok'
                 )
                 return True
@@ -652,19 +652,19 @@ class WatchTogetherClient:
                         event_name=event_name,
                     )
                     logger.info(
-                        f'watch-together report method={_safe_label(method_name)} '
+                        f'remote-control report method={_safe_label(method_name)} '
                         'status=ok'
                     )
                     return True
                 except Exception:
                     logger.info(
-                        f'watch-together report method={_safe_label(method_name)} '
+                        f'remote-control report method={_safe_label(method_name)} '
                         'status=failed'
                     )
                     return False
             except Exception:
                 logger.info(
-                    f'watch-together report method={_safe_label(method_name)} '
+                    f'remote-control report method={_safe_label(method_name)} '
                     'status=failed'
                 )
                 return False
@@ -695,7 +695,7 @@ class WatchTogetherClient:
                 )
                 self._stopped_reported = True
                 logger.info(
-                    'watch-together report method=report_stopped status=ok'
+                    'remote-control report method=report_stopped status=ok'
                 )
                 return True
             except TypeError:
@@ -706,17 +706,17 @@ class WatchTogetherClient:
                     )
                     self._stopped_reported = True
                     logger.info(
-                        'watch-together report method=report_stopped status=ok'
+                        'remote-control report method=report_stopped status=ok'
                     )
                     return True
                 except Exception:
                     logger.info(
-                        'watch-together report method=report_stopped status=failed'
+                        'remote-control report method=report_stopped status=failed'
                     )
                     return False
             except Exception:
                 logger.info(
-                    'watch-together report method=report_stopped status=failed'
+                    'remote-control report method=report_stopped status=failed'
                 )
                 return False
 
@@ -765,7 +765,7 @@ class WatchTogetherClient:
                 except Exception:
                     pass
         logger.info(
-            f'watch-together command={command} handled={str(handled).lower()}'
+            f'remote-control command={command} handled={str(handled).lower()}'
         )
         return handled
 
@@ -805,7 +805,7 @@ class WatchTogetherClient:
         if self.play_session_id and str(message_session) == str(self.play_session_id):
             return True
         logger.info(
-            'watch-together command filtered '
+            'remote-control command filtered '
             'reason=play_session_mismatch '
             f'expected_hash={_short_hash(self.play_session_id)} '
             f'received_hash={_short_hash(message_session)}'
@@ -872,7 +872,7 @@ class WatchTogetherClient:
                     position = None
             if position is None:
                 logger.info(
-                    'watch-together command filtered '
+                    'remote-control command filtered '
                     'reason=seek_position_missing'
                 )
                 return False
@@ -888,7 +888,7 @@ class WatchTogetherClient:
                 handled = False
             return self._finish_playstate_command('Stop', handled)
         logger.info(
-            'watch-together command filtered '
+            'remote-control command filtered '
             f'reason=unsupported_playstate command={_command_label(command)}'
         )
         return False
@@ -899,7 +899,7 @@ class WatchTogetherClient:
         name = _field(payload, 'Name') or _field(payload, 'Command')
         if str(name or '').lower() != 'displaymessage':
             logger.info(
-                'watch-together command filtered '
+                'remote-control command filtered '
                 f'reason=unsupported_general command={_command_label(name)}'
             )
             return False
@@ -915,7 +915,7 @@ class WatchTogetherClient:
         )
         if text is None:
             logger.info(
-                'watch-together command filtered '
+                'remote-control command filtered '
                 'reason=displaymessage_payload_missing'
             )
             return False
@@ -934,7 +934,7 @@ class WatchTogetherClient:
         except Exception:
             handled = False
         logger.info(
-            'watch-together command=DisplayMessage '
+            'remote-control command=DisplayMessage '
             f'handled={str(handled).lower()}'
         )
         return handled
@@ -945,7 +945,7 @@ class WatchTogetherClient:
         message_type, payload = self._decode_message(raw_message)
         message_type_label = _message_type_label(message_type)
         logger.info(
-            f'watch-together websocket message type={message_type_label}'
+            f'remote-control websocket message type={message_type_label}'
         )
         if message_type_label == 'playstate':
             return self._handle_playstate(payload)
@@ -956,7 +956,7 @@ class WatchTogetherClient:
             self._last_heartbeat_at = 0
             return True
         logger.info(
-            f'watch-together websocket message ignored type={message_type_label}'
+            f'remote-control websocket message ignored type={message_type_label}'
         )
         return False
 
@@ -967,4 +967,4 @@ class WatchTogetherClient:
     shutdown = stop
 
 
-EmbyWatchTogetherClient = WatchTogetherClient
+EmbyRemoteControlClient = RemoteControlClient

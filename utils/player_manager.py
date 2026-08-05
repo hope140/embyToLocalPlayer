@@ -11,7 +11,7 @@ from utils.net_tools import (get_redirect_url, requests_urllib, realtime_playing
                              update_server_playback_progress, sync_third_party_for_eps, check_miss_runtime_start_sec)
 from utils.players import start_player_func_dict, playlist_func_dict, stop_sec_func_dict, prefetch_data
 from utils.tools import activate_window_by_pid
-from utils.watch_together_client import WatchTogetherClient
+from utils.remote_control_client import RemoteControlClient
 
 logger = MyLogger()
 
@@ -30,7 +30,7 @@ class BaseInit:
         self.playing_feedback_stop_event = threading.Event()
         self.playing_feedback_request_lock = threading.Lock()
         self.playing_feedback_thread = None
-        self.watch_together_client = None
+        self._remote_control_client = None
         # The remote-control client and the legacy feedback worker are started
         # from more than one playback path.  Serialise their lifecycle so a
         # stop/start overlap cannot create two control clients or clear the
@@ -214,7 +214,7 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
     def remote_control_client(self):
         """Expose the independent client while retaining the old attribute."""
 
-        return self.watch_together_client
+        return self._remote_control_client
 
     def start_realtime_playing_feedback(self):
         with self._feedback_lifecycle_lock:
@@ -223,7 +223,7 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
             # real-time Playing/Progress events.  Avoid sending a second
             # stream through the browser's captured Authorization headers.
             self.start_remote_control()
-            if self.watch_together_client is not None:
+            if self._remote_control_client is not None:
                 return
             if self.playing_feedback_thread and self.playing_feedback_thread.is_alive():
                 return
@@ -251,40 +251,32 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
         """Start optional Emby remote control for the current mpv/IINA instance."""
 
         with self._feedback_lifecycle_lock:
-            if self.watch_together_client is not None:
-                return self.watch_together_client
+            if self._remote_control_client is not None:
+                return self._remote_control_client
             if self.player_name not in ('mpv', 'iina') or self.data.get('server') != 'emby':
                 return None
             mpv = self.player_kwargs.get('mpv')
             if not mpv:
                 return None
             try:
-                client = WatchTogetherClient(data=self.data, player=mpv)
+                client = RemoteControlClient(data=self.data, player=mpv)
                 if client.start():
-                    self.watch_together_client = client
+                    self._remote_control_client = client
                 return client
             except Exception as exc:
                 # Optional control must never prevent ordinary local playback.
-                logger.info(f'watch-together unavailable: {str(exc)[:120]}')
+                logger.info(f'remote-control unavailable: {str(exc)[:120]}')
                 return None
-
-    # Historical names remain available to integrations that still call the
-    # room-oriented lifecycle methods directly.
-    def start_watch_together(self):
-        return self.start_remote_control()
 
     def stop_remote_control(self):
         with self._feedback_lifecycle_lock:
-            client, self.watch_together_client = self.watch_together_client, None
+            client, self._remote_control_client = self._remote_control_client, None
             if client is None:
                 return
             try:
                 client.stop()
             except Exception as exc:
-                logger.info(f'watch-together stop failed: {str(exc)[:120]}')
-
-    def stop_watch_together(self):
-        return self.stop_remote_control()
+                logger.info(f'remote-control stop failed: {str(exc)[:120]}')
 
     def send_realtime_playing_feedback(self, **kwargs):
         with self.playing_feedback_request_lock:
