@@ -15,10 +15,10 @@ class UpdateArchiveTests(unittest.TestCase):
                 zf.writestr(name, payload)
         return archive
 
-    def test_update_url_is_pinned_to_beta_branch(self):
+    def test_update_url_is_pinned_to_main_branch(self):
         self.assertEqual(
             update.UPDATE_URL,
-            "https://github.com/hope140/embyToLocalPlayer/archive/refs/heads/beta.zip",
+            "https://github.com/hope140/embyToLocalPlayer/archive/refs/heads/main.zip",
         )
         self.assertNotIn("releases/latest", update.UPDATE_URL)
 
