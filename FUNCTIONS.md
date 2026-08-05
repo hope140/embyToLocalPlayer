@@ -232,6 +232,7 @@ flowchart LR
 - **作用**：管理员在自己的本机 etlp 通过 Emby 油猴菜单维护持久房间；房间只绑定同一 Emby 服务器上的恰好两名用户，参与者客户端用 mpv/IINA 控制播放会话。
 - **入口与流程**：管理员在 Emby 左侧原生导航点击“同步观看”，进入主内容页面后进行 loopback 认证并查看房间、创建/删除房间或执行暂停、继续、重新同步；侧栏入口尚未出现时可使用油猴菜单“同步观看房间”回退。普通参与者只需在本机开启控制会话，不使用网页播放器同步，也不建立客户端互连端口。
 - **关键配置**：`[watch_together] enable`（所有参与者机器）以及管理员本机的 `admin_enable`、`server_url`、`admin_api_key`。修改后台线程配置后重启 etlp；房间元数据持久化到 `watch_together_rooms.json`，会一直保留到通过 UI 删除房间或手动处理文件，损坏文件不会自动覆盖。
+- **独立远程控制**：`[remote_control] enable`（默认 yes）只控制当前 Emby mpv/IINA 播放器的控制 WebSocket，不要求加入同步观看房间。旧播放数据里的 `watch_together_enabled` 保留为兼容回退；新的 `remote_control_enabled` 数据开关优先。控制台按钮是否出现仍取决于服务端识别到活动会话及能力，项目不保证特定版本的呈现。
 - **范围与约束**：仅 Emby、同一服务器、两名用户、mpv/IINA；两端 `ItemId` 必须相同，媒体时长差不超过 3 秒，速度固定 1.0；允许不同 `MediaSourceId`。两人均可暂停/继续/seek，主用户决定初始位置和冲突优先；断开、停止或换片会暂停另一方等待，不自动起播或自动下一集。
 - **安全**：管理员 key 只应留在管理员本机 INI，不能放入网页、油猴或日志；浏览器 token 只经 loopback 短期认证且不落盘；房间 JSON 不含 token。即使本地 HTTP 配置为 LAN，watch-together endpoints 仍只接受 loopback。
 - **非目标**：不使用/宣传 Emby PartyService，不提供多人、邀请链接、聊天、网页播放控制或速度/字幕/音轨/音量设置；不声称已完成真实 Emby 实机测试或具备生产稳定性。
@@ -358,6 +359,7 @@ flowchart LR
 | `[src]` / `[dst]` | 服务端路径到客户端本地/挂载路径的成对转换。 |
 | `[playlist]` | 连续播放启用范围、版本匹配、条目限制和简易自动下一集。 |
 | `[dev]` | 字幕、版本、代理、重定向、STRM、日志、进程、实时反馈等高级设置。 |
+| `[remote_control]` | Emby 控制台对 mpv/IINA 当前播放会话的独立控制通道开关。 |
 | `[watch_together]` | [实验] 两人 Emby 同步观看房间开关、管理员地址和本机 admin key。仅 Emby 使用。 |
 | `[bangumi]` | Bangumi 单向观看记录同步。 |
 | `[trakt]` | Trakt 单向观看记录同步与 OAuth 应用信息。 |
@@ -382,6 +384,7 @@ flowchart LR
 | 修改最终进度回传 | `[emby] update_progress` | `utils/net_tools.py`、`utils/http_server.py` | Emby/Jellyfin/Plex、短视频、播放完成、ISO/M3U8。 |
 | 修改 Bangumi/Trakt 同步 | `[bangumi]`、`[trakt]` | `utils/bangumi_sync.py`、`utils/trakt_sync.py` | ID 匹配、完成阈值、令牌、Plex 差异。 |
 | 修改继续观看排序/隐藏 | 浏览器脚本 `config` 和本地存储 | `user_script/embyToLocalPlayer.user.js` | 接口字段、前两项保序、三天范围、隐藏列表。 |
+| 修改 Emby 远程控制 | `[remote_control]`、`remote_control_enabled` | `utils/emby_session_api.py`、`utils/watch_together_client.py`、`utils/player_manager.py` | mpv/IINA 会话生命周期、能力声明、暂停/继续/停止/seek/文字命令。 |
 | 修改同步观看房间 | `[watch_together]`、管理员油猴菜单 | `user_script/embyToLocalPlayer.user.js`、`utils/watch_together_coordinator.py`、`utils/watch_together_store.py` | Emby 同服两用户、mpv/IINA 控制会话、loopback 认证、房间 JSON 完整性。 |
 | 修改缓存/边下边播 | `[gui]` | `utils/downloader.py`、`utils/gui.py`、`utils/http_server.py` | 磁盘空间、稀疏文件、恢复任务、删除阈值、播放回退。 |
 | 修改 qBittorrent 联动 | `server_side_href`、`http_server_token`、路径转换 | `qbittorrent_webui_open_file/qbittorrent_webui_open_file.js`、`utils/tools.py` | 单/多文件种子、本地路径、HTTP Range、安全性。 |

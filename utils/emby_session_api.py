@@ -97,6 +97,51 @@ def watch_together_enabled(data=None, override=None):
         return False
 
 
+def _coerce_enabled(value, default=False):
+    """Convert INI/data switch values without treating arbitrary text as true."""
+
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def remote_control_enabled(data=None, override=None):
+    """Resolve the independent Emby remote-control switch.
+
+    ``remote_control_enabled`` is the preferred per-playback data field and
+    ``override`` is used by callers/tests that already resolved configuration.
+    The historical ``watch_together_enabled`` data field remains a compatibility
+    fallback so older playback payloads keep their previous behaviour.  When a
+    new payload does not carry either field, ``[remote_control] enable`` is
+    consulted.  A missing remote-control section defaults to enabled because
+    remote control is useful outside a room; users can opt out explicitly with
+    ``[remote_control] enable = no``.  The old room switch is intentionally not
+    consulted here so turning off room coordination does not disable controls.
+    """
+
+    if override is not None:
+        return _coerce_enabled(override)
+    if isinstance(data, dict):
+        if "remote_control_enabled" in data:
+            return _coerce_enabled(data.get("remote_control_enabled"))
+        # Accept the INI-shaped spelling in small integrations while keeping
+        # the documented data field above as the canonical form.
+        if "remote_control_enable" in data:
+            return _coerce_enabled(data.get("remote_control_enable"))
+        if "watch_together_enabled" in data:
+            return _coerce_enabled(data.get("watch_together_enabled"))
+
+    try:
+        raw = configs.raw
+        if raw.has_option("remote_control", "enable"):
+            return raw.getboolean("remote_control", "enable", fallback=True)
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return True
+
+
 class EmbySessionError(RuntimeError):
     """Raised when an Emby session operation cannot be completed."""
 

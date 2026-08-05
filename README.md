@@ -71,6 +71,20 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
 
 该功能标记为实验，不声称已完成真实 Emby 实机测试或具备生产稳定性。
 
+> Emby 远程控制
+
+Emby 控制台的播放器控制通道与同步观看房间是两个独立开关。`[remote_control]`
+中的 `enable = yes`（默认值）只负责让当前存在的 mpv/IINA 播放器建立独立的
+Emby 控制 WebSocket；`[watch_together] enable` 只负责是否参加两人同步观看房间。
+关闭后者不会关闭前者，显式设置 `[remote_control] enable = no` 才会停用控制通道。
+旧版播放数据中的 `watch_together_enabled` 仍作为兼容回退，新增数据可用
+`remote_control_enabled` 覆盖它。
+
+客户端会为当前 Emby 播放会话声明 `PlayPause`、`Pause`、`Unpause`、`Stop`、`Seek`
+和 `DisplayMessage` 能力，并把控制台命令转给 mpv/IINA。控制台按钮是否显示还取决于
+Emby 服务端是否识别到这个活动会话及其能力；项目未在本地宣称或保证特定服务端版本的
+按钮呈现结果。
+
 > Windows
 
 1. 双击 `embyToLocalPlayer_debug.bat`

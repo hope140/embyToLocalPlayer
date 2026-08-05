@@ -14,9 +14,11 @@ from utils.emby_session_api import (
     EmbySessionError,
     EmbySessionApi,
     derive_control_device_id,
+    remote_control_enabled,
 )
 from utils.data_parser import _extract_auth_identity
 from utils.players import get_mpv_snapshot
+from utils.player_manager import PrefetchManager
 import utils.watch_together_client as watch_together_client_module
 from utils.watch_together_client import WatchTogetherClient
 
@@ -136,6 +138,24 @@ class FakeWebSocket:
 
 
 class EmbySessionApiTests(unittest.TestCase):
+    def test_remote_control_switch_is_independent_and_legacy_data_compatible(self):
+        self.assertTrue(remote_control_enabled({"server": "emby"}))
+        self.assertTrue(remote_control_enabled({
+            "remote_control_enabled": True,
+            "watch_together_enabled": False,
+        }))
+        self.assertFalse(remote_control_enabled({
+            "remote_control_enabled": False,
+            "watch_together_enabled": True,
+        }))
+        self.assertFalse(remote_control_enabled({"watch_together_enabled": False}))
+        self.assertTrue(remote_control_enabled({"watch_together_enabled": True}))
+
+    def test_remote_control_constructor_override_wins(self):
+        self.assertFalse(remote_control_enabled(
+            {"remote_control_enabled": True}, override=False,
+        ))
+
     def test_device_id_is_stable_and_session_specific(self):
         first = derive_control_device_id('browser', 'one')
         self.assertEqual(first, derive_control_device_id('browser', 'one'))
@@ -772,6 +792,57 @@ class WatchTogetherClientTests(unittest.TestCase):
             {'server': 'emby', 'watch_together_enabled': True},
             player=None, session_api=self.api, enabled=True,
         ).start())
+
+    def test_remote_control_starts_when_room_sync_is_disabled(self):
+        client = WatchTogetherClient(
+            {
+                'server': 'emby',
+                'watch_together_enabled': False,
+                'remote_control_enabled': True,
+            },
+            player=self.player, session_api=self.api, enabled=None,
+            ws_factory=lambda *args, **kwargs: self.ws,
+            heartbeat_interval=100,
+        )
+        self.assertTrue(client.start())
+        deadline = time.time() + 1
+        while not self.ws.sent and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(self.ws.sent)
+        client.stop(timeout=1)
+
+    def test_remote_control_explicitly_disabled_does_not_start(self):
+        client = WatchTogetherClient(
+            {
+                'server': 'emby',
+                'watch_together_enabled': True,
+                'remote_control_enabled': False,
+            },
+            player=self.player, session_api=self.api, enabled=None,
+            ws_factory=lambda *args, **kwargs: self.ws,
+        )
+        self.assertFalse(client.start())
+        self.assertIsNone(client.thread)
+
+    def test_player_manager_reuses_and_serialises_remote_client_lifecycle(self):
+        manager = PrefetchManager(
+            data={
+                'server': 'emby', 'scheme': 'https', 'netloc': 'media.test',
+                'api_key': 'token', 'user_id': 'user',
+            }, player_name='mpv', player_path='mpv'
+        )
+        manager.player_kwargs = {'mpv': self.player}
+        fake_client = mock.Mock()
+        fake_client.start.return_value = True
+        with mock.patch('utils.player_manager.WatchTogetherClient', return_value=fake_client) as factory:
+            manager.start_realtime_playing_feedback()
+            manager.start_realtime_playing_feedback()
+            self.assertEqual(factory.call_count, 1)
+            self.assertIs(manager.watch_together_client, fake_client)
+            self.assertIs(manager.remote_control_client, fake_client)
+            manager.stop_realtime_playing_feedback()
+            self.assertEqual(fake_client.stop.call_count, 1)
+            self.assertIsNone(manager.watch_together_client)
 
 
 if __name__ == '__main__':

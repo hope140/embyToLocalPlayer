@@ -17,7 +17,10 @@ import threading
 import time
 
 from utils.configs import MyLogger
-from utils.emby_session_api import EmbySessionApi, watch_together_enabled
+from utils.emby_session_api import (
+    EmbySessionApi,
+    remote_control_enabled as is_remote_control_enabled,
+)
 from utils.players import get_mpv_snapshot, mpv_display_message, mpv_seek, mpv_set_pause
 
 
@@ -168,12 +171,25 @@ class WatchTogetherClient:
     """Control and state bridge for one Emby playback session."""
 
     def __init__(self, data=None, player=None, *, mpv=None, session_api=None,
-                 enabled=None, ws_factory=None, report_interval=10.0,
+                 enabled=None, remote_enabled=None,
+                 remote_control_enabled=None, ws_factory=None, report_interval=10.0,
                  heartbeat_interval=20.0, ws_timeout=0.5, reconnect_min=1.0,
                  reconnect_max=30.0, seek_threshold=3.0, clock=None):
         self.data = data or {}
         self.player = player or mpv
-        self.enabled = watch_together_enabled(self.data, override=enabled)
+        # ``enabled`` is the historical constructor override.  Keep it for
+        # callers/tests while offering descriptive remote-control spellings for
+        # new integrations.  The most explicit value wins.
+        configured_override = (
+            remote_control_enabled
+            if remote_control_enabled is not None
+            else remote_enabled
+            if remote_enabled is not None
+            else enabled
+        )
+        self.enabled = is_remote_control_enabled(
+            self.data, override=configured_override,
+        )
         self.session_api = session_api or EmbySessionApi(self.data)
         self.ws_factory = ws_factory
         self.report_interval = max(0.1, float(report_interval))
