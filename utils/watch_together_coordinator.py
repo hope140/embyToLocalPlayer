@@ -26,6 +26,11 @@ from utils.watch_together_store import (
 logger = MyLogger()
 TICKS_PER_SECOND = 10 ** 7
 MAX_RUNTIME_DIFFERENCE_TICKS = 3 * TICKS_PER_SECOND
+# A session with an explicit remote-control capability is the strongest
+# indication that its WebSocket/control connection is still current.  Older
+# Emby-compatible responses may omit that field, so missing values stay
+# eligible and are only used as a fallback after capability-aware candidates.
+SESSION_ACTIVITY_GAP_SECONDS = 5 * 60
 CONTROL_CLIENT = "embyToLocalPlayer"
 CONTROL_DEVICE_NAME = "watch-together"
 CONTROL_DEVICE_PREFIX = "etlp-wt-"
@@ -600,6 +605,39 @@ class WatchTogetherCoordinator:
                 continue
             candidates[user_id].append(session)
 
+        # A server may omit SupportsRemoteControl on an older session record,
+        # so that field alone cannot be a hard requirement.  When a current
+        # WebSocket session advertises the capability, however, an unknown
+        # record whose LastActivityDate is materially older is a stale
+        # duplicate rather than a second viewer.  Keep unknown records with a
+        # missing timestamp for compatibility; they are resolved by the
+        # normal per-user selection below when no freshness evidence exists.
+        capable_activity = [
+            _timestamp(value.get("LastActivityDate"))
+            for values in candidates.values()
+            for value in values
+            if cls._session_remote_control_status(value) is True
+            and _timestamp(value.get("LastActivityDate")) > 0
+        ]
+        if capable_activity:
+            freshest_capable = max(capable_activity)
+            for user_id, values in candidates.items():
+                retained = []
+                for value in values:
+                    activity = _timestamp(value.get("LastActivityDate"))
+                    has_activity = bool(cls._session_field(value, "LastActivityDate"))
+                    stale_unknown = (
+                        cls._session_remote_control_status(value) is None
+                        and has_activity
+                        and activity > 0
+                        and freshest_capable - activity > SESSION_ACTIVITY_GAP_SECONDS
+                    )
+                    if stale_unknown:
+                        skipped["stale_activity"] = skipped.get("stale_activity", 0) + 1
+                        continue
+                    retained.append(value)
+                candidates[user_id] = retained
+
         # If both participants have a single common item, prefer that item
         # before applying recency.  This prevents a newer stale tab showing a
         # different title from masking the session that is actually in the
@@ -637,9 +675,7 @@ class WatchTogetherCoordinator:
             for value in values:
                 session_id = str(value.get("Id") or value.get("SessionId") or "")
                 previous = by_session_id.get(session_id)
-                if previous is None or _timestamp(value.get("LastActivityDate")) > _timestamp(
-                    previous.get("LastActivityDate")
-                ):
+                if previous is None or cls._session_selection_key(value) > cls._session_selection_key(previous):
                     by_session_id[session_id] = value
             values = list(by_session_id.values())
             max_selection = max(
@@ -672,6 +708,12 @@ class WatchTogetherCoordinator:
     def _session_rejection_reason(cls, session):
         """Return a terse reason for excluding a session from selection."""
 
+        remote_control = cls._session_remote_control_status(session)
+        if remote_control is False:
+            return "remote_control_unavailable"
+        active = cls._session_bool_field(session, "IsActive")
+        if active is False:
+            return "inactive"
         session_id = session.get("Id") or session.get("SessionId")
         if not str(session_id or "").strip():
             return "missing_session_id"
@@ -686,6 +728,61 @@ class WatchTogetherCoordinator:
         ).lower()
         if bool(play_state.get("IsStopped")) or state_name == "stopped":
             return "stopped"
+        return None
+
+    @staticmethod
+    def _session_field(session, name, default=None):
+        """Read a session field using Emby's case-insensitive JSON names."""
+
+        if not isinstance(session, dict):
+            return default
+        expected = str(name).lower()
+        for key, value in session.items():
+            if str(key).lower() == expected:
+                return value
+        return default
+
+    @classmethod
+    def _session_bool_field(cls, session, name):
+        value = cls._session_field(session, name)
+        if value is None:
+            return None
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("1", "true", "yes", "on"):
+                return True
+            if normalized in ("0", "false", "no", "off"):
+                return False
+        return bool(value)
+
+    @classmethod
+    def _session_remote_control_status(cls, session):
+        """Return remote-control support, or ``None`` when the server omits it.
+
+        ``SupportsRemoteControl`` is emitted by current Emby Sessions records
+        after the WebSocket capabilities handshake.  A few compatible servers
+        (and older records) omit it; nested capability data is accepted as a
+        compatibility fallback, while an explicit false is never treated as
+        an active command target.
+        """
+
+        value = cls._session_bool_field(session, "SupportsRemoteControl")
+        if value is not None:
+            return value
+        capabilities = cls._session_field(session, "Capabilities")
+        if isinstance(capabilities, dict):
+            value = cls._session_bool_field(capabilities, "SupportsRemoteControl")
+            if value is None:
+                value = cls._session_bool_field(capabilities, "SupportsMediaControl")
+            if value is not None:
+                return value
+        # Emby-compatible responses sometimes expose only the command list.
+        # A non-empty list confirms a capable connection; an empty list is
+        # kept unknown because it can be returned during the brief handshake
+        # before the WebSocket capabilities declaration is processed.
+        commands = cls._session_field(session, "SupportedCommands")
+        if isinstance(commands, (list, tuple, set)) and commands:
+            return True
         return None
 
     @staticmethod
@@ -726,8 +823,15 @@ class WatchTogetherCoordinator:
         ).lower()
         stopped = bool(play_state.get("IsStopped")) or state_name == "stopped"
         active = bool(session_id and item_id and not stopped)
+        remote_control = WatchTogetherCoordinator._session_remote_control_status(session)
+        # Explicitly capable WebSocket sessions outrank records from servers
+        # that omit the capability field.  ``False`` records are rejected
+        # before this key is evaluated, but retaining a zero tier keeps this
+        # helper safe when called directly by integrations/tests.
+        capability_rank = 2 if remote_control is True else (1 if remote_control is None else 0)
         return (
             1 if active else 0,
+            capability_rank,
             WatchTogetherCoordinator._control_session_priority(session),
             _timestamp(session.get("LastActivityDate")),
         )

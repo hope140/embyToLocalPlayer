@@ -123,6 +123,32 @@ class WatchTogetherCoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(selected["u1"]["Id"], "active")
 
+    def test_session_filter_rejects_non_remote_and_inactive_duplicates(self):
+        active = self.api.session("u1", "active", 4)
+        active["SupportsRemoteControl"] = True
+        stale = self.api.session("u1", "stale", 8)
+        stale["SupportsRemoteControl"] = False
+        stale["LastActivityDate"] = "2026-01-02T00:00:00Z"
+        inactive = self.api.session("u1", "inactive", 9)
+        inactive["IsActive"] = False
+        inactive["LastActivityDate"] = "2026-01-03T00:00:00Z"
+        selected = self.coordinator.select_control_sessions(
+            [active, stale, inactive, self.api.sessions[1]], ["u1", "u2"]
+        )
+        self.assertEqual(selected["u1"]["Id"], "active")
+
+    def test_session_filter_drops_old_unknown_duplicate_when_capable_peer_is_fresh(self):
+        fresh = self.api.session("u1", "fresh", 4)
+        fresh["SupportsRemoteControl"] = True
+        fresh["LastActivityDate"] = "2026-01-02T00:00:00Z"
+        stale = self.api.session("u2", "stale", 8)
+        stale["LastActivityDate"] = "2025-01-01T00:00:00Z"
+        selected = self.coordinator.select_control_sessions(
+            [fresh, stale], ["u1", "u2"]
+        )
+        self.assertEqual(selected["u1"]["Id"], "fresh")
+        self.assertIsNone(selected["u2"])
+
     def test_session_filter_rejects_missing_id_item_play_state_and_stopped(self):
         missing_id = self.api.session("u1", "missing", 2)
         missing_id["Id"] = ""
@@ -208,6 +234,16 @@ class WatchTogetherCoordinatorTests(unittest.TestCase):
 
     def test_single_active_player_waiting_does_not_pause(self):
         self.api.sessions[1]["PlayState"]["IsStopped"] = True
+        self.coordinator.poll_once(now=0)
+        runtime = self.coordinator.runtime[self.room["id"]]
+        self.assertEqual(runtime["state"], "waiting")
+        self.assertEqual(self.api.commands, [])
+
+    def test_stale_second_control_session_does_not_pause_single_player(self):
+        stale = self.api.session("u2", "stale", 8)
+        stale["SupportsRemoteControl"] = False
+        stale["LastActivityDate"] = "2026-01-02T00:00:00Z"
+        self.api.sessions = [self.api.sessions[0], stale]
         self.coordinator.poll_once(now=0)
         runtime = self.coordinator.runtime[self.room["id"]]
         self.assertEqual(runtime["state"], "waiting")
