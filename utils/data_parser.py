@@ -327,9 +327,9 @@ def parse_received_data_emby(received_data):
         play_session_id=play_session_id,
         device_id=device_id,
         # Keep the browser identity for media URLs, but expose a deterministic
-        # per-playback control identity for the optional watch-together client.
+        # per-playback control identity for the optional remote-control client.
         browser_device_id=device_id,
-        watch_together_device_id=derive_control_device_id(device_id, play_session_id)
+        remote_control_device_id=derive_control_device_id(device_id, play_session_id)
         if is_emby else '',
         headers=headers,
         item_id=item_id,

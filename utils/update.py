@@ -49,7 +49,7 @@ def _archive_layout(infos):
     """Return normalised names and an optional single GitHub prefix.
 
     GitHub branch archives contain one directory (for example
-    ``embyToLocalPlayer-watch_together/``); local test archives may already be
+    ``embyToLocalPlayer-beta/``); local test archives may already be
     flat. The common prefix is removed before extraction.
     """
     names = []

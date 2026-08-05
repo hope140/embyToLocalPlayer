@@ -32,7 +32,7 @@ def get_mpv_snapshot(mpv):
 
     Both mpv and IINA expose these properties through the existing JSON IPC
     wrapper.  Keeping the reads in one helper also gives the optional
-    watch-together client a narrow seam for fake players in tests.
+    remote-control client a narrow seam for fake players in tests.
     """
 
     if not mpv:

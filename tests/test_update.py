@@ -28,13 +28,13 @@ class UpdateArchiveTests(unittest.TestCase):
             archive = self._archive(
                 root,
                 [
-                    ("hope140-embyToLocalPlayer-watch_together/", ""),
-                    ("hope140-embyToLocalPlayer-watch_together/utils/", ""),
-                    ("hope140-embyToLocalPlayer-watch_together/embyToLocalPlayer.py", "new"),
-                    ("hope140-embyToLocalPlayer-watch_together/utils/example.py", "util"),
+                    ("hope140-embyToLocalPlayer-beta/", ""),
+                    ("hope140-embyToLocalPlayer-beta/utils/", ""),
+                    ("hope140-embyToLocalPlayer-beta/embyToLocalPlayer.py", "new"),
+                    ("hope140-embyToLocalPlayer-beta/utils/example.py", "util"),
                     (
-                        "hope140-embyToLocalPlayer-watch_together/embyToLocalPlayer_config.ini",
-                        "[watch_together]\nenable = no\n",
+                        "hope140-embyToLocalPlayer-beta/embyToLocalPlayer_config.ini",
+                        "[remote_control]\nenable = yes\n",
                     ),
                 ],
             )
@@ -44,12 +44,12 @@ class UpdateArchiveTests(unittest.TestCase):
 
             prefix = update.extract_update_archive(archive, root, example, is_windows=False)
 
-            self.assertEqual(prefix, "hope140-embyToLocalPlayer-watch_together")
+            self.assertEqual(prefix, "hope140-embyToLocalPlayer-beta")
             self.assertEqual((root / "embyToLocalPlayer.py").read_text(), "new")
             self.assertEqual((root / "utils/example.py").read_text(), "util")
             self.assertEqual(live_config.read_text(), "admin_api_key = must stay\n")
-            self.assertIn("enable = no", example.read_text())
-            self.assertFalse((root / "hope140-embyToLocalPlayer-watch_together").exists())
+            self.assertIn("[remote_control]", example.read_text())
+            self.assertFalse((root / "hope140-embyToLocalPlayer-beta").exists())
 
     def test_flat_archive_is_supported_and_all_config_variants_are_protected(self):
         with tempfile.TemporaryDirectory() as temp:
