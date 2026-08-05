@@ -36,7 +36,7 @@ class WatchTogetherUiContractTests(unittest.TestCase):
         self.assertEqual(section.get("admin_api_key"), "")
 
     def test_userscript_metadata_menu_endpoints_and_secret_scope(self):
-        self.assertRegex(self.userscript, r"@version\s+2026\.08\.04\.3\b")
+        self.assertRegex(self.userscript, r"@version\s+2026\.08\.04\.4\b")
         update_url = "https://raw.githubusercontent.com/hope140/embyToLocalPlayer/watch_together/user_script/embyToLocalPlayer.user.js"
         self.assertIn(f"// @updateURL    {update_url}", self.userscript)
         self.assertIn(f"// @downloadURL  {update_url}", self.userscript)
@@ -70,6 +70,19 @@ class WatchTogetherUiContractTests(unittest.TestCase):
         self.assertIn("parsed.password", watch_code)
         self.assertIn("code === 'server_mismatch'", watch_code)
         self.assertIn("当前 Emby 实际服务器与 INI", watch_code)
+        self.assertIn("watch_together_participant_mode", watch_code)
+        self.assertIn("watchTogetherRenderParticipantMode", watch_code)
+        self.assertIn("只读参与者面板", watch_code)
+        self.assertIn("管理员负责创建房间", watch_code)
+        self.assertIn("保持本机 ETLP 运行", watch_code)
+        self.assertIn("与管理员相同的视频", watch_code)
+        self.assertIn("参与者无需填写 admin key", watch_code)
+        self.assertIn("state.participantMode", watch_code)
+        self.assertIn("createSection.hidden = true", watch_code)
+        self.assertIn("roomsSection.hidden = true", watch_code)
+        self.assertIn("state.createSection = createSection", watch_code)
+        self.assertIn("state.roomsSection = roomsSection", watch_code)
+        self.assertIn("state.context = null", watch_code)
 
         # Native Emby navigation/page integration replaces the old modal and
         # never invents a hash route or a full-screen overlay.

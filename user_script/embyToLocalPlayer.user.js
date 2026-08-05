@@ -3,7 +3,7 @@
 // @name:zh-CN   embyToLocalPlayer
 // @name:en      embyToLocalPlayer
 // @namespace    https://github.com/kjtsune/embyToLocalPlayer
-// @version      2026.08.04.3
+// @version      2026.08.04.4
 // @updateURL    https://raw.githubusercontent.com/hope140/embyToLocalPlayer/watch_together/user_script/embyToLocalPlayer.user.js
 // @downloadURL  https://raw.githubusercontent.com/hope140/embyToLocalPlayer/watch_together/user_script/embyToLocalPlayer.user.js
 // @description  Emby/Jellyfin 调用外部本地播放器，并回传播放记录。适配 Plex。
@@ -424,6 +424,7 @@
     async function watchTogetherApiRequest(path, body, context, state = null, retried = false) {
         const generation = state && state.generation;
         if (!watchTogetherStateIsCurrent(state, generation)) return null;
+        if (state && state.participantMode) return null;
         if (!watchTogetherToken || watchTogetherTokenGeneration !== generation) {
             await watchTogetherAuthenticate(context, state);
             if (!watchTogetherStateIsCurrent(state, generation)) return null;
@@ -457,6 +458,7 @@
         const code = String(error && error.code || '');
         if (code === 'timeout') return '连接本地服务超时，请确认 etlp 正在运行后重试。';
         if (code === 'network_error' || code === 'aborted' || status === 0) return '本地服务未运行或无法连接，请启动/重启 etlp 后重试。';
+        if (code === 'watch_together_participant_mode') return '参与者模式：请由管理员创建房间；保持 ETLP 运行，并在 Emby 中打开同一视频。';
         if (status === 401) return '登录令牌已失效，请刷新 Emby 页面后重试。';
         if (code === 'server_mismatch') return '当前 Emby 实际服务器与 INI 中的 server_url 不一致，请改为同一服务器根 URL 后重启 etlp。';
         if (code === 'administrator_required') return '需要在 Emby 管理员账号页面操作，并在管理员本机配置 admin_enable。';
@@ -710,6 +712,7 @@
             previousPages,
             users: [],
             runtime: [],
+            participantMode: false,
             closed: false,
         };
         const content = watchTogetherElement('div', null, 'etlp-wt-content');
@@ -725,6 +728,17 @@
         const status = watchTogetherElement('div', '正在连接本地服务…', 'etlp-wt-status');
         status.setAttribute('role', 'status');
         status.setAttribute('aria-live', 'polite');
+
+        const participantSection = watchTogetherElement('section', null, 'etlp-wt-section etlp-wt-participant-section');
+        participantSection.hidden = true;
+        const participantHeader = watchTogetherElement('div', null, 'etlp-wt-section-header');
+        const participantHeadingGroup = watchTogetherElement('div', null, 'etlp-wt-section-heading');
+        const participantHeading = watchTogetherElement('h2', '只读参与者面板', 'etlp-wt-section-title');
+        const participantDescription = watchTogetherElement('p', '管理员创建同步观看房间后，参与者无需管理房间。', 'etlp-wt-section-description');
+        const participantSteps = watchTogetherElement('p', '管理员负责创建房间；参与者请保持本机 ETLP 运行，并在 Emby 中打开与管理员相同的视频。参与者无需填写 admin key。', 'etlp-wt-section-description');
+        participantHeadingGroup.append(participantHeading, participantDescription, participantSteps);
+        participantHeader.appendChild(participantHeadingGroup);
+        participantSection.appendChild(participantHeader);
 
         const createSection = watchTogetherElement('section', null, 'etlp-wt-section etlp-wt-create-section');
         const createHeader = watchTogetherElement('div', null, 'etlp-wt-section-header');
@@ -771,9 +785,14 @@
         roomsHeader.append(roomsHeadingGroup, roomCount);
         const rooms = watchTogetherElement('div', null, 'etlp-wt-rooms');
         roomsSection.append(roomsHeader, rooms);
-        content.append(header, status, createSection, roomsSection);
+        content.append(header, status, participantSection, createSection, roomsSection);
         page.appendChild(content);
         state.status = status;
+        state.heading = heading;
+        state.subtitle = subtitle;
+        state.participantSection = participantSection;
+        state.createSection = createSection;
+        state.roomsSection = roomsSection;
         state.form = form;
         state.nameInput = nameInput;
         state.userA = userA;
@@ -815,6 +834,21 @@
 
     function watchTogetherSetStatus(state, message) {
         if (watchTogetherStateIsCurrent(state) && state.status) state.status.textContent = String(message || '');
+    }
+
+    function watchTogetherRenderParticipantMode(state) {
+        if (!watchTogetherStateIsCurrent(state) || state.participantMode) return;
+        state.participantMode = true;
+        // Participant mode never receives a watch token.  Drop any transient
+        // values and context before rendering the static, read-only panel.
+        watchTogetherInvalidateToken(state);
+        state.context = null;
+        if (state.heading) state.heading.textContent = '同步观看（参与者模式）';
+        if (state.subtitle) state.subtitle.textContent = '只读参与者面板：管理员负责创建房间；请保持 ETLP 运行，并在 Emby 中打开与管理员相同的视频。';
+        if (state.createSection) state.createSection.hidden = true;
+        if (state.roomsSection) state.roomsSection.hidden = true;
+        if (state.participantSection) state.participantSection.hidden = false;
+        watchTogetherSetStatus(state, '参与者模式已启用。管理员创建房间后，请保持 ETLP 运行并打开同一视频。');
     }
 
     function watchTogetherSetFormDisabled(state, disabled) {
@@ -1036,6 +1070,7 @@
             alert('同步观看房间需要在 Emby 页面打开，当前页面尚未准备好。');
             return;
         }
+        if (state.participantMode) return;
         state.context = context;
         watchTogetherSetStatus(state, '正在验证 Emby 账号…');
         try {
@@ -1043,7 +1078,12 @@
             if (!watchTogetherStateIsCurrent(state)) return;
             await watchTogetherRefreshRooms(state, context);
         } catch (error) {
-            if (watchTogetherStateIsCurrent(state)) watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
+            if (!watchTogetherStateIsCurrent(state)) return;
+            if (String(error && error.code || '') === 'watch_together_participant_mode') {
+                watchTogetherRenderParticipantMode(state);
+                return;
+            }
+            watchTogetherSetStatus(state, watchTogetherErrorMessage(error));
         }
     }
 

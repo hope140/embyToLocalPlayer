@@ -1298,6 +1298,18 @@ class WatchTogetherHttpService:
             return False, 503, "watch-together room store is unavailable"
         return True, 0, ""
 
+    def _participant_mode(self):
+        """Return whether this instance is an enabled, non-admin participant.
+
+        Participant machines deliberately do not initialize the administrator
+        API or room store.  The auth endpoint uses this state to tell the
+        browser to render its read-only instructions page instead of exposing
+        an administrator error.
+        """
+
+        enable, admin_enable, _, _ = self._config_values()
+        return bool(enable and not admin_enable)
+
     def start(self):
         try:
             available, _, _ = self._available()
@@ -1365,6 +1377,12 @@ class WatchTogetherHttpService:
             return dict(context)
 
     def _auth(self, body):
+        if self._participant_mode():
+            return self._error(
+                503,
+                "watch_together_participant_mode",
+                "watch-together is enabled in participant mode; an administrator must create the room",
+            )
         available, status, message = self._available()
         if not available:
             return self._error(status, "watch_together_unavailable", message)

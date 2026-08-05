@@ -89,6 +89,30 @@ class WatchTogetherHttpTests(unittest.TestCase):
         self.assertNotIn("admin-secret", persisted)
         self.assertNotIn("browser-token", persisted)
 
+    def test_participant_auth_returns_mode_without_credentials_or_store(self):
+        participant = configparser.ConfigParser()
+        participant["watch_together"] = {
+            "enable": "true", "admin_enable": "false",
+            "server_url": "https://media.test", "admin_api_key": "",
+        }
+        store_path = Path(self.temp.name) / "participant-rooms.json"
+        coordinator = WatchTogetherCoordinator(
+            api=FakeApi(), config=participant, store_path=store_path,
+        )
+        service = WatchTogetherHttpService(coordinator, config=participant)
+        status, body = service.handle(
+            "/watch-together/auth",
+            {"server_url": "https://media.test", "user_id": "guest", "api_key": "browser-token"},
+            client_address=("127.0.0.1", 1),
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["code"], "watch_together_participant_mode")
+        response_text = json.dumps(body)
+        self.assertNotIn("browser-token", response_text)
+        self.assertNotIn("admin-secret", response_text)
+        self.assertNotIn("token", body)
+        self.assertFalse(store_path.exists())
+
     def test_loopback_token_cors_and_room_lifecycle(self):
         self.assertEqual(self.call("/watch-together/rooms/list")[0], 200)
         status, result = self.call(
