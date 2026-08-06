@@ -170,6 +170,14 @@ https://github.com/kjtsune/embyToLocalPlayer#faq
   如果还不行，反馈时，提供日志、配置文件、以及服务端媒体文件和客户端对应文件的完整路径。
 * 持久性缓存模式：只看配置文件，与油猴设置不冲突，不需要开启读取硬盘模式。
 
+> CloudDrive2 STRM
+
+* 仅适用于 Emby/Jellyfin 的 HTTP `.strm`，并且已开启读取硬盘模式、客户端能访问对应本地挂载盘的场景。先在 `[dev]` 开启 `strm_local_by_file_path = yes`，再在 `[clouddrive2]` 开启 `enable = yes`。
+* etlp 会用 `path_map` 把本地挂载路径（例如 `C:\CloudDrive2`）映射为 CloudDrive2 云路径，通过本机短期 HTTP gateway 取得可播放地址；本地挂载盘仍是必要的回退路径。
+* CloudDrive2 的浏览器登录状态与本机 gRPC API Token 是两套认证，浏览器已登录不等于 `api_token` 可用。可用环境变量 `ETLP_CLOUDDRIVE2_TOKEN` 提供 token，避免写入配置文件。
+* 未配置、token 无效或无权限、CloudDrive2 接口异常、路径未命中 `path_map` 时，自动回退原挂载盘文件；Windows 盘符/UNC 路径没有显式映射时不会尝试解析。
+* `origin` 应指向本机 CloudDrive2 API（默认 `http://127.0.0.1:19798`），不要填 Emby/Jellyfin 网页地址；本机 API 也不应暴露到不可信网络。
+
 > 如何更新
 
 1. Windows: `.bat` 按 6  
