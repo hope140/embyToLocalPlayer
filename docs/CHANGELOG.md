@@ -1,9 +1,9 @@
 # 更新日志
 
-## 2026.08.05-remote_control.1（beta → main）
+## 2026.08.06-clouddrive2-beta
 
-> 本次发布基于 main 分支合并：除下述遥控功能外，同时包含上游同步内容与
-> `simkl` 标记支持（README 特性区已更新为 bangumi/bgm/simkl/trakt）。
+> 当前 beta 分支包含 CloudDrive2 STRM 支持、本地网关播放、远程轮询稳定性
+> 以及 mpv 起播窗口时序优化；同时保留本分支已有的 Emby 控制台遥控能力。
 
 ### 新增：Emby 控制台远程控制（mpv/IINA）
 
@@ -21,12 +21,12 @@
 
 - 本版本**不含** watch-together 房间同步（coordinator/store/房间 HTTP 端点/
   油猴同步界面/`[watch_together]` 配置段全部移除）。
-- 油猴脚本为无同步功能的原版，仅更新元数据指向本仓库 beta 分支。
+- 油猴脚本为无同步功能的版本，元数据和更新地址固定指向本仓库 beta 分支。
 
 ### 其他
 
 - 更新器安全化：zip 成员校验（防 zip-slip、符号链接、越界路径）、
-  配置文件保护、GitHub 分支归档前缀自动展平；更新源指向本仓库 `main` 分支。
+  配置文件保护、GitHub 分支归档前缀自动展平；更新源指向本仓库 `beta` 分支。
 - 播放进度上报的 `EventName` 修正为服务端协议大小写（`TimeUpdate`）。
 - 新增 `scripts/package_beta.ps1` 打包脚本，产出可运行 zip。
 - 遥控代码统一更名（remote_control_client / RemoteControlClient），日志

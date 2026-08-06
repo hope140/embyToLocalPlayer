@@ -37,7 +37,7 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
    [Violentmonkey](https://chrome.google.com/webstore/detail/violent-monkey/jinjaccalgkegednnccohejagnlnfdag)
    已知问题：新版 chrome 可能无法安装。
 2. 安装油猴脚本并刷新 Emby 页面。[发布页](https://greasyfork.org/zh-CN/scripts/448648-embytolocalplayer)
-3. 方案三选一，下载并解压 `.zip` 到任意英文路径。 [发布页](https://github.com/kjtsune/embyToLocalPlayer/releases)
+3. 方案三选一，下载并解压 `.zip` 到任意英文路径。 [发布页](https://github.com/hope140/embyToLocalPlayer/releases)
     * 推荐: `etlp-mpv-py-embed-win32.zip` (mpv 播放器 | Windows only | 快捷键见 FAQ)  
       无需修改配置文件，查看下方 `.bat` 运行方法。
     * `etlp-python-embed-win32.zip` (Windows only)  
@@ -57,7 +57,7 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
 
 > Emby 远程控制（实验）
 
-本版本（`main`）内置 Emby 控制台对当前 mpv/IINA 播放器的独立控制通道，
+本版本（`beta`）内置 Emby 控制台对当前 mpv/IINA 播放器的独立控制通道，
 不含同步观看房间功能。`[remote_control] enable = yes`（默认开启）时，播放器
 会以独立 Emby 会话身份建立控制 WebSocket，并声明 Pause/Unpause/PlayPause/
 Seek/Stop/DisplayMessage 能力；Emby 网页的控制台可对当前播放暂停、继续、
@@ -82,11 +82,11 @@ seek 或发送消息。只控制当前机器，不建房、不互相跟随。显
       CreateObject("Wscript.Shell").Run """<Python所在文件夹>\python.exe"" ""<脚本所在文件夹>\embyToLocalPlayer.py""" , 0, True
       ```
     * 若 bat 或者 vbs 有无法解决的问题，可尝试使用
-      [AutoHotkey 自启动解决方案](https://github.com/kjtsune/embyToLocalPlayer/issues/14#issuecomment-2430602205)。
+      [AutoHotkey 自启动解决方案（上游参考）](https://github.com/kjtsune/embyToLocalPlayer/issues/14#issuecomment-2430602205)。
     * **反馈前看下方相关 FAQ，没按要求反馈会忽略**
 
 **FAQ 内容，以 GitHub 为准。**  
-https://github.com/kjtsune/embyToLocalPlayer#faq
+https://github.com/hope140/embyToLocalPlayer/tree/beta#faq
 
 > macOS / Linux
 
