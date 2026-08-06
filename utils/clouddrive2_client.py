@@ -11,6 +11,12 @@ from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urljoin, urlparse, urlunparse
 
+try:
+    from utils.dependency_bootstrap import ensure_bundled_dependencies
+    ensure_bundled_dependencies()
+except Exception:
+    pass
+
 _PLACEHOLDER_RE = re.compile(r"\{(SCHEME|HOST|PREVIEW)\}")
 _TOKEN_PREFIX = re.compile(r"^Bearer\s+", re.I)
 

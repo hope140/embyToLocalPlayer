@@ -8,6 +8,14 @@ try:
 except Exception:
     pass
 
+try:
+    from utils.dependency_bootstrap import ensure_bundled_dependencies
+    ensure_bundled_dependencies()
+except Exception:
+    # Dependency loading is best-effort; the regular fallback/error handling
+    # should keep non-CD2 playback available if extraction is not possible.
+    pass
+
 from utils.downloader import prefetch_resume_tv
 from utils.http_server import run_server
 from utils.tools import (configs, MyLogger, kill_multi_process, clean_tmp_dir)

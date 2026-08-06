@@ -43,6 +43,15 @@ Get-ChildItem -LiteralPath $staging -Recurse -File |
     Where-Object { $_.Extension -in '.pyc', '.pyo' } |
     ForEach-Object { [System.IO.File]::Delete($_.FullName) }
 
+# The embedded Windows runtime extracts binary wheels on first launch.  Never
+# copy that machine-generated cache back into a distributable archive.
+foreach ($dir in @('_runtime_deps', '_runtime_deps.tmp')) {
+    $generated = Join-Path $staging "third_party\$dir"
+    if (Test-Path -LiteralPath $generated) {
+        [System.IO.Directory]::Delete($generated, $true)
+    }
+}
+
 if (Test-Path -LiteralPath $archivePath) {
     [System.IO.File]::Delete($archivePath)
 }
