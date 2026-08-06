@@ -54,6 +54,38 @@ def run_server(ip='127.0.0.1', port=58000):
 
 class UserScriptRequestHandler(BaseHTTPRequestHandler):
 
+    @staticmethod
+    def _is_client_disconnect_error(exc):
+        """Return whether *exc* is the normal peer-closed HTTP race.
+
+        mpv commonly cancels an in-flight Range request while closing or
+        seeking.  On Windows the buffered socket flush performed by
+        `BaseHTTPRequestHandler.finish` can then surface WSAECONNRESET
+        (10054), even though the request has already been abandoned by the
+        client.  Keep this check narrow so unrelated I/O failures still
+        reach the normal error reporting path.
+        """
+
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return True
+        return isinstance(exc, OSError) and getattr(exc, 'winerror', None) in (10053, 10054, 10058)
+
+    def handle(self):
+        try:
+            super().handle()
+        except OSError as exc:
+            if not self._is_client_disconnect_error(exc):
+                raise
+            logger.debug(f'http client disconnected during request: {exc}')
+
+    def finish(self):
+        try:
+            super().finish()
+        except OSError as exc:
+            if not self._is_client_disconnect_error(exc):
+                raise
+            logger.debug(f'http client disconnected while closing request: {exc}')
+
     def _post_resopne(self, msg=None, status=200):
         self.send_response(status)
         self.send_header('Content-type', 'application/json')

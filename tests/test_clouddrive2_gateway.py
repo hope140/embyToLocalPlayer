@@ -97,6 +97,16 @@ class CloudDrive2GatewayTests(unittest.TestCase):
 
 
 class HttpRangeTests(unittest.TestCase):
+    def test_client_disconnect_error_is_limited_to_expected_socket_errors(self):
+        is_disconnect = http_server.UserScriptRequestHandler._is_client_disconnect_error
+        self.assertTrue(is_disconnect(ConnectionResetError('peer reset')))
+        self.assertTrue(is_disconnect(ConnectionAbortedError('peer aborted')))
+        self.assertTrue(is_disconnect(BrokenPipeError('pipe closed')))
+
+        unrelated = OSError('unrelated I/O failure')
+        unrelated.winerror = 5
+        self.assertFalse(is_disconnect(unrelated))
+
     def test_parse_range_supports_suffix_and_clips_end(self):
         parse = http_server.UserScriptRequestHandler.parse_range_header
         self.assertEqual(parse('bytes=-3', 10), (7, 9))
