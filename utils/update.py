@@ -15,6 +15,31 @@ from utils.net_tools import requests_urllib
 UPDATE_URL = 'https://github.com/hope140/embyToLocalPlayer/archive/refs/heads/beta.zip'
 CONFIG_PREFIX = 'embyToLocalPlayer_config'
 
+# Keep the updater in lockstep with scripts/package_beta.ps1. GitHub branch
+# archives also contain tests, docs, and build scripts; those are not runtime
+# files and must never be copied into an installed player directory.
+PACKAGE_ROOT_FILES = frozenset(
+    {
+        'embyToLocalPlayer.py',
+        'embyToLocalPlayer_config.ini',
+        'README.md',
+        'FUNCTIONS.md',
+        'LICENSE',
+        'requirements.txt',
+    }
+)
+PACKAGE_DIRECTORIES = frozenset({'utils', 'third_party', 'user_script'})
+
+
+def _is_runtime_member(name):
+    """Return whether a flattened archive member belongs to the runtime package."""
+    if not name:
+        return False
+    if '/' not in name:
+        return name in PACKAGE_ROOT_FILES
+    top_level, _, remainder = name.partition('/')
+    return bool(remainder) and top_level in PACKAGE_DIRECTORIES
+
 
 def _normalise_member_name(name):
     """Return a safe, POSIX-style member path or raise on zip-slip input."""
@@ -138,6 +163,8 @@ def extract_update_archive(zip_path, destination, ini_example, *, is_windows=Non
             if _zip_member_is_symlink(info):
                 raise ValueError(f'unsupported symlink zip member: {info.filename!r}')
             if not name:
+                continue
+            if not _is_runtime_member(name):
                 continue
             target = _safe_destination(destination, name)
             if target is not None and not info.is_dir():

@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $OutputDirectory) {
-    $OutputDirectory = Join-Path $root 'dist'
+    $OutputDirectory = Join-Path $root 'publish'
 }
 
 $staging = Join-Path $OutputDirectory 'etlp-remote-control-beta'
