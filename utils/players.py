@@ -181,10 +181,17 @@ def mpv_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_s
     else:
         cmd.append(f'--force-media-title={media_title}')
         cmd.append(f'--osd-playing-msg={osd_title}')
-    if not mount_disk_mode:
+    # CloudDrive2 gateway playback already opens a local HTTP-backed media
+    # request. Showing the window before that request has produced a long
+    # black startup window and can race ModernX's idle/show-hide bindings.
+    # Keep the historical eager-window behavior for ordinary remote HTTP
+    # playback, where it is still useful.
+    if not mount_disk_mode and not data.get('use_strm_cd2_url'):
         cmd.append('--force-window=immediate')
         if proxy := configs.player_proxy:
             cmd.append(f'--http-proxy=http://{proxy}')
+    elif not mount_disk_mode and (proxy := configs.player_proxy):
+        cmd.append(f'--http-proxy=http://{proxy}')
     if start_sec is not None:
         if is_iina and mount_disk_mode:
             # iina 读盘模式下 start_sec 会影响下一集
