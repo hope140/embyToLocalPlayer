@@ -2,14 +2,14 @@
 // @name         embyToLocalPlayer
 // @name:zh-CN   embyToLocalPlayer
 // @name:en      embyToLocalPlayer
-// @namespace    https://github.com/kjtsune/embyToLocalPlayer
+// @namespace    https://github.com/hope140/embyToLocalPlayer
 // @version      2026.08.05
-// @updateURL    https://raw.githubusercontent.com/hope140/embyToLocalPlayer/main/user_script/embyToLocalPlayer.user.js
-// @downloadURL  https://raw.githubusercontent.com/hope140/embyToLocalPlayer/main/user_script/embyToLocalPlayer.user.js
+// @updateURL    https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js
+// @downloadURL  https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js
 // @description  Emby/Jellyfin 调用外部本地播放器，并回传播放记录。适配 Plex。
 // @description:zh-CN Emby/Jellyfin 调用外部本地播放器，并回传播放记录。适配 Plex。
 // @description:en  Play in an external player. Update watch history to Emby/Jellyfin server. Support Plex.
-// @author       Kjtsune
+// @author       hope140
 // @match        *://*/web/index.html*
 // @match        *://*/*/web/index.html*
 // @match        *://*/web/
@@ -318,7 +318,7 @@
                 'Content-Type': 'application/json'
             },
             onerror: function (error) {
-                alert(`${url}\n请求错误，本地服务未运行，请查看使用说明。\nhttps://github.com/kjtsune/embyToLocalPlayer`);
+                alert(`${url}\n请求错误，本地服务未运行，请查看使用说明。\nhttps://github.com/hope140/embyToLocalPlayer/tree/beta#faq`);
                 console.error('请求错误:', error);
             }
         });
