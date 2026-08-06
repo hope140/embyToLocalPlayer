@@ -73,6 +73,37 @@ class UpdateArchiveTests(unittest.TestCase):
             self.assertEqual(protected.read_text(), "old")
             self.assertEqual(example.read_text(), "[emby]\n")
 
+    def test_only_runtime_package_members_are_extracted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive = self._archive(
+                root,
+                [
+                    ("embyToLocalPlayer.py", "runtime"),
+                    ("utils/runtime.py", "util"),
+                    ("third_party/runtime.bin", "third-party"),
+                    ("user_script/runtime.user.js", "user-script"),
+                    ("tests/test_should_not_ship.py", "test"),
+                    ("docs/architecture.md", "docs"),
+                    ("scripts/package_beta.ps1", "script"),
+                    (".codex/state.json", "metadata"),
+                    ("README.md", "readme"),
+                    ("embyToLocalPlayer_config.ini", "[emby]\n"),
+                ],
+            )
+            example = root / "embyToLocalPlayer_example.ini"
+
+            update.extract_update_archive(archive, root, example, is_windows=False)
+
+            self.assertEqual((root / "embyToLocalPlayer.py").read_text(), "runtime")
+            self.assertEqual((root / "utils/runtime.py").read_text(), "util")
+            self.assertEqual((root / "third_party/runtime.bin").read_text(), "third-party")
+            self.assertEqual((root / "user_script/runtime.user.js").read_text(), "user-script")
+            self.assertEqual((root / "README.md").read_text(), "readme")
+            for extra in ("tests", "docs", "scripts", ".codex"):
+                self.assertFalse((root / extra).exists(), extra)
+            self.assertEqual(example.read_text(), "[emby]\n")
+
     def test_zip_slip_paths_are_rejected_before_writing(self):
         unsafe_names = ("/absolute.txt", "C:/drive.txt", "../parent.txt", "a/../../parent.txt", r"..\parent.txt")
         for unsafe_name in unsafe_names:
