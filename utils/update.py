@@ -12,12 +12,12 @@ from utils.configs import configs
 from utils.net_tools import requests_urllib
 
 
-UPDATE_URL = 'https://github.com/hope140/embyToLocalPlayer/archive/refs/heads/beta.zip'
+UPDATE_URL = 'https://github.com/hope140/embyToLocalPlayer/releases/latest/download/etlp-remote-control-beta.zip'
 CONFIG_PREFIX = 'embyToLocalPlayer_config'
 
-# Keep the updater in lockstep with scripts/package_beta.ps1. GitHub branch
-# archives also contain tests, docs, and build scripts; those are not runtime
-# files and must never be copied into an installed player directory.
+# Keep the updater in lockstep with scripts/package_beta.ps1. The release asset
+# is the exact runtime archive produced by that script, while the allowlist
+# still protects installations if an unexpected extra member is ever added.
 PACKAGE_ROOT_FILES = frozenset(
     {
         'embyToLocalPlayer.py',
