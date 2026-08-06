@@ -12,15 +12,12 @@ from socketserver import ThreadingMixIn
 
 from utils.data_parser import parse_received_data_emby, parse_received_data_plex, list_episodes
 from utils.downloader import DownloadManager
-from utils.net_tools import (realtime_playing_request_sender, update_server_playback_progress,
-                             sync_third_party_for_eps)
+from utils.net_tools import (realtime_playing_request_sender, update_server_playback_progress)
 from utils.player_manager import PlayerManager
 from utils.players import start_player_func_dict, stop_sec_func_dict
-from utils.simkl_sync import simkl_api_client
 from utils.tools import (configs, MyLogger, open_local_folder, play_media_file,
                          activate_window_by_pid, get_player_cmd, ThreadWithReturnValue,
                          create_sparse_file)
-from utils.trakt_sync import trakt_api_client
 
 player_is_running = False
 logger = MyLogger()
@@ -142,24 +139,6 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith('/send_media_file'):
             self.send_media_file()
-            return
-        if self.path.startswith('/trakt_auth'):
-            parsed_path, query = self.parse_get_query()
-            if received_code := query.get('code'):
-                trakt_api_client(received_code)
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'etlp: trakt auth success')
-            logger.info(f'trakt: auth success')
-            return
-        if self.path.startswith('/simkl_auth'):
-            parsed_path, query = self.parse_get_query()
-            if received_code := query.get('code'):
-                simkl_api_client(received_code)
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'etlp: simkl auth success')
-            logger.info(f'simkl: auth success')
             return
         if self.path.startswith('/miss_runtime_start_sec'):
             self.check_miss_runtime_start_sec()
@@ -338,11 +317,6 @@ def start_play(data):
         eps_data = eps_data_thread.join()
         current_ep = [i for i in eps_data if i['file_path'] == data['file_path']][0]
         current_ep['_stop_sec'] = stop_sec
-        for provider in 'trakt', 'bangumi', 'simkl':
-            if configs.raw.get(provider, 'enable_host', fallback=''):
-                threading.Thread(target=sync_third_party_for_eps,
-                                 kwargs={'eps': [current_ep], 'provider': provider}, daemon=True).start()
-
         if configs.gui_is_enable \
                 and progress_percent * 100 > configs.raw.getfloat('gui', 'delete_at', fallback=99.9):
             logger.info('watched, delete cache')
