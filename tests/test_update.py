@@ -15,12 +15,12 @@ class UpdateArchiveTests(unittest.TestCase):
                 zf.writestr(name, payload)
         return archive
 
-    def test_update_url_is_pinned_to_beta_branch(self):
+    def test_update_url_is_pinned_to_latest_beta_release_asset(self):
         self.assertEqual(
             update.UPDATE_URL,
-            "https://github.com/hope140/embyToLocalPlayer/archive/refs/heads/beta.zip",
+            "https://github.com/hope140/embyToLocalPlayer/releases/latest/download/etlp-remote-control-beta.zip",
         )
-        self.assertNotIn("releases/latest", update.UPDATE_URL)
+        self.assertIn("releases/latest/download", update.UPDATE_URL)
 
     def test_github_prefix_is_flattened_and_live_config_is_protected(self):
         with tempfile.TemporaryDirectory() as temp:
