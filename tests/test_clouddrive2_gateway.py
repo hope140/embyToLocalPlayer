@@ -231,6 +231,10 @@ class DataParserGatewayTests(unittest.TestCase):
         self.assertEqual(result['media_path'], 'http://127.0.0.1:58000/cd2/nonce')
         self.assertTrue(result['use_strm_cd2_url'])
         self.assertEqual(result['strm_cd2_local_path'], r'C:\Media\Movie.mkv')
+        self.assertEqual(result['media_basename'], 'Movie.mkv')
+        self.assertIn('Movie.mkv', result['media_title'])
+        self.assertNotIn('nonce', result['media_title'])
+        self.assertNotIn('.strm', result['media_title'])
         register.assert_called_once_with(r'C:\Media\Movie.mkv')
 
 

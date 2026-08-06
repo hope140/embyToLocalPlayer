@@ -302,8 +302,13 @@ def parse_received_data_emby(received_data):
     if '.m3u8' in file_path:
         media_path = stream_url = file_path
 
+    # An HTTP STRM may resolve to a local mounted media file while the actual
+    # transport uses an opaque CloudDrive2 gateway URL.  Keep the display name
+    # tied to the deterministic local media path, never to ``.strm`` or a
+    # gateway nonce.
+    display_basename = os.path.basename(strm_cd2_local_path or file_path)
     pretty_title = configs.raw.getboolean('dev', 'pretty_title', fallback=True)
-    media_title = f'{emby_title}  |  {basename}' if pretty_title and emby_title else basename
+    media_title = f'{emby_title}  |  {display_basename}' if pretty_title and emby_title else display_basename
     title_trans = configs.media_title_translate(get_trans=True)
     if title_trans:
         media_title = media_title.translate(title_trans)
@@ -841,9 +846,10 @@ def list_episodes(data: dict):
         index = item.get('IndexNumber', 0)
         unique_key = f"{item.get('ParentIndexNumber')}-{index}"
         emby_title = title_data.get(unique_key)
-        media_title = f'{emby_title}  |  {basename}' if pretty_title and emby_title else basename
+        display_basename = os.path.basename(strm_cd2_local_path or file_path)
+        media_title = f'{emby_title}  |  {display_basename}' if pretty_title and emby_title else display_basename
         media_title = media_title.replace('"', '”')
-        media_basename = os.path.basename(media_path)
+        media_basename = os.path.basename(strm_cd2_local_path or media_path)
         total_sec = int(source_info.get('RunTimeTicks', 0)) // 10 ** 7 or 3600 * 24
         size = int(source_info.get('Size', 0)) or 0
 

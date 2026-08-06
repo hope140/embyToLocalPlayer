@@ -174,7 +174,8 @@ class RemoteControlClient:
                  enabled=None, remote_enabled=None,
                  remote_control_enabled=None, ws_factory=None, report_interval=10.0,
                  heartbeat_interval=20.0, ws_timeout=0.5, reconnect_min=1.0,
-                 reconnect_max=30.0, seek_threshold=3.0, clock=None):
+                 reconnect_max=30.0, seek_threshold=3.0, snapshot_interval=0.2,
+                 clock=None):
         self.data = data or {}
         self.player = player or mpv
         # ``enabled`` is the historical constructor override.  Keep it for
@@ -198,6 +199,9 @@ class RemoteControlClient:
         self.reconnect_min = max(0.05, float(reconnect_min))
         self.reconnect_max = max(self.reconnect_min, float(reconnect_max))
         self.seek_threshold = max(0.5, float(seek_threshold))
+        # Keep WebSocket command handling responsive while avoiding a tight
+        # 50 ms loop that performs several synchronous mpv IPC reads each time.
+        self.snapshot_interval = max(0.05, float(snapshot_interval))
         self._clock = clock or time.monotonic
         self._stop_event = threading.Event()
         self._thread = None
@@ -217,6 +221,7 @@ class RemoteControlClient:
         self._last_playback_rate = 1.0
         self._last_heartbeat_at = None
         self._next_connect_at = 0.0
+        self._next_snapshot_at = 0.0
         self._backoff = self.reconnect_min
 
     @property
@@ -508,6 +513,7 @@ class RemoteControlClient:
             # Send Playing even when the first WebSocket connection is
             # temporarily unavailable; HTTP and WS failures are independent.
             self._report_snapshot(force=True)
+            self._next_snapshot_at = self._clock() + self.snapshot_interval
             while not self._stop_event.is_set():
                 now = self._clock()
                 if ws is None and now >= self._next_connect_at:
@@ -520,7 +526,7 @@ class RemoteControlClient:
                         )
                         self._schedule_reconnect()
                         ws = None
-                self._report_snapshot()
+                self._poll_snapshot_if_due(now)
                 if ws is not None:
                     self._declare_capabilities()
                 if ws is not None:
@@ -545,6 +551,16 @@ class RemoteControlClient:
 
     def _snapshot(self):
         return get_mpv_snapshot(self.player)
+
+    def _poll_snapshot_if_due(self, now=None):
+        """Poll mpv at a bounded cadence while keeping WS handling frequent."""
+
+        now = self._clock() if now is None else float(now)
+        if now < self._next_snapshot_at:
+            return False
+        self._report_snapshot()
+        self._next_snapshot_at = now + self.snapshot_interval
+        return True
 
     def publish_snapshot(self, snapshot, *, force=False, now=None):
         """Publish one externally supplied snapshot (handy for tests)."""
