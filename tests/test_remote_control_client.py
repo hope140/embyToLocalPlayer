@@ -356,6 +356,25 @@ class RemoteControlClientTests(unittest.TestCase):
         })))
         self.assertIn(('show-text', 'hello', 1000), self.player.commands)
 
+    def test_snapshot_poll_is_throttled(self):
+        self.client._next_snapshot_at = 1.0
+        with mock.patch.object(self.client, '_report_snapshot') as report:
+            self.assertFalse(self.client._poll_snapshot_if_due(now=0.9))
+            report.assert_not_called()
+
+            self.assertTrue(self.client._poll_snapshot_if_due(now=1.0))
+            report.assert_called_once_with()
+            self.assertAlmostEqual(
+                self.client._next_snapshot_at,
+                1.0 + self.client.snapshot_interval,
+            )
+
+            self.assertFalse(self.client._poll_snapshot_if_due(now=1.1))
+            self.assertTrue(self.client._poll_snapshot_if_due(
+                now=1.0 + self.client.snapshot_interval,
+            ))
+            self.assertEqual(report.call_count, 2)
+
     def test_playpause_toggles_paused_player_and_reports_ack(self):
         self.player.paused = True
         self.client.publish_snapshot(
