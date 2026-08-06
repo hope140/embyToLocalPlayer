@@ -12,7 +12,7 @@ from utils.configs import configs
 from utils.net_tools import requests_urllib
 
 
-UPDATE_URL = 'https://github.com/hope140/embyToLocalPlayer/archive/refs/heads/main.zip'
+UPDATE_URL = 'https://github.com/hope140/embyToLocalPlayer/archive/refs/heads/beta.zip'
 CONFIG_PREFIX = 'embyToLocalPlayer_config'
 
 
