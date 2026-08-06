@@ -237,8 +237,13 @@ flowchart LR
 
 以下功能代码已经存在，但不应当作默认能力承诺。除非明确需要，否则保持关闭。
 
+### CloudDrive2 STRM
+
+仅对 Emby/Jellyfin 的 HTTP `.strm` 且已启用读取硬盘模式的请求生效。配置 `[clouddrive2]` 的 `origin`、`api_token`（或环境变量 `ETLP_CLOUDDRIVE2_TOKEN`）和 Windows `path_map` 后，etlp 会把本地挂载路径映射为 CloudDrive2 云路径，并通过本机短期 gateway 提供播放地址。浏览器登录状态不等于本机 CloudDrive2 gRPC API Token；未配置、无权限、接口失败或路径未命中映射时，会自动回退原挂载盘文件。该功能不替代本地挂载，也不面向公网提供媒体服务。
+
 | 功能 | 作用 | 关键配置/入口 | 主要限制 |
 | --- | --- | --- | --- |
+| CloudDrive2 STRM | 将读取硬盘模式下 HTTP STRM 的本地挂载路径解析为 CloudDrive2 播放地址 | `[clouddrive2]`、`[dev] strm_local_by_file_path`、`ETLP_CLOUDDRIVE2_TOKEN` | 需要本机 gRPC token 和正确的 `path_map`；失败自动回退原挂载盘；仅支持 Emby/Jellyfin HTTP STRM。 |
 | ISO/BDMV 原盘播放 | 按路径切换 VLC、PotPlayer 或 mpv 播放原盘 | `player_by_path`、`strm_direct_host`、读盘模式 | ISO 不回传进度；Pot/mpv 需要本地挂载，VLC 更适合菜单展示。 |
 | 本地 URL 替换 | 把源视频流地址替换成本机 alist/nginx 地址 | 隐藏配置 `stream_redirect` | 配置成对地址，错误替换会直接导致无法播放。 |
 | 局域网 STRM 进度 | 在长期运行的另一台 etlp 上保存缺失时长 STRM 的临时进度 | `listen_on_localhost = no`、`server_side_href` | 无持久数据库；开放监听有安全风险。 |
@@ -260,6 +265,7 @@ flowchart LR
 | `[exe]` | 播放器别名和可执行文件路径。 |
 | `[emby]` | 默认播放器、最终进度回传、全屏。名称沿用历史，但也影响 Jellyfin/Plex 主流程。 |
 | `[src]` / `[dst]` | 服务端路径到客户端本地/挂载路径的成对转换。 |
+| `[clouddrive2]` | CloudDrive2 STRM 的 gRPC 地址、token、路径映射和超时。 |
 | `[playlist]` | 连续播放启用范围、版本匹配、条目限制和简易自动下一集。 |
 | `[dev]` | 字幕、版本、代理、重定向、STRM、日志、进程、实时反馈等高级设置。 |
 | `[gui]` | 隐藏的持久缓存、下载和任务管理功能。 |
