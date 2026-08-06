@@ -6,6 +6,7 @@ import urllib.parse
 
 from utils.configs import configs, MyLogger
 from utils.emby_session_api import derive_control_device_id
+from utils.clouddrive2_gateway import maybe_register_strm_cd2_url
 from utils.net_tools import multi_thread_requests, requests_urllib, get_redirect_url
 from utils.tools import (show_version_info, main_ep_to_title, main_ep_intro_time, logger_setup, version_prefer_emby,
                          match_version_range, sub_via_other_media_version, force_disk_mode_by_path,
@@ -264,6 +265,12 @@ def parse_received_data_emby(received_data):
         else:
             media_path = stream_url
 
+    strm_cd2_local_path = media_path if use_strm_local_path and not media_path.startswith(('http://', 'https://')) else None
+    strm_cd2_url = maybe_register_strm_cd2_url(strm_cd2_local_path) if strm_cd2_local_path else None
+    use_strm_cd2_url = bool(strm_cd2_url)
+    if strm_cd2_url:
+        media_path = strm_cd2_url
+
     media_streams = media_source_info['MediaStreams']
     # mpv 可传递首集内封字幕选中序号，其他播放器由播放器自身规则决定。
     # A local path derived from an HTTP .strm has no matching sidecar subtitle path.
@@ -311,7 +318,9 @@ def parse_received_data_emby(received_data):
     total_sec = int(media_source_info.get('RunTimeTicks', 0)) // 10 ** 7 or 3600 * 24
     position = start_sec / total_sec
     user_id = query['UserId']
-    media_basename = os.path.basename(media_path)
+    # Keep the real filename when the transport URL is an opaque CD2 gateway
+    # nonce; playlist/window naming must not depend on that random URL.
+    media_basename = os.path.basename(strm_cd2_local_path or media_path)
     size = int(media_source_info.get('Size', 0)) or 0
 
     result = dict(
@@ -354,6 +363,8 @@ def parse_received_data_emby(received_data):
         is_http_source=is_http_source,
         strm_local_by_file_path=strm_local_by_file_path,
         use_strm_local_path=use_strm_local_path,
+        use_strm_cd2_url=use_strm_cd2_url,
+        strm_cd2_local_path=strm_cd2_local_path,
         source_path=source_path,
         is_http_direct_strm=is_http_direct_strm,
         sub_inner_idx=sub_inner_idx,
@@ -422,7 +433,9 @@ def parse_received_data_plex(received_data):
             if not mount_disk_mode and sub_key else None
         media_path = translate_path_by_ini(file_path) if mount_disk_mode else stream_url
         basename = os.path.basename(file_path)
-        media_basename = os.path.basename(media_path)
+        # The gateway URL contains only a nonce, so preserve the local STRM
+        # target filename for playlist and player metadata.
+        media_basename = os.path.basename(strm_cd2_local_path or media_path)
         title = meta.get('title', basename)
         media_title = title if title == basename else f'{title} | {basename}'
         if title_trans:
@@ -818,6 +831,12 @@ def list_episodes(data: dict):
             else:
                 media_path = stream_url
 
+        strm_cd2_local_path = media_path if use_strm_local_path and not media_path.startswith(('http://', 'https://')) else None
+        strm_cd2_url = maybe_register_strm_cd2_url(strm_cd2_local_path) if strm_cd2_local_path else None
+        use_strm_cd2_url = bool(strm_cd2_url)
+        if strm_cd2_url:
+            media_path = strm_cd2_url
+
         basename = os.path.basename(file_path)
         index = item.get('IndexNumber', 0)
         unique_key = f"{item.get('ParentIndexNumber')}-{index}"
@@ -875,6 +894,8 @@ def list_episodes(data: dict):
             sub_inner_idx=sub_inner_idx,
             source_path=source_path,
             use_strm_local_path=use_strm_local_path,
+            use_strm_cd2_url=use_strm_cd2_url,
+            strm_cd2_local_path=strm_cd2_local_path,
         ))
         return result
 
