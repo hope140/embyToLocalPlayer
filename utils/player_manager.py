@@ -8,7 +8,7 @@ from utils.configs import configs, MyLogger
 from utils.downloader import Downloader
 from utils.emby_api_thin import EmbyApiThin
 from utils.net_tools import (get_redirect_url, requests_urllib, realtime_playing_request_sender,
-                             update_server_playback_progress, sync_third_party_for_eps, check_miss_runtime_start_sec)
+                             update_server_playback_progress, check_miss_runtime_start_sec)
 from utils.players import start_player_func_dict, playlist_func_dict, stop_sec_func_dict, prefetch_data
 from utils.tools import activate_window_by_pid
 from utils.remote_control_client import RemoteControlClient
@@ -205,13 +205,6 @@ class BaseManager(BaseInit):
         threading.Thread(target=self.prefetch_next_ep_playback_info, daemon=True).start()
         if not need_update_eps:
             return
-        for provider in 'trakt', 'bangumi', 'simkl':
-            if need_update_eps[0]['total_sec'] == 3600 * 24:
-                logger.error('trakt, bgm disabled: cuz miss emby runtime data')
-                break
-            if configs.raw.get(provider, 'enable_host', fallback=''):
-                threading.Thread(target=sync_third_party_for_eps,
-                                 kwargs={'eps': need_update_eps, 'provider': provider}, daemon=True).start()
 
 
 class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理

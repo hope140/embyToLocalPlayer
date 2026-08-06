@@ -6,7 +6,7 @@
 2. 每项功能支持哪些服务器、播放器和使用方式；
 3. 后续想修改某项功能时，应先看哪些配置和模块。
 
-本文以当前 `main` 分支的代码、`README.md` 和 `embyToLocalPlayer_config.ini` 为准。它不是安装教程，也不替代 README 中的 FAQ。
+本文以当前 CloudDrive2 实验分支的代码、`README.md` 和 `embyToLocalPlayer_config.ini` 为准。它不是安装教程，也不替代 README 中的 FAQ。
 
 ## 1. 状态说明
 
@@ -37,7 +37,6 @@ flowchart LR
     G --> H
     H --> I["播放进度与暂停状态"]
     I --> J["回传 Emby / Jellyfin / Plex"]
-    I --> K["可选同步 Bangumi / Trakt"]
 ```
 
 主要组成部分：
@@ -49,7 +48,7 @@ flowchart LR
 | 本地 HTTP 服务 | 接收油猴请求、分派播放/下载/打开文件夹等操作 | `utils/http_server.py` |
 | 数据解析 | 解析 Emby/Jellyfin/Plex 数据，确定视频、字幕、版本和播放列表 | `utils/data_parser.py` |
 | 播放器管理 | 启动播放器、维护播放列表、获取播放位置 | `utils/player_manager.py`、`utils/players.py` |
-| 服务端通信 | 回传进度、处理重定向、字幕缓存、第三方同步 | `utils/net_tools.py` |
+| 服务端通信 | 回传进度、处理重定向、字幕缓存 | `utils/net_tools.py` |
 | 配置与通用能力 | 读取配置、路径转换、播放器选择、日志 | `utils/configs.py`、`utils/tools.py` |
 
 ## 3. 支持范围总览
@@ -65,8 +64,6 @@ flowchart LR
 | 剧集连续播放 | 支持 | 支持 | 支持 | 受播放器、外挂字幕、多版本匹配等条件限制。 |
 | 退出时回传最终进度 | 支持 | 支持 | 支持 | 可通过 `[emby] update_progress` 关闭；ISO、M3U8 不回传。 |
 | 实时回传进度和暂停状态 | 支持 | 支持 | 未适配 | 当前实时接口面向 Emby/Jellyfin，播放器还需支持 mpv IPC。 |
-| Bangumi 单向同步 | 支持 | 支持 | 不支持 | 仅同步符合风格筛选的常规动画剧集。 |
-| Trakt 单向同步 | 支持 | 支持 | 支持 | 依赖外部条目 ID 和 Trakt OAuth 配置。 |
 
 ### 3.2 本地播放器
 
@@ -154,7 +151,7 @@ flowchart LR
 - **实时回传**：mpv/IINA 播放时周期性发送进度，并在暂停、恢复时立即同步；当前使用 Emby/Jellyfin 播放会话接口。
 - **关键配置**：`[emby] update_progress`；`[dev] playing_feedback_enable`、`playing_feedback_interval`、`playing_feedback_host`。
 - **默认间隔**：30 秒，代码最低限制为 10 秒。
-- **播放完成判断**：播放列表和第三方同步通常以播放超过约 90% 为完成依据；媒体服务器本身仍可能使用自己的已观看规则。
+- **播放完成判断**：播放列表通常以播放超过约 90% 为完成依据；媒体服务器本身仍可能使用自己的已观看规则。
 - **跳过情况**：ISO、M3U8 不回传；播放器无法取得停止时间时不回传；缺失时长的 STRM 可能需要播放列表功能辅助补全。
 - **相关模块**：`utils/player_manager.py`、`utils/players.py`、`utils/net_tools.py`。
 
@@ -236,87 +233,7 @@ flowchart LR
 - **更新工具**：`utils/update.py` 用于更新项目，并生成新旧配置差异文件。
 - **相关模块**：`embyToLocalPlayer.py`、`utils/configs.py`、`utils/tools.py`、`utils/update.py`。
 
-## 5. 第三方观看记录同步
-
-### 5.1 Bangumi / bgm.tv
-
-**状态：** [条件支持]
-
-- **方向**：仅从 Emby/Jellyfin 向 Bangumi 标记已观看，不会从 Bangumi 回写媒体服务器。
-- **触发**：播放器正常关闭，且该集的播放进度达到完成阈值。
-- **范围**：只处理符合 `[bangumi] genres` 的常规动画剧集；不支持 Plex。
-- **关键配置**：`enable_host`、`username`、`access_token`、`private`、`genres`。
-- **主要限制**：多季、长篇、OVA/剧场版/WEB 续作关系和日期匹配可能失败；令牌有有效期。
-- **额外命令**：可通过命令行把 Bangumi“在看”列表中已完成条目标为已观看。
-- **相关模块**：`utils/bangumi_sync.py`、`utils/bangumi_api.py`、`utils/net_tools.py`。
-
-### 5.2 Trakt
-
-**状态：** [条件支持]
-
-- **方向**：仅从媒体服务器向 Trakt 写入观看历史。
-- **触发**：播放器正常关闭，且达到完成阈值。
-- **范围**：Emby、Jellyfin、Plex 均可配置。
-- **关键配置**：`[trakt] enable_host`、`user_name`、`client_id`、`client_secret`。
-- **授权**：本地服务通过 `/trakt_auth` 接收 OAuth 回调，并保存令牌文件。
-- **主要限制**：电影通常需要 IMDb ID，剧集需要单集 IMDb 或 TheTVDB 等可匹配 ID；网页手动标记已播放不会触发同步。
-- **相关模块**：`utils/trakt_sync.py`、`utils/trakt_api.py`、`utils/http_server.py`。
-
-## 6. 仓库内附属工具
-
-这些目录和脚本与主程序同仓库维护，但不是主播放流程的必需部分。
-
-### 6.1 `embyBangumi`
-
-**状态：** [条件支持，高风险写入]
-
-- 使用 Emby 从 TMDB 刮削出的原产地名称和上映时间搜索 Bangumi。
-- 把 Bangumi 首季评分写入 Emby 的“影评人评分/烂番茄评分”字段。
-- 电影搜索失败时会扩大日期范围重试；搜索结果和失败结果按不同期限缓存。
-- `dry_run = yes` 可先预览效果。
-- **风险**：会修改 Emby 元数据，项目没有还原功能。正式运行前必须备份，确认结果后再关闭 dry-run。
-- 主要位置：`embyBangumi/embyBangumi.py`、`embyBangumi/embyBangumi_config.ini`。
-
-### 6.2 `embyDouban`
-
-**状态：** [条件支持]
-
-- 在 Emby 详情页展示豆瓣、Bangumi 评分、链接和标签。
-- 豆瓣短评可通过油猴菜单开关。
-- 使用浏览器缓存减少对外部接口的重复请求。
-- 匹配依赖标题、IMDb ID、Bangumi 数据和第三方接口，结果可能缺失或不准确。
-- 主要位置：`embyDouban/embyDouban.user.js`。
-
-### 6.3 `embyEverywhere`
-
-**状态：** [条件支持]
-
-- 在 bgm.tv、豆瓣、IMDb、TMDB、TVDB、Trakt、Google 搜索结果等页面增加 Emby 搜索/跳转入口。
-- 根据站点可取得的 IMDb、TMDB、TVDB ID，或标题与年份查询 Emby。
-- 页面缺少可匹配 ID/标题时不会搜索；第三方网站改版可能导致入口失效。
-- 主要位置：`embyEverywhere/embyEverywhere.user.js`。
-
-### 6.4 `linkDoubanTrakt`
-
-**状态：** [条件支持]
-
-- 在豆瓣电影页面增加 Trakt 跳转，在 Trakt 电影/剧集页面增加豆瓣跳转。
-- 主要依赖 IMDb ID，并通过豆瓣 API、Wikidata 或搜索结果补全映射。
-- 使用浏览器缓存降低重复查询；第三方接口或页面结构变化可能影响结果。
-- 主要位置：`user_script/linkDoubanTrakt.user.js`。
-
-### 6.5 qBittorrent WebUI 打开/播放
-
-**状态：** [条件支持]
-
-- 在 qBittorrent WebUI 增加打开本地文件夹和调用本地播放器的操作。
-- 多文件种子默认选择体积最大的文件播放。
-- 默认按路径转换后从本地/挂载盘播放。
-- [实验/无支持] 客户端找不到本地文件时，可让文件所在服务器上的 etlp 通过 HTTP Range 提供媒体文件；需要局域网监听、相同 token 和额外地址配置。
-- 网络转发模式不支持外挂字幕，开放局域网监听时应设置 `http_server_token` 并限制可信网络。
-- 主要位置：`qbittorrent_webui_open_file/qbittorrent_webui_open_file.js`、`utils/http_server.py`、`utils/tools.py`。
-
-## 7. 实验和隐藏功能
+## 5. 实验和隐藏功能
 
 以下功能代码已经存在，但不应当作默认能力承诺。除非明确需要，否则保持关闭。
 
@@ -327,7 +244,6 @@ flowchart LR
 | 局域网 STRM 进度 | 在长期运行的另一台 etlp 上保存缺失时长 STRM 的临时进度 | `listen_on_localhost = no`、`server_side_href` | 无持久数据库；开放监听有安全风险。 |
 | mpv IPC 数据传递 | 向 mpv Lua 脚本发送命令管道和播放列表数据 | `mpv_input_ipc_server`、`mpv_ipc_playlist_data` | 播放列表数据较大；静态管道可能影响回传。 |
 | mpv 自动跳过片头片尾 | 根据 Emby 片头数据或章节标题/时长自动跳过或提示 | 隐藏配置 `skip_intro` | 依赖章节或扫描结果；规则误判会错误跳转。 |
-| mpv 独立同步 Bangumi/Trakt | 不经过网页调用也可在播放超过 90% 后同步 | 独立 Lua 脚本 + 第三方同步配置 | 只面向 mpv 网络视频流，仍依赖媒体服务器用户信息。 |
 | 预读取下一集 | 在当前集播放到指定比例后读取下一集首尾数据 | `prefetch_percent`、`prefetch_path`、`prefetch_host` | 主要为 nginx 分片缓存设计，配置复杂且消耗网络流量。 |
 | 预读取继续观看 | 预取最近 7 天更新剧集并尝试补全 STRM 媒体信息 | `server_data_group`、`prefetch_conf` | 适合常开设备；需要 API key 和 user_id。 |
 | Telegram 追更通知 | “继续观看”更新时通过机器人通知 | `[tg_notify]` | 依赖预读取继续观看和 Telegram 网络；默认配置模板未展示。 |
@@ -337,7 +253,7 @@ flowchart LR
 | 媒体标题字符替换 | 避免高版本 PotPlayer 因标题字符导致启动失败 | `media_title_translate` | 错误替换可能影响显示或其他播放器，只建议用于 Pot。 |
 | 其他版本字幕 | 当前版本无合适字幕时尝试使用其他版本字幕 | `sub_extract_priority` | 版本间时间轴可能不一致，不能保证同步。 |
 
-## 8. 配置区域速查
+## 6. 配置区域速查
 
 | 配置区域 | 主要负责 |
 | --- | --- |
@@ -346,15 +262,13 @@ flowchart LR
 | `[src]` / `[dst]` | 服务端路径到客户端本地/挂载路径的成对转换。 |
 | `[playlist]` | 连续播放启用范围、版本匹配、条目限制和简易自动下一集。 |
 | `[dev]` | 字幕、版本、代理、重定向、STRM、日志、进程、实时反馈等高级设置。 |
-| `[bangumi]` | Bangumi 单向观看记录同步。 |
-| `[trakt]` | Trakt 单向观看记录同步与 OAuth 应用信息。 |
 | `[gui]` | 隐藏的持久缓存、下载和任务管理功能。 |
 | `[tg_notify]` | 隐藏的 Telegram 追更通知。 |
 | `[dandan]` | 隐藏的弹弹play 支持。 |
 
 浏览器脚本中的 `config` 对象和油猴本地存储不属于 INI 配置。修改它们只影响浏览器端行为，例如直播是否交给网页播放器、继续观看重排、隐藏剧集和完整路径显示。
 
-## 9. 后续修改导航
+## 7. 后续修改导航
 
 | 想修改的目标 | 先检查的配置/前端开关 | 主要模块 | 需要联动回归的范围 |
 | --- | --- | --- | --- |
@@ -367,17 +281,15 @@ flowchart LR
 | 修改连续播放 | `[playlist]` | `utils/player_manager.py`、`utils/data_parser.py`、`utils/players.py` | 多集回传、版本匹配、S0、HTTP 外挂字幕、各播放器列表 API。 |
 | 修改实时进度反馈 | `playing_feedback_*` | `utils/player_manager.py`、`utils/net_tools.py` | mpv/IINA 单集和列表、暂停/恢复、Emby/Jellyfin 会话状态。 |
 | 修改最终进度回传 | `[emby] update_progress` | `utils/net_tools.py`、`utils/http_server.py` | Emby/Jellyfin/Plex、短视频、播放完成、ISO/M3U8。 |
-| 修改 Bangumi/Trakt 同步 | `[bangumi]`、`[trakt]` | `utils/bangumi_sync.py`、`utils/trakt_sync.py` | ID 匹配、完成阈值、令牌、Plex 差异。 |
 | 修改继续观看排序/隐藏 | 浏览器脚本 `config` 和本地存储 | `user_script/embyToLocalPlayer.user.js` | 接口字段、前两项保序、三天范围、隐藏列表。 |
 | 修改缓存/边下边播 | `[gui]` | `utils/downloader.py`、`utils/gui.py`、`utils/http_server.py` | 磁盘空间、稀疏文件、恢复任务、删除阈值、播放回退。 |
-| 修改 qBittorrent 联动 | `server_side_href`、`http_server_token`、路径转换 | `qbittorrent_webui_open_file/qbittorrent_webui_open_file.js`、`utils/tools.py` | 单/多文件种子、本地路径、HTTP Range、安全性。 |
 
-## 10. 已知边界与修改原则
+## 8. 已知边界与修改原则
 
 - 项目主要依赖浏览器网页接口和播放器外部控制接口，两端升级都可能造成兼容问题。
 - 数值和行为优先放在 INI 或油猴脚本配置中，不应在多个模块重复硬编码。
 - 修改播放流程时，至少分别验证网络模式、读盘模式、单集、播放列表和 STRM。
-- 修改进度逻辑时，必须区分实时反馈、播放器退出后的最终回传、第三方完成同步三个阶段。
+- 修改进度逻辑时，必须区分实时反馈和播放器退出后的最终回传两个阶段。
 - 新增播放器不能只验证“能启动”，还要明确开始时间、字幕、连续播放和进度回传分别是否支持。
 - 开放 `listen_on_localhost = no` 或媒体文件 HTTP 转发时，应限制在可信局域网并设置 token；当前本地服务不是面向公网设计的通用媒体服务器。
 - 评分回填、缓存删除等会修改外部数据或本地文件的功能，应继续保留预演、确认或明确阈值，避免不可逆操作。

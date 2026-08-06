@@ -15,10 +15,6 @@ from typing import Union
 from utils.configs import configs, MyLogger
 
 ssl_context = ssl.SSLContext() if configs.raw.getboolean('dev', 'skip_certificate_verify', fallback=False) else None
-bangumi_api_cache = {'cache_time': time.time(), 'bangumi': None}
-sync_third_party_done_ids = {'trakt': [],
-                             'bangumi': [],
-                             'simkl': []}
 
 logger = MyLogger()
 redirect_url_cache = {}
@@ -375,45 +371,6 @@ def update_server_playback_progress(stop_sec, data):
         change_plex_play_position(stop_sec=stop_sec, **data)
     logger.info(f'update progress: {data["basename"]} {stop_sec=}')
 
-
-def sync_third_party_for_eps(eps, provider):
-    if not eps:
-        return
-    if not configs.check_str_match(eps[0]['netloc'], provider, 'enable_host', log=True):
-        return
-    useful_items = []
-    for ep in eps:
-        item_id = ep['item_id']
-        if item_id in sync_third_party_done_ids[provider]:
-            logger.info(f"{provider}: skip, cuz updated previously. {ep['basename']}")
-            continue
-        if ep['_stop_sec'] / ep['total_sec'] > 0.9:
-            sync_third_party_done_ids[provider].append(item_id)
-            useful_items.append(ep)
-    if not useful_items:
-        return
-
-    if provider == 'trakt':
-        from utils.trakt_sync import trakt_sync_main
-        trakt_sync_main(eps_data=useful_items)
-
-    if provider == 'bangumi':
-        from utils.bangumi_sync import bangumi_sync_main
-        bgm = bangumi_api_cache.get(provider)
-        if bgm:
-            bgm.username = configs.raw.get('bangumi', 'username', fallback='')
-            bgm.private = configs.raw.getboolean('bangumi', 'private', fallback=True)
-            bgm.access_token = configs.raw.get('bangumi', 'access_token', fallback='')
-            bgm.http_proxy = configs.script_proxy
-            bgm.init()
-        bgm = bangumi_sync_main(bangumi=bgm, eps_data=useful_items)
-        bangumi_api_cache[provider] = bgm
-        if bangumi_api_cache['cache_time'] + 86400 < time.time():
-            bangumi_api_cache.update({'cache_time': time.time(), 'bangumi': None})
-
-    if provider == 'simkl':
-        from utils.simkl_sync import simkl_sync_main
-        simkl_sync_main(eps_data=useful_items)
 
 def save_sub_file(url, name='tmp_sub.srt'):
     srt = os.path.join(configs.cwd, '.tmp', name)

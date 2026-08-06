@@ -1,18 +1,16 @@
-# etlp - embyToLocalPlayer
+# etlp - embyToLocalPlayer（CloudDrive2 实验分支）
 
 etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放进度（可关）。适配 Plex。
+
+本分支用于实验将本地挂载路径解析/访问切换为 CloudDrive2。分支只保留播放器、路径转换、STRM、本地预热和进度回传等主线能力；不包含同步观看、豆瓣/Bangumi、Simkl/Trakt、聚合搜索和 qBittorrent 联动等旁线功能。
 
 **特性**
 
 * 在首页也可以播放。点击原来的播放按钮就可以。可配置版本优先级（若视频多版本）。
 * 播放列表（连续播放）支持，下一集保持相同版本。
 * mpv / IINA 默认实时回传单集和连续播放的进度，暂停或恢复时立即同步状态。
-* bangumi.tv bgm.tv simkl.tv trakt.tv 单向标记已观看支持。
 * 本地挂载用户：可跳转到路径对应文件夹。（按钮在网页显示文件路径的上面）
 * 未适配的播放器一般也能用，只是不会回传进度。
-* 可在 qBittorrent WebUI 里直接播放或者跳转到路径对应挂载文件夹。
-  [配套脚本](https://greasyfork.org/zh-CN/scripts/450015-qbittorrent-webui-open-file)
-* 伪 • 聚合搜索。[配套脚本](https://github.com/kjtsune/embyToLocalPlayer/tree/main/embyEverywhere)
 
 **以下播放器支持回传进度**
 
@@ -385,86 +383,6 @@ https://github.com/kjtsune/embyToLocalPlayer#faq
 </details>
 
 <details>
-<summary>bgm.tv / trakt.tv 存储记录</summary>
-
-### bgm.tv / simkl / trakt.tv 存储记录
-
-> 通用 FAQ
-
-* Clash for Windows 用户：
-    * 日志报错：`SSLEOFError(8, 'EOF occurred in violation of protocol (_ssl.c:1129)'))`
-    * 解决方案：Clash > Settings > System Proxy > Specify Protocol > 启用。
-
-* 使用含 Python 的便携版用户无需安装依赖。其他用户需要安装：命令行终端运行，安装失败尝试在启用或禁用代理的环境来安装：  
-  `python -m pip install requests`  
-  或者：  
-  `python -m pip install requests -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com`
-
-> bangumi.tv（bgm.tv） 单向同步（点格子）
-
-* 缺点：
-    1. 只能往 Bangumi 单向同步。
-    2. 只在播放器正常关闭后，同步播放器已播放的（网页点击已播放不触发）。
-    3. 只支持常规剧集，不支持剧场版等。
-* 使用说明：
-    1. 访问并创建令牌 [https://next.bgm.tv/demo/access-token](https://next.bgm.tv/demo/access-token)：   
-       复制令牌到 ini 配置文件 `[bangumi]` 部分，` access_token = ` 里
-    2. ini 配置文件 `[bangumi]` 填写 `enable_host` `user_name` 这两项。
-    3. 启动脚本，播放一集动漫，拖到最后，关闭播放器。看日志是否同步成功。
-* 常见问题：
-    1. 5季或者90集以上的条目暂不支持。
-    2. 日志提示 `Unauthorized` 一般是令牌过期或者没填对，Windows 会自动弹出令牌生成页面。
-  3. 集上映日期匹配方案：在常规搜索失败后采用，此时无视季和集数对应，只要 Emby bgm 集上映日期相差两天(含)内就匹配成功。
-  4. 由于 `bgm.tv` 的 `续集` 不一定是下一季，导致第几季可能关联错误（经下面处理后概率低）。  
-       目前把 `续集` 里：集数大于3，同时第一集的序号小于2的 `续集` 当作下一季的开始。  
-       且只保留类型为 TV 的续集（`类型在标题右侧灰字`），跳过类型为 OVA 剧场版 WEB 等的。  
-       例外：如果第一季是 WEB，则续集不会跳过 WEB。  
-       如果同步的集序号小于12（不会是分批次放送），还会核查 Emby 里的季上映时间（一般是 TMDb 的时间）与 bgm.tv
-       的上映时间相差是否超过15天，来保证准确性。  
-       Plex 是核查集上映时间与 bgm.tv 的季上映时间相差是否超过180天，来保证准确性。  
-       如果还有其他特殊情况，可以反馈。
-* 使用命令行将在看列表的已完成条目标记为已观看。
-    1. 在 etlp 所在文件夹打开命令行。
-    2. 便携版用户运行：`./python_embed/python.exe ./utils/bangumi_sync.py mark_played`
-    3. 其他用户运行：`python utils/bangumi_sync.py mark_played`
-
-> simkl 单向同步
-
-* 缺点：
-    1. 只能往 simkl 单向同步。
-    2. 只在播放器正常关闭后，同步播放器已播放的（网页点击已播放不触发）。
-    3. 配置和使用都麻烦。
-* 使用说明：
-    1. [点击访问：simkl dev 页面](https://simkl.com/settings/developer/)：   
-       创建 app，名字任意，Redirect uri 填写: `http://localhost:58000/simkl_auth` ，然后保存。  
-       已创建的 app 在 dev 页面底部能看到。
-    2. ini 配置文件`[simkl]` 填写 `enable_host` `client_id` `client_secret` 这三项。
-    3. 启动脚本，会自动跳验证页面。点击 Yes 按钮，稍等后，网页会显示 `etlp: simkl auth success`。  
-       etlp 目录下会自动生成 `simkl_token.json`
-    4. 播放一个视频，拖到最后，关闭播放器。看日志是否同步成功。
-* 其他问题：
-    1. 若想用 emby 本身的 simkl 插件，需要开启实时回传，插件有30秒全局限流。暂不考虑适配支持。
-
-> trakt.tv 单向同步
-
-* 缺点：
-    1. 媒体服务器一般本身就有 Trakt 插件。
-    2. 只能往 Trakt 单向同步。
-    3. 只在播放器正常关闭后，同步播放器已播放的（网页点击已播放不触发）。
-    4. 配置和使用都麻烦。
-* 使用说明：
-    1. [点击访问：Trakt app 管理页面](https://trakt.tv/oauth/applications)：   
-       创建 app，名字任意，Redirect uri 填写: `http://localhost:58000/trakt_auth` ，然后保存。
-    2. ini 配置文件`[trakt]` 填写 `enable_host` `user_name` `client_id` `client_secret` 这四项。
-    3. 启动脚本，会自动跳验证页面。或者自行点击 app 详情页面的 `Authorize`
-       按钮，二次同意后，网页会显示 `etlp: trakt auth success`。etlp 目录下会自动生成 `trakt_token.json`
-    4. 播放一个视频，拖到最后，关闭播放器。看日志是否同步成功。
-* 常见问题：
-    1. 若同步失败。电影看是否缺失IMDb，剧集看单集下方是否有 IMDb 或 TheTVDB。
-
-</details>
-
-<details>
 <summary>其他</summary>
 
 ### 其他:
@@ -574,26 +492,6 @@ https://github.com/kjtsune/embyToLocalPlayer#faq
   # 若含有特殊值 hint_only（可删除），为启用仅提示模式，不自动跳过。需要跳过就按章节跳转快捷键。
   skip_intro = 90, 91, 5, 30, 70, opening, ending, op, ed, hint_only
   ```
-
-</details>
-
-<details>
-<summary>mpv bangumi trakt 独立同步脚本</summary>
-
-> mpv bangumi trakt 独立同步脚本
-
-* 使用情景：不想用本工具网页调用播放，但也想标记 bangumi trakt 中对应条目为已观看。
-* 条件：mpv 播放器，播放网络视频流，播放进度超过 90% 时同步。
-* 使用方法：
-    1. 下载 `etlp-python-embed-win32.zip` 并解压到任意文件夹。  
-       （之前就在用本脚本的，更换为便携版，不要运行两份。或者参考 `FAQ > 观看记录存储服务相关` 自行安装 Python 和依赖。）
-    2. 将 lua： `刚才解压的文件夹\utils\others\etlp_sync_bgm_trakt.lua` 移动至 mpv 的脚本文件夹。  
-       例如：`mpv.exe 所在目录 > portable_config > scripts > etlp_sync_bgm_trakt.lua`
-    3. 修改 `etlp_sync_bgm_trakt.lua` 内 etlp 的保存目录（刚才解压的文件夹路径）
-    4. 参考上方 `FAQ > 观看记录存储服务相关` 修改配置文件：`embyToLocalPlayer_config.ini`
-    5. 参考 `隐藏功能 > 预读取继续观看` 设置 `[dev] > server_data_group`。用于获取`user_id`
-    6. 播放一个视频，进度拖到 90% 以上，查看 etlp 日志：`刚才解压的文件夹 > log.txt`。或者查看 mpv 日志。
-* 排错方法：使用本项目浏览器调用播放测试。
 
 </details>
 
