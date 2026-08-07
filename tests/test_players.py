@@ -29,6 +29,10 @@ class MpvStartupArgumentTests(unittest.TestCase):
         command = self._start_and_get_command({})
         self.assertIn('--force-window=immediate', command)
 
+    def test_autocreate_playlist_is_disabled_for_etlp_managed_playlist(self):
+        command = self._start_and_get_command({'use_strm_cd2_url': True})
+        self.assertIn('--autocreate-playlist=no', command)
+
 
 if __name__ == '__main__':
     unittest.main()

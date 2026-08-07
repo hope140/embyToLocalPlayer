@@ -181,6 +181,11 @@ def mpv_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_s
     else:
         cmd.append(f'--force-media-title={media_title}')
         cmd.append(f'--osd-playing-msg={osd_title}')
+    # mpv 内置 autocreate-playlist 会在打开本地文件时自动加入同目录同类型文件，
+    # 这些自动条目没有 per-file 标题，会被全局 --force-media-title 统一命名为
+    # 第一集，导致挂载盘模式下切下一集标题不更新。etlp 自己管理播放列表，
+    # 这里显式关闭自动创建。
+    cmd.append('--autocreate-playlist=no')
     # CloudDrive2 gateway playback already opens a local HTTP-backed media
     # request. Showing the window before that request has produced a long
     # black startup window and can race ModernX's idle/show-hide bindings.
