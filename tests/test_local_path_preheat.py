@@ -125,6 +125,56 @@ class LocalPathPreheatTests(unittest.TestCase):
 
         preheat.assert_not_called()
 
+    def test_preheat_local_media_paths_reads_next_episodes(self):
+        config = self.make_config(
+            strm_local_path_preheat='yes',
+            strm_local_path_preheat_bytes='4096',
+            strm_local_path_preheat_timeout_seconds='2',
+        )
+
+        class ImmediateThread:
+            def __init__(self, target, args=(), kwargs=None, name=None, daemon=None):
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs or {}
+
+            def start(self):
+                self.target(*self.args, **self.kwargs)
+
+        with mock.patch.object(tools.configs, 'raw', config), \
+                mock.patch.object(tools.os.path, 'isfile', return_value=True), \
+                mock.patch.object(tools.threading, 'Thread', ImmediateThread), \
+                mock.patch.object(tools, '_preheat_local_media_path') as preheat:
+            tools.preheat_local_media_paths(
+                ['Z:/a.mkv', 'Z:/b.mkv', 'https://example.test/c.mkv'])
+
+        self.assertEqual(preheat.call_count, 2)
+        first, second = [c.args for c in preheat.call_args_list]
+        self.assertEqual(first[:3], ('Z:/a.mkv', 4096, 2.0))
+        self.assertEqual(second[:3], ('Z:/b.mkv', 4096, 2.0))
+
+    def test_preheat_local_media_paths_respects_limit_and_skips_missing(self):
+        config = self.make_config(strm_local_path_preheat='yes')
+
+        class ImmediateThread:
+            def __init__(self, target, args=(), kwargs=None, name=None, daemon=None):
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs or {}
+
+            def start(self):
+                self.target(*self.args, **self.kwargs)
+
+        with mock.patch.object(tools.configs, 'raw', config), \
+                mock.patch.object(tools.os.path, 'isfile',
+                                  side_effect=lambda path: path in ('Z:/a.mkv', 'Z:/b.mkv')), \
+                mock.patch.object(tools.threading, 'Thread', ImmediateThread), \
+                mock.patch.object(tools, '_preheat_local_media_path') as preheat:
+            tools.preheat_local_media_paths(
+                ['Z:/a.mkv', 'Z:/missing.mkv', 'Z:/b.mkv', 'Z:/c.mkv'], limit=2)
+
+        self.assertEqual([c.args[0] for c in preheat.call_args_list], ['Z:/a.mkv', 'Z:/b.mkv'])
+
 
 if __name__ == '__main__':
     unittest.main()

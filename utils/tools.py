@@ -350,6 +350,41 @@ def _preheat_local_media_path(media_path, read_bytes, timeout_seconds, *,
     return True
 
 
+def preheat_local_media_paths(media_paths, limit=2):
+    """Best-effort background preheat for upcoming mounted local strm paths.
+
+    Reads the same ``[dev] strm_local_path_preheat*`` options used for the
+    first file, so next-episode switching on a slow mounted drive does not
+    leave mpv waiting for the mount to warm up.  Failures never affect
+    playback.
+    """
+    config = configs.raw
+    try:
+        enabled = config.getboolean('dev', 'strm_local_path_preheat', fallback=True)
+    except ValueError:
+        enabled = True
+    if not enabled or limit <= 0:
+        return
+    try:
+        read_bytes = max(1, config.getint('dev', 'strm_local_path_preheat_bytes', fallback=65536))
+    except ValueError:
+        read_bytes = 65536
+    try:
+        timeout = max(0, config.getfloat('dev', 'strm_local_path_preheat_timeout_seconds', fallback=3))
+    except ValueError:
+        timeout = 3
+    for media_path in media_paths:
+        if not media_path or media_path.startswith(('http://', 'https://')) or not os.path.isfile(media_path):
+            continue
+        if limit <= 0:
+            break
+        limit -= 1
+        threading.Thread(
+            target=_preheat_local_media_path,
+            args=(media_path, read_bytes, timeout),
+            name='etlp-strm-next-preheat', daemon=True).start()
+
+
 def get_player_cmd(media_path, file_path, data=None):
     # emby source_path 是 strm 的内容
     config = configs.raw
