@@ -488,6 +488,19 @@ class EmbySessionApi:
         self._capture_session_id(result)
         return result
 
+    def switch_playback_item(self, item_id=None, media_source_id=None):
+        """Point subsequent playback reports at a different library item.
+
+        Used when mpv advances to the next playlist episode: the control
+        session stays the same, but ItemId/MediaSourceId must follow the
+        currently playing media or Emby keeps the previous episode active.
+        """
+        if item_id is not None:
+            self.item_id = str(item_id)
+        if media_source_id is not None:
+            self.media_source_id = str(media_source_id)
+        return True
+
     def _capture_session_id(self, response):
         """Remember a server session id when an Emby response provides one."""
 
