@@ -287,7 +287,10 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
             if not mpv:
                 return None
             try:
-                client = RemoteControlClient(data=self.data, player=mpv)
+                client = RemoteControlClient(
+                    data=self.data, player=mpv,
+                    episodes_by_title=self.playlist_data,
+                )
                 if client.start():
                     self._remote_control_client = client
                 return client
