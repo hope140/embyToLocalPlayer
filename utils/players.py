@@ -363,6 +363,19 @@ def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
     pre_list = episodes[pre_index:cur_index]
     suf_list = episodes[cur_index:cur_index + limit]
 
+    # mpv 最终播放列表顺序：前插的 pre_list（倒序逐个插 0，结果保持原序）、
+    # 已在播放的当前集、再是后续集。旧版 mpv 不支持 insert 时只有后续集。
+    if is_iina:
+        mpv.mpv_playlist_titles = [data['media_title']]
+    elif not new_loadfile_cmd:
+        mpv.mpv_playlist_titles = [data['media_title']] + [
+            ep['media_title'] for ep in suf_list if ep['basename'] != data['basename']]
+    else:
+        mpv.mpv_playlist_titles = [ep['media_title'] for ep in pre_list]
+        mpv.mpv_playlist_titles.append(data['media_title'])
+        mpv.mpv_playlist_titles.extend(
+            ep['media_title'] for ep in suf_list if ep['basename'] != data['basename'])
+
     def adding_thread():
         suf_thread = threading.Thread(target=loop_episodes, args=(suf_list,))
         pre_thread = threading.Thread(target=loop_episodes, args=(reversed(pre_list), True))
@@ -384,6 +397,7 @@ def stop_sec_mpv(mpv: MPV, stop_sec_only=True, **_):
     stop_sec = None
     name_stop_sec_dict = {}
     name_total_sec_dict = {}
+    mpv.mpv_stop_sec_by_pos = {}
 
     chapters_dict = {}
     chapter_skipped = []
@@ -406,6 +420,7 @@ def stop_sec_mpv(mpv: MPV, stop_sec_only=True, **_):
             media_title = mpv.command('get_property', 'media-title')
             tmp_sec = mpv.command('get_property', 'time-pos')
             speed = mpv.command('get_property', 'speed')
+            mpv_pos = mpv.command('get_property', 'playlist-current-pos')
 
             chapters_raw = mpv.command('get_property', 'chapter-list') if dura_start else None
             chapter_index = mpv.command('get_property', 'chapter') if dura_start else None
@@ -418,6 +433,10 @@ def stop_sec_mpv(mpv: MPV, stop_sec_only=True, **_):
                 if not stop_sec_only:
                     name_stop_sec_dict[media_title] = tmp_sec
                     prefetch_data['stop_sec_dict'][media_title] = tmp_sec
+                    try:
+                        mpv.mpv_stop_sec_by_pos[int(mpv_pos)] = tmp_sec
+                    except (TypeError, ValueError):
+                        pass
 
                 if not chapters_dict and dura_start and chapters_raw:
                     dura_start, dura_end, jitter_sec = int(dura_start), int(dura_end), int(jitter_sec)

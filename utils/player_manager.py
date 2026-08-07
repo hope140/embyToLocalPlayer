@@ -10,7 +10,7 @@ from utils.emby_api_thin import EmbyApiThin
 from utils.net_tools import (get_redirect_url, requests_urllib, realtime_playing_request_sender,
                              update_server_playback_progress, check_miss_runtime_start_sec)
 from utils.players import start_player_func_dict, playlist_func_dict, stop_sec_func_dict, prefetch_data
-from utils.tools import activate_window_by_pid
+from utils.tools import activate_window_by_pid, preheat_local_media_paths
 from utils.remote_control_client import RemoteControlClient
 
 logger = MyLogger()
@@ -83,6 +83,14 @@ class BaseManager(BaseInit):
 
         self.playlist_data = playlist_func_dict[self.player_name](data=self.data, eps_data=eps_data,
                                                                   **self.player_kwargs)
+        # 挂载盘模式下 mpv 切到下一集需要重新打开本地文件，预热前几集让切换
+        # 更快，避免切集窗口期过长导致下一集进度漏采。
+        if self.data.get('use_strm_local_path'):
+            current_basename = self.data.get('basename')
+            next_paths = [ep.get('media_path') for ep in self.playlist_data.values()
+                          if ep.get('use_strm_local_path')
+                          and ep.get('media_path') and ep.get('basename') != current_basename]
+            preheat_local_media_paths(next_paths)
 
     def http_sub_auto_next_ep_time_loop(self, key_field):
         playlist_data = tuple(self.playlist_data.items())
@@ -123,6 +131,21 @@ class BaseManager(BaseInit):
             else:
                 self.playlist_time = stop_fun_res
 
+        # mpv 在切集瞬间 media-title 可能来不及刷新，位置会被记到错误标题下。
+        # 用播放列表位置兜底：把只有位置、没有对应标题 key 的集数补进来，
+        # 保证下一集进度不会因为标题未刷新而丢失。
+        mpv = self.player_kwargs.get('mpv')
+        if mpv is not None:
+            by_pos = getattr(mpv, 'mpv_stop_sec_by_pos', None)
+            titles = getattr(mpv, 'mpv_playlist_titles', None)
+            if by_pos and titles and not getattr(mpv, 'is_iina', False):
+                for pos, stop_sec in by_pos.items():
+                    if not stop_sec or not isinstance(pos, int) or not (0 <= pos < len(titles)):
+                        continue
+                    title = titles[pos]
+                    if title and title not in self.playlist_time:
+                        self.playlist_time[title] = stop_sec
+
         # 未兼容播放器多开，暂不处理
         prefetch_data['on'] = False
         self.stop_realtime_playing_feedback()
@@ -152,56 +175,62 @@ class BaseManager(BaseInit):
                 continue
             if not _stop_sec:
                 continue
-            start_sec = ep.get('start_sec') or 0
-            _stop_sec = int(_stop_sec)
-            feedback_started = ep.pop('_playing_feedback_started', False)
-            if feedback_started:
-                # 先独立关闭实时会话，后续进度逻辑即使跳过也不会残留 Now Playing。
-                realtime_playing_request_sender(
-                    data=ep, cur_sec=_stop_sec, method='end', is_paused=False)
-                # 后续需要更新进度时只补 Stopped，不能再创建新的 Playing。
-                ep['update_success'] = True
-            if abs(_stop_sec - int(start_sec)) < 20:
-                logger.info(f"skip update progress, {ep['basename']} start_sec stop_sec too close")
-                continue
-            ep['_stop_sec'] = _stop_sec
-            emby_strm_miss_runtime = bool(ep['server'] != 'plex' and ep['total_sec'] == 3600 * 24)
-            mpv_total_sec = self.playlist_total_sec.get(key)
-            need_recheck = emby_strm_miss_runtime and bool(not mpv_total_sec or _stop_sec / mpv_total_sec < 0.9)
-            if need_recheck:
-                # 注意：仅限启用播放列表时候有这些处理，strm 缺失 total_sec 和 缓存播放进度
-                netloc, item_id, basename = ep['netloc'], ep['item_id'], ep['basename']
-                logger.info('strm: fetching playback info')  # emby 也可能补全媒体信息失败，会返回没有 RunTimeTicks 的。
-                _playback_info = self.emby_thin.get_playback_info(item_id, timeout=30)  # Jellyfin 不会在播放中补全媒体信息
-                _media_source = [i for i in _playback_info['MediaSources'] if i.get('RunTimeTicks', 0)]
-                _total_sec = _media_source and _media_source[0]['RunTimeTicks'] // 10 ** 7 or 0
-                if _media_source:
-                    # 注意此处 id 变动了，为了确保回传成功，目前没不良影响。多版本不同支线的情况极少，emby 自身也是没区分。
-                    ep['item_id'] = _media_source[0].get('ItemId') or _media_source[0]['Id']  # jellyfin/10.11.1 是 Id
-                    logger.info('strm: total_sec found by recheck server data')
-                else:
-                    check_miss_runtime_start_sec(netloc, item_id, basename, stop_sec=_stop_sec)
-                    logger.info(f'strm: recheck failed, cache start_sec={_stop_sec} | {basename}')
+            try:
+                start_sec = ep.get('start_sec') or 0
+                _stop_sec = int(_stop_sec)
+                feedback_started = ep.pop('_playing_feedback_started', False)
+                if feedback_started:
+                    # 先独立关闭实时会话，后续进度逻辑即使跳过也不会残留 Now Playing。
+                    realtime_playing_request_sender(
+                        data=ep, cur_sec=_stop_sec, method='end', is_paused=False)
+                    # 后续需要更新进度时只补 Stopped，不能再创建新的 Playing。
+                    ep['update_success'] = True
+                if abs(_stop_sec - int(start_sec)) < 20:
+                    logger.info(f"skip update progress, {ep['basename']} start_sec stop_sec too close")
+                    continue
+                ep['_stop_sec'] = _stop_sec
+                emby_strm_miss_runtime = bool(ep['server'] != 'plex' and ep['total_sec'] == 3600 * 24)
+                mpv_total_sec = self.playlist_total_sec.get(key)
+                need_recheck = emby_strm_miss_runtime and bool(
+                    not mpv_total_sec or _stop_sec / mpv_total_sec < 0.9)
+                if need_recheck:
+                    # 注意：仅限启用播放列表时候有这些处理，strm 缺失 total_sec 和 缓存播放进度
+                    netloc, item_id, basename = ep['netloc'], ep['item_id'], ep['basename']
+                    logger.info('strm: fetching playback info')  # emby 也可能补全媒体信息失败，会返回没有 RunTimeTicks 的。
+                    _playback_info = self.emby_thin.get_playback_info(
+                        item_id, timeout=30)  # Jellyfin 不会在播放中补全媒体信息
+                    _media_source = [i for i in _playback_info['MediaSources'] if i.get('RunTimeTicks', 0)]
+                    _total_sec = _media_source and _media_source[0]['RunTimeTicks'] // 10 ** 7 or 0
+                    if _media_source:
+                        # 注意此处 id 变动了，为了确保回传成功，目前没不良影响。多版本不同支线的情况极少，emby 自身也是没区分。
+                        ep['item_id'] = _media_source[0].get('ItemId') or _media_source[0]['Id']  # jellyfin/10.11.1 是 Id
+                        logger.info('strm: total_sec found by recheck server data')
+                    else:
+                        check_miss_runtime_start_sec(netloc, item_id, basename, stop_sec=_stop_sec)
+                        logger.info(f'strm: recheck failed, cache start_sec={_stop_sec} | {basename}')
 
-                total_sec = self.playlist_total_sec.get(key) or _total_sec
-                _skip = True
-                if total_sec:
-                    ep['total_sec'] = total_sec
-                    if _stop_sec / total_sec > 0.9 or _total_sec:
-                        update_server_playback_progress(stop_sec=_stop_sec, data=ep)
-                        _skip = False
-                _skip and logger.info(f"skip update progress, {ep['basename']} miss runtime data")
-            else:
-                if emby_strm_miss_runtime and mpv_total_sec:
-                    ep['total_sec'] = mpv_total_sec
-                # realtime_playing_request_sender(cur_sec=_stop_sec, data=ep, method='start')
-                # # time.sleep(1)
-                # # emby 的 simkl 插件 回传由 Progress 触发，可能会造成后台残留正在播放。
-                # # simkl 插件有全局 30 秒静默冷却时间，以及只回传首次。
-                # realtime_playing_request_sender(cur_sec=_stop_sec, data=ep, method='playing')
-                # realtime_playing_request_sender(cur_sec=_stop_sec, data=ep, method='end')
-                update_server_playback_progress(stop_sec=_stop_sec, data=ep)
-            need_update_eps.append(ep)
+                    total_sec = self.playlist_total_sec.get(key) or _total_sec
+                    _skip = True
+                    if total_sec:
+                        ep['total_sec'] = total_sec
+                        if _stop_sec / total_sec > 0.9 or _total_sec:
+                            update_server_playback_progress(stop_sec=_stop_sec, data=ep)
+                            _skip = False
+                    _skip and logger.info(f"skip update progress, {ep['basename']} miss runtime data")
+                else:
+                    if emby_strm_miss_runtime and mpv_total_sec:
+                        ep['total_sec'] = mpv_total_sec
+                    # realtime_playing_request_sender(cur_sec=_stop_sec, data=ep, method='start')
+                    # # time.sleep(1)
+                    # # emby 的 simkl 插件 回传由 Progress 触发，可能会造成后台残留正在播放。
+                    # # simkl 插件有全局 30 秒静默冷却时间，以及只回传首次。
+                    # realtime_playing_request_sender(cur_sec=_stop_sec, data=ep, method='playing')
+                    # realtime_playing_request_sender(cur_sec=_stop_sec, data=ep, method='end')
+                    update_server_playback_progress(stop_sec=_stop_sec, data=ep)
+                need_update_eps.append(ep)
+            except Exception as error:
+                # 单集回传失败（网络、数据缺失等）不能中断其余集数的回传。
+                logger.error(f'update progress failed, {ep["basename"]=} {_stop_sec=} error={error!r}')
         threading.Thread(target=self.prefetch_next_ep_playback_info, daemon=True).start()
         if not need_update_eps:
             return
