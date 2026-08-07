@@ -23,7 +23,6 @@ $rootFiles = @(
     'embyToLocalPlayer.py',
     'embyToLocalPlayer_config.ini',
     'README.md',
-    'FUNCTIONS.md',
     'LICENSE',
     'requirements.txt'
 )
@@ -33,6 +32,13 @@ foreach ($file in $rootFiles) {
 
 foreach ($dir in @('utils', 'third_party', 'user_script')) {
     Copy-Item -Path (Join-Path $root $dir) -Destination $staging -Recurse -Force
+}
+
+# Ship the Windows launcher at the package root so it can be run directly,
+# matching the standalone install layout (it lives under utils/others/ in git).
+$launcher = Join-Path $root 'utils\others\embyToLocalPlayer_debug.bat'
+if (Test-Path -LiteralPath $launcher) {
+    Copy-Item -LiteralPath $launcher -Destination (Join-Path $staging 'embyToLocalPlayer_debug.bat') -Force
 }
 
 # Remove bytecode caches and other non-runtime files from the package.
