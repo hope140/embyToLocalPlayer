@@ -94,6 +94,8 @@ class FakeSessionApi:
         self.sessions = 0
         self.calls = []
         self.find_results = []
+        self.item_id = 'item-1'
+        self.media_source_id = 'source-1'
 
     def find_session(self, play_session_id=None):
         self.sessions += 1
@@ -114,6 +116,13 @@ class FakeSessionApi:
 
     def report_stopped(self, **kwargs):
         self.reports.append(('stopped', kwargs))
+
+    def switch_playback_item(self, item_id=None, media_source_id=None):
+        self.calls.append(('switch_playback_item', item_id, media_source_id))
+        if item_id is not None:
+            self.item_id = item_id
+        if media_source_id is not None:
+            self.media_source_id = media_source_id
 
 
 class FakeWebSocket:
@@ -690,6 +699,67 @@ class RemoteControlClientTests(unittest.TestCase):
             self.assertIn('Version: 1.8.0', metadata)
             self.assertIn('License: Apache-2.0', metadata)
             self.assertIn('websocket_client-1.8.0.dist-info/LICENSE', names)
+
+    def test_media_title_change_switches_reported_item(self):
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+            episodes_by_title={
+                'EP1': {'item_id': 'item-1', 'media_source_id': 'source-1'},
+                'EP2': {'item_id': 'item-2', 'media_source_id': 'source-2'},
+            },
+        )
+        self.assertTrue(client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False, 'media_title': 'EP1'}, now=0))
+        self.assertEqual(self.api.reports[-1][0], 'playing')
+
+        self.assertTrue(client.publish_snapshot(
+            {'position_sec': 12, 'is_paused': False, 'media_title': 'EP2'}, now=11))
+        self.assertIn(('switch_playback_item', 'item-2', 'source-2'), self.api.calls)
+        self.assertEqual(self.api.item_id, 'item-2')
+        self.assertEqual(self.api.media_source_id, 'source-2')
+        # A fresh Playing for EP2 was reported; the position reset may also
+        # trigger an immediate Progress in the same publish.
+        self.assertIn('playing', [report[0] for report in self.api.reports])
+
+        # Progress reports after the switch keep using the new item.
+        self.assertTrue(client.publish_snapshot(
+            {'position_sec': 13, 'is_paused': False, 'media_title': 'EP2'}, now=22))
+        self.assertEqual(self.api.reports[-1][0], 'progress')
+        self.assertEqual(self.api.item_id, 'item-2')
+
+    def test_unknown_media_title_does_not_switch(self):
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+            episodes_by_title={'EP1': {'item_id': 'item-1', 'media_source_id': 'source-1'}},
+        )
+        self.assertTrue(client.publish_snapshot(
+            {'position_sec': 10, 'is_paused': False, 'media_title': 'EP1'}, now=0))
+        self.assertTrue(client.publish_snapshot(
+            {'position_sec': 12, 'is_paused': False, 'media_title': 'EP9'}, now=11))
+        self.assertEqual(self.api.reports[-1][0], 'progress')
+        self.assertNotIn(('switch_playback_item', 'item-9', 'source-9'), self.api.calls)
+        self.assertEqual(self.api.item_id, 'item-1')
+
+    def test_switch_playback_item_updates_payload_item(self):
+        requests = []
+
+        def request(url, **kwargs):
+            requests.append((url, kwargs))
+            return {'SessionId': 'server-session'}
+
+        api = EmbySessionApi({
+            'scheme': 'http', 'netloc': 'media.test', 'api_key': 'token',
+            'user_id': 'user-1', 'play_session_id': 'session',
+            'item_id': 'item-1', 'media_source_id': 'source-1',
+        }, request_func=request)
+        api.switch_playback_item(item_id='item-2', media_source_id='source-2')
+        api.report_progress(position_sec=5)
+        payload = requests[-1][1]['_json']
+        self.assertEqual(payload['ItemId'], 'item-2')
+        self.assertEqual(payload['MediaSourceId'], 'source-2')
+        self.assertEqual(payload['PlaySessionId'], 'session')
 
     def test_bundled_websocket_fallback_in_isolated_subprocess(self):
         script = "\n".join((
