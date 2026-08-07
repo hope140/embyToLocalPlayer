@@ -175,9 +175,12 @@ class RemoteControlClient:
                  remote_control_enabled=None, ws_factory=None, report_interval=10.0,
                  heartbeat_interval=20.0, ws_timeout=0.5, reconnect_min=1.0,
                  reconnect_max=30.0, seek_threshold=3.0, snapshot_interval=0.2,
-                 clock=None):
+                 clock=None, episodes_by_title=None):
         self.data = data or {}
         self.player = player or mpv
+        # media-title -> episode data mapping for the current playlist.  Used
+        # to follow mpv into the next episode without losing the Emby session.
+        self.episodes_by_title = episodes_by_title or {}
         # ``enabled`` is the historical constructor override.  Keep it for
         # callers/tests while offering descriptive remote-control spellings for
         # new integrations.  The most explicit value wins.
@@ -601,6 +604,11 @@ class RemoteControlClient:
                 )
             return result
 
+        media_title = snapshot.get('media_title')
+        if media_title and media_title != self._last_snapshot.get('media_title'):
+            if self._switch_playback_item(media_title, position, paused, playback_rate):
+                self._last_report_at = now
+
         previous_position = self._last_position
         previous_pause = self._last_pause
         last_snapshot_at = self._last_snapshot_at if self._last_snapshot_at is not None else now
@@ -684,6 +692,35 @@ class RemoteControlClient:
                     'status=failed'
                 )
                 return False
+
+    def _switch_playback_item(self, media_title, position, paused, playback_rate):
+        """Point the active Emby session at the newly playing playlist episode.
+
+        mpv advances through etlp's playlist without ending the process, so the
+        reported ItemId/MediaSourceId must follow the current media-title.
+        Otherwise Emby keeps showing the previous episode with a moving
+        position until playback stops.
+        """
+        ep = self.episodes_by_title.get(media_title)
+        if not ep:
+            return False
+        switch = getattr(self.session_api, 'switch_playback_item', None)
+        if switch is None:
+            return False
+        try:
+            switch(item_id=ep.get('item_id'), media_source_id=ep.get('media_source_id'))
+        except Exception as exc:
+            logger.info(f'remote-control item switch failed: {str(exc)[:120]}')
+            return False
+        result = self._report(
+            'report_playing', position, paused, 'TimeUpdate', playback_rate,
+        )
+        if result:
+            logger.info(
+                'remote-control switched item '
+                f'title_hash={_short_hash(media_title)}'
+            )
+        return result
 
     def _report_stopped(self):
         with self._report_lock:
