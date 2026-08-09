@@ -28,12 +28,18 @@ first launch because binary extensions cannot be imported directly from a zip
 archive.  The cache is machine-generated and is intentionally excluded from
 source packages.
 
+The HTTP dependency wheels are pinned to these releases and are downloaded
+unchanged from the official PyPI file host:
+
+- `requests==2.32.5`: [wheel](https://files.pythonhosted.org/packages/1e/db/4254e3eabe8020b458f1a747140d32277ec7a271daf1d235b70dc0b4e6e3/requests-2.32.5-py3-none-any.whl), SHA256 `2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6`
+- `urllib3==2.6.3`: [wheel](https://files.pythonhosted.org/packages/39/08/aaaad47bc4e9dc8c725e68f9d04865dbcb2052843ff09c97b08904852d84/urllib3-2.6.3-py3-none-any.whl), SHA256 `bf272323e553dfb2e87d9bfd225ca7b0f467b919d7bbd355436d3fd37cb0acd4`
+- `idna==3.15`: [wheel](https://files.pythonhosted.org/packages/d2/23/408243171aa9aaba178d3e2559159c24c1171a641aa83b67bdd3394ead8e/idna-3.15-py3-none-any.whl), SHA256 `048adeaf8c2d788c40fee287673ccaa74c24ffd8dcf09ffa555a2fbb59f10ac8`
+
 ## Upgrading
 
-Do not edit the wheel by hand.  To update it, download the `py3-none-any`
-wheel for the intended version directly from the matching official PyPI
-release, verify it with `Get-FileHash -Algorithm SHA256` (or
-`hashlib.sha256`), replace the file unchanged, and update the filename,
-hard-coded digest in `utils/remote_control_client.py`, tests, and this note.
-Keep `requirements.txt` pinned to the same version until the replacement has
-been reviewed.
+Do not edit a wheel by hand.  To update one, download the `py3-none-any` wheel
+for the intended version directly from the matching official PyPI release,
+verify it with `Get-FileHash -Algorithm SHA256` (or `hashlib.sha256`), replace
+the file unchanged, and update the filename, digest mapping in
+`utils/dependency_bootstrap.py`, tests, and this note.  Keep `requirements.txt`
+pinned to the same version until the replacement has been reviewed.
