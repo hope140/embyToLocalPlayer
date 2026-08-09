@@ -13,6 +13,7 @@ if (-not $OutputDirectory) {
 
 $staging = Join-Path $OutputDirectory 'etlp-remote-control-beta'
 $archivePath = Join-Path $OutputDirectory 'etlp-remote-control-beta.zip'
+$checksumPath = "$archivePath.sha256"
 
 if (Test-Path -LiteralPath $staging) {
     [System.IO.Directory]::Delete($staging, $true)
@@ -63,5 +64,14 @@ if (Test-Path -LiteralPath $archivePath) {
 }
 Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $archivePath -Force
 
+$archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+$utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+[System.IO.File]::WriteAllText(
+    $checksumPath,
+    "$archiveHash  $(Split-Path -Leaf $archivePath)$([Environment]::NewLine)",
+    $utf8NoBom
+)
+
 Write-Output "==> package folder: $staging"
 Write-Output "==> archive: $archivePath"
+Write-Output "==> checksum: $checksumPath"

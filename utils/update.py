@@ -1,5 +1,7 @@
+import hashlib
 import os
 import os.path
+import re
 import stat
 import shutil
 import sys
@@ -12,8 +14,74 @@ from utils.configs import configs
 from utils.net_tools import requests_urllib
 
 
+PACKAGE_ASSET = 'etlp-remote-control-beta.zip'
 UPDATE_URL = 'https://github.com/hope140/embyToLocalPlayer/releases/latest/download/etlp-remote-control-beta.zip'
+CHECKSUM_URL = 'https://github.com/hope140/embyToLocalPlayer/releases/latest/download/etlp-remote-control-beta.zip.sha256'
 CONFIG_PREFIX = 'embyToLocalPlayer_config'
+
+_CHECKSUM_RECORD = re.compile(r'(?P<digest>[0-9a-fA-F]{64}) {2}(?P<filename>\S+)')
+
+
+def parse_checksum(checksum_text):
+    """Parse the one-record sidecar for the fixed beta package asset."""
+    if isinstance(checksum_text, bytes):
+        try:
+            checksum_text = checksum_text.decode('utf-8')
+        except UnicodeDecodeError as exc:
+            raise ValueError('checksum file is not valid UTF-8 text') from exc
+    if not isinstance(checksum_text, str):
+        raise ValueError('checksum response must be text')
+
+    records = [line for line in checksum_text.splitlines() if line.strip()]
+    if len(records) != 1:
+        raise ValueError(
+            f'checksum file must contain exactly one non-empty record; found {len(records)}')
+
+    match = _CHECKSUM_RECORD.fullmatch(records[0])
+    if match is None:
+        raise ValueError('checksum record must contain 64 hex characters, two spaces, and a filename')
+    filename = match.group('filename')
+    if filename != PACKAGE_ASSET:
+        raise ValueError(f'checksum filename does not match expected asset {PACKAGE_ASSET!r}')
+    return match.group('digest').lower()
+
+
+def calculate_sha256(path, chunk_size=1024 * 1024):
+    """Return a file's SHA256 digest while reading it in bounded chunks."""
+    if chunk_size <= 0:
+        raise ValueError('SHA256 chunk size must be positive')
+    digest = hashlib.sha256()
+    with open(path, 'rb') as source:
+        for chunk in iter(lambda: source.read(chunk_size), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_verified_update(cwd):
+    """Download and verify the update archive, returning its live archive path."""
+    cwd = Path(cwd)
+    zip_path = cwd / 'embyToLocalPlayer.zip'
+    zip_part_path = Path(f'{zip_path}.part')
+    try:
+        checksum_text = requests_urllib(CHECKSUM_URL, decode=True)
+        expected_digest = parse_checksum(checksum_text)
+
+        requests_urllib(UPDATE_URL, save_path=str(zip_part_path))
+        if not zip_part_path.is_file():
+            raise FileNotFoundError('update archive download did not produce a file')
+        actual_digest = calculate_sha256(zip_part_path)
+        if actual_digest != expected_digest:
+            raise ValueError(
+                f'update archive SHA256 mismatch: expected {expected_digest}, got {actual_digest}')
+
+        os.replace(str(zip_part_path), str(zip_path))
+        return str(zip_path)
+    except Exception:
+        try:
+            zip_part_path.unlink()
+        except OSError:
+            pass
+        raise
 
 # Keep the updater in lockstep with scripts/package_beta.ps1. The release asset
 # is the exact runtime archive produced by that script, while the allowlist
@@ -222,15 +290,14 @@ def main():
     print('#' * 50)
 
     print(f'{configs.script_proxy=}')
-    print('downloading...')
-    zip_path = os.path.join(cwd, 'embyToLocalPlayer.zip')
-    requests_urllib(UPDATE_URL, save_path=zip_path)
-
-    pycache = os.path.join(cwd, 'utils', '__pycache__')
-    shutil.rmtree(pycache, ignore_errors=True)
+    print('downloading checksum and archive...')
+    zip_path = download_verified_update(cwd)
 
     print('unpacking...')
     prefix = extract_update_archive(zip_path, cwd, ini_example)
+    # Do not remove caches until verified extraction has completed successfully.
+    pycache = os.path.join(cwd, 'utils', '__pycache__')
+    shutil.rmtree(pycache, ignore_errors=True)
     print(f'\nnew example {ini_example}; archive prefix={prefix!r}')
 
     check_ini_diff(old_path=ini_old, new_path=ini_example, diff_path=diff_path)

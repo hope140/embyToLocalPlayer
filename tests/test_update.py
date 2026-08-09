@@ -1,3 +1,4 @@
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,10 @@ class UpdateArchiveTests(unittest.TestCase):
         self.assertEqual(
             update.UPDATE_URL,
             "https://github.com/hope140/embyToLocalPlayer/releases/latest/download/etlp-remote-control-beta.zip",
+        )
+        self.assertEqual(
+            update.CHECKSUM_URL,
+            "https://github.com/hope140/embyToLocalPlayer/releases/latest/download/etlp-remote-control-beta.zip.sha256",
         )
         self.assertIn("releases/latest/download", update.UPDATE_URL)
 
@@ -139,6 +144,138 @@ class UpdateArchiveTests(unittest.TestCase):
             archive = self._archive(root, [("embyToLocalPlayer_config.ini", "[emby]\n")])
             with mock.patch.object(update, "requests_urllib", side_effect=AssertionError("network")):
                 update.extract_update_archive(archive, root / "out", root / "example.ini", is_windows=False)
+
+
+class UpdateDownloadTests(unittest.TestCase):
+    def _stub_download(self, archive_payload, checksum_text):
+        calls = []
+
+        def fake_requests(url, **kwargs):
+            calls.append((url, kwargs))
+            if url == update.CHECKSUM_URL:
+                return checksum_text
+            if url == update.UPDATE_URL:
+                Path(kwargs["save_path"]).write_bytes(archive_payload)
+                return kwargs["save_path"]
+            raise AssertionError(f"unexpected URL: {url}")
+
+        return calls, fake_requests
+
+    def test_checksum_parser_accepts_single_record_and_normalises_case(self):
+        digest = "A" * 64
+        self.assertEqual(
+            update.parse_checksum(f"{digest}  {update.PACKAGE_ASSET}\n"),
+            digest.lower(),
+        )
+
+    def test_checksum_parser_rejects_multiple_records_invalid_hex_and_wrong_name(self):
+        valid = "a" * 64
+        invalid_records = (
+            f"{valid}  {update.PACKAGE_ASSET}\n{valid}  {update.PACKAGE_ASSET}\n",
+            f"{'g' * 64}  {update.PACKAGE_ASSET}\n",
+            f"{valid} {update.PACKAGE_ASSET}\n",
+            f"{valid}  other.zip\n",
+        )
+        for checksum_text in invalid_records:
+            with self.subTest(checksum_text=checksum_text):
+                with self.assertRaises(ValueError):
+                    update.parse_checksum(checksum_text)
+
+    def test_verified_download_replaces_archive_atomically_and_keeps_pycache(self):
+        payload = b"verified update archive"
+        digest = hashlib.sha256(payload).hexdigest()
+        checksum_text = f"{digest}  {update.PACKAGE_ASSET}\n"
+        calls, fake_requests = self._stub_download(payload, checksum_text)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            live_archive = root / "embyToLocalPlayer.zip"
+            live_archive.write_bytes(b"old archive")
+            pycache = root / "utils" / "__pycache__"
+            pycache.mkdir(parents=True)
+            marker = pycache / "keep.pyc"
+            marker.write_bytes(b"old bytecode")
+
+            with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+                result = update.download_verified_update(root)
+
+            self.assertEqual(Path(result), live_archive)
+            self.assertEqual(live_archive.read_bytes(), payload)
+            self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
+            self.assertTrue(marker.exists())
+            self.assertEqual([url for url, _ in calls], [update.CHECKSUM_URL, update.UPDATE_URL])
+            self.assertEqual(calls[1][1]["save_path"], str(root / "embyToLocalPlayer.zip.part"))
+
+    def test_checksum_mismatch_cleans_part_without_changing_live_files(self):
+        payload = b"downloaded bytes that do not match"
+        expected = hashlib.sha256(b"different bytes").hexdigest()
+        calls, fake_requests = self._stub_download(
+            payload,
+            f"{expected}  {update.PACKAGE_ASSET}\n",
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            live_archive = root / "embyToLocalPlayer.zip"
+            live_archive.write_bytes(b"old archive")
+            pycache = root / "utils" / "__pycache__"
+            pycache.mkdir(parents=True)
+            marker = pycache / "keep.pyc"
+            marker.write_bytes(b"old bytecode")
+
+            with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+                with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+                    update.download_verified_update(root)
+
+            self.assertEqual(live_archive.read_bytes(), b"old archive")
+            self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
+            self.assertTrue(marker.exists())
+            self.assertEqual([url for url, _ in calls], [update.CHECKSUM_URL, update.UPDATE_URL])
+
+    def test_malformed_checksum_does_not_download_or_change_live_files(self):
+        calls, fake_requests = self._stub_download(b"unused", "not a checksum\n")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            live_archive = root / "embyToLocalPlayer.zip"
+            live_archive.write_bytes(b"old archive")
+            part = root / "embyToLocalPlayer.zip.part"
+            part.write_bytes(b"stale partial archive")
+
+            with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+                with self.assertRaises(ValueError):
+                    update.download_verified_update(root)
+
+            self.assertEqual(live_archive.read_bytes(), b"old archive")
+            self.assertFalse(part.exists())
+            self.assertEqual([url for url, _ in calls], [update.CHECKSUM_URL])
+
+    def test_archive_download_exception_cleans_partial_file(self):
+        payload = b"partial archive"
+        checksum = hashlib.sha256(payload).hexdigest()
+        calls = []
+
+        def failing_requests(url, **kwargs):
+            calls.append((url, kwargs))
+            if url == update.CHECKSUM_URL:
+                return f"{checksum}  {update.PACKAGE_ASSET}\n"
+            if url == update.UPDATE_URL:
+                Path(kwargs["save_path"]).write_bytes(payload)
+                raise OSError("simulated download failure")
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            live_archive = root / "embyToLocalPlayer.zip"
+            live_archive.write_bytes(b"old archive")
+
+            with mock.patch.object(update, "requests_urllib", side_effect=failing_requests):
+                with self.assertRaisesRegex(OSError, "simulated download failure"):
+                    update.download_verified_update(root)
+
+            self.assertEqual(live_archive.read_bytes(), b"old archive")
+            self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
+            self.assertEqual([url for url, _ in calls], [update.CHECKSUM_URL, update.UPDATE_URL])
 
 
 if __name__ == "__main__":
