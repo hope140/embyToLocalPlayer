@@ -175,6 +175,71 @@ class LocalPathPreheatTests(unittest.TestCase):
 
         self.assertEqual([c.args[0] for c in preheat.call_args_list], ['Z:/a.mkv', 'Z:/b.mkv'])
 
+    def test_preheat_local_media_paths_defers_path_checks_to_daemon_coordinator(self):
+        config = self.make_config(strm_local_path_preheat='yes')
+        path_check_started = threading.Event()
+        release_path_check = threading.Event()
+        threads = []
+        real_thread = threading.Thread
+
+        def blocking_isfile(path):
+            path_check_started.set()
+            release_path_check.wait(1)
+            return True
+
+        class DeferredThread:
+            def __init__(self, target, args=(), kwargs=None, name=None, daemon=None):
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs or {}
+                self.name = name
+                self.daemon = daemon
+                threads.append(self)
+
+            def start(self):
+                return None
+
+        try:
+            with mock.patch.object(tools.configs, 'raw', config), \
+                    mock.patch.object(tools.os.path, 'isfile', side_effect=blocking_isfile), \
+                    mock.patch.object(tools.threading, 'Thread', DeferredThread), \
+                    mock.patch.object(tools, '_preheat_local_media_path'):
+                tools.preheat_local_media_paths(['Z:/a.mkv'])
+
+                self.assertEqual(len(threads), 1)
+                coordinator = threads[0]
+                self.assertTrue(coordinator.daemon)
+                self.assertEqual(coordinator.name, 'etlp-strm-next-preheat-coordinator')
+                self.assertFalse(path_check_started.is_set())
+
+                coordinator_thread = real_thread(
+                    target=coordinator.target,
+                    args=coordinator.args,
+                    kwargs=coordinator.kwargs,
+                    daemon=True,
+                )
+                coordinator_thread.start()
+                self.assertTrue(path_check_started.wait(1))
+                self.assertTrue(coordinator_thread.is_alive())
+                release_path_check.set()
+                coordinator_thread.join(1)
+        finally:
+            release_path_check.set()
+            if 'coordinator_thread' in locals():
+                coordinator_thread.join(1)
+
+    def test_preheat_local_media_paths_does_not_start_when_disabled_or_limit_nonpositive(self):
+        for config, limit in (
+                (self.make_config(strm_local_path_preheat='no'), 2),
+                (self.make_config(strm_local_path_preheat='yes'), 0),
+                (self.make_config(strm_local_path_preheat='yes'), -1)):
+            with self.subTest(limit=limit, enabled=config.get('dev', 'strm_local_path_preheat')):
+                with mock.patch.object(tools.configs, 'raw', config), \
+                        mock.patch.object(tools.threading, 'Thread') as thread:
+                    tools.preheat_local_media_paths(['Z:/a.mkv'], limit=limit)
+
+                thread.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

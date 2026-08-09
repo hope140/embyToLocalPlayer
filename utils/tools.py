@@ -378,16 +378,35 @@ def preheat_local_media_paths(media_paths, limit=2):
         timeout = max(0, config.getfloat('dev', 'strm_local_path_preheat_timeout_seconds', fallback=3))
     except ValueError:
         timeout = 3
-    for media_path in media_paths:
-        if not media_path or media_path.startswith(('http://', 'https://')) or not os.path.isfile(media_path):
-            continue
-        if limit <= 0:
-            break
-        limit -= 1
-        threading.Thread(
-            target=_preheat_local_media_path,
-            args=(media_path, read_bytes, timeout),
-            name='etlp-strm-next-preheat', daemon=True).start()
+
+    candidates = [
+        media_path for media_path in media_paths
+        if media_path and not media_path.startswith(('http://', 'https://'))
+    ]
+
+    def schedule_preheat():
+        remaining = limit
+        for media_path in candidates:
+            if remaining <= 0:
+                break
+            try:
+                media_path_exists = os.path.isfile(media_path)
+            except OSError as error:
+                _logger.warn(
+                    f'strm local path preheat path check failed, {media_path}, '
+                    f'error={error!r}')
+                continue
+            if not media_path_exists:
+                continue
+            remaining -= 1
+            threading.Thread(
+                target=_preheat_local_media_path,
+                args=(media_path, read_bytes, timeout),
+                name='etlp-strm-next-preheat', daemon=True).start()
+
+    threading.Thread(
+        target=schedule_preheat,
+        name='etlp-strm-next-preheat-coordinator', daemon=True).start()
 
 
 def get_player_cmd(media_path, file_path, data=None):
