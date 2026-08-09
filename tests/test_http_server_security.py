@@ -119,6 +119,34 @@ class HttpServerRouteTests(unittest.TestCase):
         status, _ = self._post('/openFolder.evil', {}, headers={'X-ETLP-Protocol': '1'})
         self.assertEqual(status, 404)
 
+    def test_emby_and_plex_threads_use_parsed_payload(self):
+        raw = ConfigParser()
+        raw.read_dict({'gui': {'enable_path': '', 'without_confirm': 'no'}})
+        original_payload = {'server': 'raw payload'}
+        for route, parser_name in (
+                ('/embyToLocalPlayer/', 'parse_received_data_emby'),
+                ('/plexToLocalPlayer/', 'parse_received_data_plex')):
+            with self.subTest(route=route):
+                parsed_payload = {
+                    'server': 'parsed server',
+                    'server_version': '1',
+                    'mount_disk_mode': False,
+                    'netloc': 'media.example',
+                    'file_path': r'C:\Media\movie.mp4',
+                }
+                handler = object.__new__(http_server.UserScriptRequestHandler)
+                with mock.patch.object(http_server.configs, 'raw', raw), \
+                        mock.patch.object(http_server.configs, 'gui_is_enable', False), \
+                        mock.patch.object(http_server.configs, 'check_str_match', return_value=False), \
+                        mock.patch.object(http_server, parser_name, return_value=parsed_payload), \
+                        mock.patch.object(http_server.threading, 'Thread') as thread_cls:
+                    handler._dispatch_post(route, original_payload)
+
+                play_calls = [call for call in thread_cls.call_args_list
+                              if call.kwargs.get('target') is http_server.start_play]
+                self.assertEqual(len(play_calls), 1)
+                self.assertIs(play_calls[0].kwargs['args'][0], parsed_payload)
+
     def _post_sparse(self, payload):
         cache_dir = tempfile.mkdtemp()
         raw = ConfigParser()

@@ -260,19 +260,18 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             create_sparse_file(target, size)
             return {'sparse_file': True}
 
-        thread_dict = {
-            'play': threading.Thread(target=start_play, args=(data,)),
-            'play_check': threading.Thread(target=dl_manager.play_check, args=(data,)),
-            'download_play': threading.Thread(target=dl_manager.download_play, args=(data,)),
-            'download_not_play': threading.Thread(target=dl_manager.download_play, args=(data, False)),
-            'download_only': threading.Thread(target=dl_manager.download_only, args=(data,)),
-            'delete_by_id': threading.Thread(target=dl_manager.delete, args=({}, data.get('_id'))),
-            'delete': threading.Thread(target=dl_manager.delete, args=(data,)),
-            'resume_or_pause': threading.Thread(target=dl_manager.resume_or_pause, args=(data,)),
-        }
-        [setattr(t, 'daemon', True) for t in thread_dict.values()]
-
         if canonical_path in ('/gui', '/dl', '/pl'):
+            thread_dict = {
+                'play': threading.Thread(target=start_play, args=(data,)),
+                'play_check': threading.Thread(target=dl_manager.play_check, args=(data,)),
+                'download_play': threading.Thread(target=dl_manager.download_play, args=(data,)),
+                'download_not_play': threading.Thread(target=dl_manager.download_play, args=(data, False)),
+                'download_only': threading.Thread(target=dl_manager.download_only, args=(data,)),
+                'delete_by_id': threading.Thread(target=dl_manager.delete, args=({}, data.get('_id'))),
+                'delete': threading.Thread(target=dl_manager.delete, args=(data,)),
+                'resume_or_pause': threading.Thread(target=dl_manager.resume_or_pause, args=(data,)),
+            }
+            [setattr(t, 'daemon', True) for t in thread_dict.values()]
             gui_cmd = data.get('gui_cmd')
             if gui_cmd not in thread_dict:
                 raise ValueError('unknown gui command')
@@ -290,6 +289,17 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             data = parse_received_data_emby(data) if canonical_path == '/embyToLocalPlayer' \
                 else parse_received_data_plex(data)
             logger.info(f"server={data['server']}/{data.get('server_version')} {data['mount_disk_mode']=}")
+            thread_dict = {
+                'play': threading.Thread(target=start_play, args=(data,)),
+                'play_check': threading.Thread(target=dl_manager.play_check, args=(data,)),
+                'download_play': threading.Thread(target=dl_manager.download_play, args=(data,)),
+                'download_not_play': threading.Thread(target=dl_manager.download_play, args=(data, False)),
+                'download_only': threading.Thread(target=dl_manager.download_only, args=(data,)),
+                'delete_by_id': threading.Thread(target=dl_manager.delete, args=({}, data.get('_id'))),
+                'delete': threading.Thread(target=dl_manager.delete, args=(data,)),
+                'resume_or_pause': threading.Thread(target=dl_manager.resume_or_pause, args=(data,)),
+            }
+            [setattr(t, 'daemon', True) for t in thread_dict.values()]
             if configs.check_str_match(_str=data['netloc'], section='gui', option='except_host'):
                 threading.Thread(target=start_play, args=(data,), daemon=True).start()
                 return None
