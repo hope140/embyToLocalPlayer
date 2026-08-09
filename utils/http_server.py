@@ -117,6 +117,15 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
     def _server_token(self):
         return configs.raw.get('dev', 'http_server_token', fallback='').strip()
 
+    def _header(self, name, default=None):
+        value = self.headers.get(name)
+        if value is not None:
+            return value
+        for key, value in self.headers.items():
+            if key.lower() == name.lower():
+                return value
+        return default
+
     def log_message(self, _format, *args):
         # BaseHTTPRequestHandler's default request-line log includes the query
         # string.  Keep only the route and status so tokens/signatures cannot
@@ -150,13 +159,13 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         self._send_json_response({'error': message}, status)
 
     def _read_json_body(self):
-        content_type = self.headers.get('Content-Type', '')
+        content_type = self._header('Content-Type', '')
         media_type = content_type.split(';', 1)[0].strip().lower()
         if media_type != 'application/json':
             self._send_error(400, 'Content-Type must be application/json')
             return None
 
-        length_header = self.headers.get('Content-Length')
+        length_header = self._header('Content-Length')
         if length_header is None:
             self._send_error(400, 'Content-Length is required')
             return None
@@ -191,7 +200,7 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             token = self._server_token()
             if not token:
                 self._send_error(401, 'Authorization required')
-            elif not bearer_token_valid(self.headers.get('Authorization'), token):
+            elif not bearer_token_valid(self._header('Authorization'), token):
                 self._send_error(401, 'Authorization invalid')
             else:
                 return True
@@ -315,7 +324,7 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         if not token:
             self._send_error(401, 'Authorization required')
             return False
-        if not bearer_token_valid(self.headers.get('Authorization'), token):
+        if not bearer_token_valid(self._header('Authorization'), token):
             self._send_error(401, 'Authorization invalid')
             return False
         return True
