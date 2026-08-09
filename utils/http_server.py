@@ -13,6 +13,9 @@ from socketserver import ThreadingMixIn
 from utils.data_parser import parse_received_data_emby, parse_received_data_plex, list_episodes
 from utils.clouddrive2_gateway import configure_gateway, gateway
 from utils.downloader import DownloadManager
+from utils.http_security import (ETLP_PROTOCOL_HEADER, bearer_token_valid,
+                                 is_loopback_address, media_url_signature_valid,
+                                 protocol_header_valid)
 from utils.net_tools import (realtime_playing_request_sender, update_server_playback_progress)
 from utils.player_manager import PlayerManager
 from utils.players import start_player_func_dict, stop_sec_func_dict
@@ -42,7 +45,14 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def run_server(ip='127.0.0.1', port=58000):
-    if not configs.raw.getboolean('dev', 'listen_on_localhost', fallback=True):
+    listen_on_localhost = configs.raw.getboolean('dev', 'listen_on_localhost', fallback=True)
+    if not listen_on_localhost:
+        token = configs.raw.get('dev', 'http_server_token', fallback='').strip()
+        if len(token) < 32:
+            raise ValueError(
+                '[dev] http_server_token is required (at least 32 characters) when '
+                'listen_on_localhost = no; generate one with secrets.token_urlsafe(32)'
+            )
         ip = get_machine_ip()
     server_address = (ip, port)
     httpd = ThreadingHTTPServer(server_address, UserScriptRequestHandler)
@@ -53,6 +63,17 @@ def run_server(ip='127.0.0.1', port=58000):
 
 
 class UserScriptRequestHandler(BaseHTTPRequestHandler):
+
+    MAX_POST_BODY_BYTES = 1024 * 1024
+    POST_ROUTES = {
+        '/gui', '/gui/', '/dl', '/dl/', '/pl', '/pl/',
+        '/embyToLocalPlayer', '/embyToLocalPlayer/',
+        '/plexToLocalPlayer', '/plexToLocalPlayer/',
+        '/openFolder', '/openFolder/',
+        '/playMediaFile', '/playMediaFile/',
+        '/action/sparse_file',
+    }
+    _MEDIA_PATH_RE = re.compile(r'^/send_media_file(?:\.[A-Za-z0-9]+)?$')
 
     @staticmethod
     def _is_client_disconnect_error(exc):
@@ -86,32 +107,113 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
                 raise
             logger.debug(f'http client disconnected while closing request: {exc}')
 
-    def _post_resopne(self, msg=None, status=200):
-        self.send_response(status)
-        self.send_header('Content-type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        msg = msg or {'msg': 'default'}
-        self.wfile.write(json.dumps(msg).encode('utf-8'))
+    def _request_path(self):
+        return urllib.parse.urlparse(getattr(self, 'path', '')).path
 
-    def do_POST(self):
-        length = int(self.headers.get('content-length'))
-        data = json.loads(self.rfile.read(length))
-        configs.update()
-        if 'ToLocalPlayer' in self.path:
-            self._post_resopne()
-            if data.get('showTaskManager'):
-                from utils.gui import show_task_manager
-                # multiprocessing.Process(target=show_task_manager, daemon=True).start()
-                # 多进程会复制 dl_manager 导致如果正在下载的话，会重复启动下载任务。
-                threading.Thread(target=show_task_manager, daemon=True).start()
-                # tkinter 不是线程安全的，可能会导致退出。
+    def _client_ip(self):
+        address = getattr(self, 'client_address', ('', 0))
+        return address[0] if address else ''
+
+    def _server_token(self):
+        return configs.raw.get('dev', 'http_server_token', fallback='').strip()
+
+    def log_message(self, _format, *args):
+        # BaseHTTPRequestHandler's default request-line log includes the query
+        # string.  Keep only the route and status so tokens/signatures cannot
+        # accidentally enter the regular request log.
+        status = args[1] if len(args) > 1 else ''
+        logger.info('http request', self.command, self._request_path(), status, self._client_ip())
+
+    def _send_json_response(self, msg=None, status=200):
+        if getattr(self, '_response_sent', False):
+            return False
+        self._response_sent = True
+        payload = {'msg': 'default'} if msg is None else msg
+        body = json.dumps(payload).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(body)
+        return True
+
+    def _post_response(self, msg=None, status=200):
+        return self._send_json_response(msg, status)
+
+    def _post_resopne(self, msg=None, status=200):
+        """Backward-compatible typo alias for the single-response helper."""
+
+        return self._post_response(msg, status)
+
+    def _send_error(self, status, message):
+        self._send_json_response({'error': message}, status)
+
+    def _read_json_body(self):
+        content_type = self.headers.get('Content-Type', '')
+        media_type = content_type.split(';', 1)[0].strip().lower()
+        if media_type != 'application/json':
+            self._send_error(400, 'Content-Type must be application/json')
+            return None
+
+        length_header = self.headers.get('Content-Length')
+        if length_header is None:
+            self._send_error(400, 'Content-Length is required')
+            return None
+        try:
+            length = int(length_header)
+        except (TypeError, ValueError):
+            self._send_error(400, 'Content-Length must be an integer')
+            return None
+        if length < 0:
+            self._send_error(400, 'Content-Length must not be negative')
+            return None
+        if length > self.MAX_POST_BODY_BYTES:
+            self._send_error(413, 'request body is too large')
+            return None
+        body = self.rfile.read(length)
+        if len(body) != length:
+            self._send_error(400, 'request body is incomplete')
+            return None
+        try:
+            data = json.loads(body.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_error(400, 'request body must be valid JSON')
+            return None
+        if not isinstance(data, dict):
+            self._send_error(400, 'request JSON must be an object')
+            return None
+        return data
+
+    def _authorize_post(self, path):
+        loopback = is_loopback_address(self._client_ip())
+        if path == '/action/sparse_file' and not loopback:
+            token = self._server_token()
+            if not token:
+                self._send_error(401, 'Authorization required')
+            elif not bearer_token_valid(self.headers.get('Authorization'), token):
+                self._send_error(401, 'Authorization invalid')
+            else:
                 return True
-            data = parse_received_data_emby(data) if self.path.startswith('/emby') else parse_received_data_plex(data)
-            logger.info(f"server={data['server']}/{data.get('server_version')} {data['mount_disk_mode']=}")
-            if configs.check_str_match(_str=data['netloc'], section='gui', option='except_host'):
-                threading.Thread(target=start_play, args=(data,), daemon=True).start()
-                return True
+            return False
+        if not loopback:
+            self._send_error(403, 'local action requires a loopback client')
+            return False
+        if not protocol_header_valid(self.headers):
+            self._send_error(403, f'{ETLP_PROTOCOL_HEADER}: 1 is required')
+            return False
+        return True
+
+    def _dispatch_post(self, path, data):
+        canonical_path = path.rstrip('/') or '/'
+        if canonical_path == '/action/sparse_file':
+            cache_dir = configs.raw.get('gui', 'server_cache_path', fallback='')
+            if not cache_dir:
+                logger.error('gui[server_cache_path] missing, check it')
+                raise ValueError('server cache path is not configured')
+            create_sparse_file(os.path.join(cache_dir, data['name']), data['size'])
+            return {'sparse_file': True}
+
         thread_dict = {
             'play': threading.Thread(target=start_play, args=(data,)),
             'play_check': threading.Thread(target=dl_manager.play_check, args=(data,)),
@@ -124,29 +226,35 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         }
         [setattr(t, 'daemon', True) for t in thread_dict.values()]
 
-        if self.path.startswith('/action'):
-            if self.path.endswith('sparse_file'):
-                cache_dir = configs.raw.get('gui', 'server_cache_path', fallback='')
-                if not cache_dir:
-                    logger.error('gui[server_cache_path] missing, check it')
-                    return
-                create_sparse_file(os.path.join(cache_dir, data['name']), data['size'])
-                return self._post_resopne({'sparse_file': True})
-
-        self._post_resopne()
-        if self.path in ('/gui', '/dl', '/pl'):
-            gui_cmd = data['gui_cmd']
-            logger.info(self.path, gui_cmd)
+        if canonical_path in ('/gui', '/dl', '/pl'):
+            gui_cmd = data.get('gui_cmd')
+            if gui_cmd not in thread_dict:
+                raise ValueError('unknown gui command')
+            logger.info('http action', canonical_path, gui_cmd)
             thread_dict[gui_cmd].start()
-        elif 'ToLocalPlayer' in self.path:
+            return None
+
+        if canonical_path in ('/embyToLocalPlayer', '/plexToLocalPlayer'):
+            if data.get('showTaskManager'):
+                from utils.gui import show_task_manager
+                # multiprocessing.Process would copy dl_manager and duplicate
+                # an active download task; keep this on a daemon thread.
+                threading.Thread(target=show_task_manager, daemon=True).start()
+                return None
+            data = parse_received_data_emby(data) if canonical_path == '/embyToLocalPlayer' \
+                else parse_received_data_plex(data)
+            logger.info(f"server={data['server']}/{data.get('server_version')} {data['mount_disk_mode']=}")
+            if configs.check_str_match(_str=data['netloc'], section='gui', option='except_host'):
+                threading.Thread(target=start_play, args=(data,), daemon=True).start()
+                return None
             if configs.gui_is_enable:
                 if configs.raw.get('gui', 'enable_path'):
                     if not configs.check_str_match(data['file_path'], 'gui', 'enable_path', log_by=False):
                         thread_dict['play'].start()
-                        return True
+                        return None
                 if configs.raw.getboolean('gui', 'without_confirm', fallback=False):
                     thread_dict['download_play'].start()
-                    return True
+                    return None
                 from utils.gui import show_ask_button
                 logger.info('show ask button')
                 if configs.platform != 'Darwin':
@@ -155,36 +263,89 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
                     multiprocessing.Process(target=show_ask_button, args=(data,), daemon=True).start()
             else:
                 thread_dict['play'].start()
-        elif 'openFolder' in self.path:
+            return None
+
+        if canonical_path == '/openFolder':
             open_local_folder(data)
-        elif 'playMediaFile' in self.path:
+            return None
+        if canonical_path == '/playMediaFile':
             play_media_file(data)
-        else:
-            logger.error(self.path, ' not allow')
-            self._post_resopne({'msg': f'{self.path} not allow'})
+            return None
+        raise ValueError('route not allowed')
+
+    def do_POST(self):
+        path = self._request_path()
+        if path not in self.POST_ROUTES:
+            self._send_error(404, 'route not found')
+            return
+        if not self._authorize_post(path):
+            return
+        data = self._read_json_body()
+        if data is None:
+            return
+        configs.update()
+        try:
+            response = self._dispatch_post(path, data)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            logger.error('http POST request rejected', path)
+            self._send_error(400, 'invalid request data')
+            return
+        except Exception as exc:
+            logger.error('http POST action failed', path, type(exc).__name__)
+            self._send_error(400, 'request action failed')
+            return
+        self._send_json_response(response)
 
     def do_OPTIONS(self):
-        pass
+        self._send_error(403, 'OPTIONS is not supported')
+
+    @classmethod
+    def _is_media_path(cls, path):
+        return bool(cls._MEDIA_PATH_RE.fullmatch(path))
+
+    @staticmethod
+    def _is_cd2_path(path):
+        parts = path.split('/')
+        return len(parts) == 3 and parts[1] == 'cd2' and bool(parts[2])
+
+    def _authorize_runtime_get(self):
+        if is_loopback_address(self._client_ip()):
+            return True
+        token = self._server_token()
+        if not token:
+            self._send_error(401, 'Authorization required')
+            return False
+        if not bearer_token_valid(self.headers.get('Authorization'), token):
+            self._send_error(401, 'Authorization invalid')
+            return False
+        return True
 
     def do_GET(self):
-        if self.path in ['/', '/favicon.ico']:
+        path = self._request_path()
+        if path in ('/', '/favicon.ico'):
             self.send_response(200)
+            self.send_header('Content-Length', str(len(b'Server is running')))
             self.end_headers()
             self.wfile.write(b'Server is running')
             return
-        if self.path.startswith('/send_media_file'):
+        if self._is_media_path(path):
             self.send_media_file()
             return
-        if self.path.startswith('/cd2/'):
+        if self._is_cd2_path(path):
             self.send_cd2_file()
             return
-        if self.path.startswith('/miss_runtime_start_sec'):
-            self.check_miss_runtime_start_sec()
+        if path == '/miss_runtime_start_sec':
+            if self._authorize_runtime_get():
+                self.check_miss_runtime_start_sec()
             return
-        logger.info(f'path invalid {self.path=}')
+        self._send_error(404, 'route not found')
 
     def do_HEAD(self):
-        if self.path.startswith('/cd2/'):
+        path = self._request_path()
+        if self._is_media_path(path):
+            self.send_media_file()
+            return
+        if self._is_cd2_path(path):
             self.send_cd2_file()
             return
         self.send_response(404)
@@ -195,31 +356,42 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
 
     def parse_get_query(self):
         parsed_path = urllib.parse.urlparse(self.path)
-        query = dict(urllib.parse.parse_qsl(parsed_path.query))
+        query = dict(urllib.parse.parse_qsl(parsed_path.query, keep_blank_values=True))
         return parsed_path, query
 
     def check_miss_runtime_start_sec(self):
-        parsed_path, query = self.parse_get_query()
+        _, query = self.parse_get_query()
         stop_sec = query.get('stop_sec')
-        netloc, item_id, basename = query.get('netloc'), query.get('item_id'), query.get('basename')
-        key = f'{netloc}-{item_id}'
-        self.send_response(200)
-        self.end_headers()
-        if stop_sec:
-            miss_runtime_start_sec[key] = int(float(stop_sec))
+        netloc, item_id = query.get('netloc'), query.get('item_id')
+        if not netloc or not item_id:
+            self._send_error(400, 'netloc and item_id are required')
             return
+        key = f'{netloc}-{item_id}'
+        if stop_sec is not None and stop_sec != '':
+            try:
+                value = float(stop_sec)
+                if value < 0 or value > 10 * 60 * 60:
+                    raise ValueError
+                miss_runtime_start_sec[key] = int(value)
+            except (TypeError, ValueError):
+                self._send_error(400, 'stop_sec must be a valid non-negative number')
+                return
         start_sec = miss_runtime_start_sec.get(key, 0)
-        self.return_json({'start_sec': start_sec})
+        self._send_json_response({'start_sec': start_sec})
 
     def send_media_file(self):
-        parsed_path, query = self.parse_get_query()
-        req_token = query.get('token', '')
-        server_token = configs.raw.get('dev', 'http_server_token', fallback='')
-        if req_token != server_token:
-            logger.info(f'req_token invalid: {req_token=} {server_token=}')
+        parsed_path = urllib.parse.urlparse(self.path)
+        pairs = urllib.parse.parse_qsl(parsed_path.query, keep_blank_values=True)
+        query = dict(pairs)
+        required = {'file_path', 'expires', 'sig'}
+        if len(pairs) != len(required) or set(query) != required:
+            self._send_error(400, 'file_path, expires and sig are required')
             return
-
-        video_path = urllib.parse.unquote(query['file_path'])
+        video_path = query['file_path']
+        if not media_url_signature_valid(self._server_token(), video_path,
+                                         query['expires'], query['sig']):
+            self._send_error(403, 'media URL signature invalid or expired')
+            return
 
         video_ext = ['webm', 'mkv', 'flv', 'vob', 'ogv', 'ogg', 'rrc', 'gifv', 'mng', 'mov', 'avi', 'qt', 'wmv', 'yuv',
                      'rm', 'asf', 'amv', 'mp4', 'm4p', 'm4v', 'mpg', 'mp2', 'mpeg', 'mpe', 'mpv', 'm4v', 'svi', '3gp',
@@ -228,14 +400,15 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
                    'cdg', 'idx', 'ttml']
         valid_ext = tuple(video_ext + sub_ext)
 
-        if not video_path.endswith(valid_ext):
-            logger.info(f'ext invalid: {video_path}')
+        if not video_path.lower().endswith(valid_ext):
+            self._send_error(404, 'media extension not allowed')
             return
 
         if not os.path.exists(video_path):
             self.send_response(404)
             self.end_headers()
-            self.wfile.write(b'File not found')
+            if self.command != 'HEAD':
+                self.wfile.write(b'File not found')
             return
 
         self._send_local_file(video_path)

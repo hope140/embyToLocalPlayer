@@ -460,7 +460,12 @@ https://github.com/hope140/embyToLocalPlayer/tree/beta#faq
   ```
     # 是否仅监听本机地址，会更安全，但无法与让其他 etlp 通讯。在服务器运行时需要改为 no。
     listen_on_localhost = no
+    # 非本机监听时必须填写至少 32 个字符的随机 token。
+    # 生成示例：python -c "import secrets; print(secrets.token_urlsafe(32))"
+    http_server_token = 请替换为随机字符串
   ```
+* `listen_on_localhost = yes`（默认）时普通本机播放无需配置 token。改为 `no` 后，服务会在绑定端口前检查 token；缺失或少于 32 个字符会直接拒绝启动。
+* 跨设备动作请求仅用于稀疏文件创建和 STRM 临时进度同步，并须携带 `Authorization: Bearer <http_server_token>`；其他动作即使 token 正确也会拒绝。媒体文件转发可通过短期 HMAC 签名 URL（`file_path`、`expires`、`sig`）访问，不会在 URL 中发送明文 token。
 * 客户端 eltp 填写位置：`.ini` > `[dev]`
   ```
     # 在服务器运行的 eltp 通讯监听地址，例如：http://192.168.1.23:58000

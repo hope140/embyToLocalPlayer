@@ -246,7 +246,7 @@ flowchart LR
 | CloudDrive2 STRM | 将读取硬盘模式下 HTTP STRM 的本地挂载路径解析为 CloudDrive2 播放地址 | `[clouddrive2]`、`[dev] strm_local_by_file_path`、`ETLP_CLOUDDRIVE2_TOKEN` | 需要本机 gRPC token 和正确的 `path_map`；失败自动回退原挂载盘；仅支持 Emby/Jellyfin HTTP STRM。 |
 | ISO/BDMV 原盘播放 | 按路径切换 VLC、PotPlayer 或 mpv 播放原盘 | `player_by_path`、`strm_direct_host`、读盘模式 | ISO 不回传进度；Pot/mpv 需要本地挂载，VLC 更适合菜单展示。 |
 | 本地 URL 替换 | 把源视频流地址替换成本机 alist/nginx 地址 | 隐藏配置 `stream_redirect` | 配置成对地址，错误替换会直接导致无法播放。 |
-| 局域网 STRM 进度 | 在长期运行的另一台 etlp 上保存缺失时长 STRM 的临时进度 | `listen_on_localhost = no`、`server_side_href` | 无持久数据库；开放监听有安全风险。 |
+| 局域网 STRM 进度 | 在长期运行的另一台 etlp 上保存缺失时长 STRM 的临时进度 | `listen_on_localhost = no`、`server_side_href`、`http_server_token` | 非本机请求必须携带 Bearer token；无持久数据库。 |
 | mpv IPC 数据传递 | 向 mpv Lua 脚本发送命令管道和播放列表数据 | `mpv_input_ipc_server`、`mpv_ipc_playlist_data` | 播放列表数据较大；静态管道可能影响回传。 |
 | mpv 自动跳过片头片尾 | 根据 Emby 片头数据或章节标题/时长自动跳过或提示 | 隐藏配置 `skip_intro` | 依赖章节或扫描结果；规则误判会错误跳转。 |
 | 预读取下一集 | 在当前集播放到指定比例后读取下一集首尾数据 | `prefetch_percent`、`prefetch_path`、`prefetch_host` | 主要为 nginx 分片缓存设计，配置复杂且消耗网络流量。 |
@@ -297,5 +297,5 @@ flowchart LR
 - 修改播放流程时，至少分别验证网络模式、读盘模式、单集、播放列表和 STRM。
 - 修改进度逻辑时，必须区分实时反馈和播放器退出后的最终回传两个阶段。
 - 新增播放器不能只验证“能启动”，还要明确开始时间、字幕、连续播放和进度回传分别是否支持。
-- 开放 `listen_on_localhost = no` 或媒体文件 HTTP 转发时，应限制在可信局域网并设置 token；当前本地服务不是面向公网设计的通用媒体服务器。
+- 本地 HTTP 服务默认只接受回环请求；油猴和 Python 内部 POST 使用 `X-ETLP-Protocol: 1`。开放 `listen_on_localhost = no` 时必须设置至少 32 个字符的 `http_server_token`，跨设备动作接口仅开放稀疏文件和 STRM 临时进度并使用 `Authorization: Bearer`，其他动作即使 token 正确也会拒绝。媒体文件 HTTP 转发使用 `file_path`、`expires`、`sig` 的短期 HMAC URL，不发送明文 token；当前服务不是面向公网设计的通用媒体服务器。
 - 评分回填、缓存删除等会修改外部数据或本地文件的功能，应继续保留预演、确认或明确阈值，避免不可逆操作。

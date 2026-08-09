@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Union
 
 from utils.configs import configs, MyLogger
+from utils.http_security import (ETLP_PROTOCOL_HEADER, ETLP_PROTOCOL_VERSION,
+                                 bearer_header, is_local_http_server_url)
 
 ssl_context = ssl.SSLContext() if configs.raw.getboolean('dev', 'skip_certificate_verify', fallback=False) else None
 
@@ -68,10 +70,11 @@ def safe_url(url):
 def requests_urllib(host, params=None, _json=None, decode=False, timeout=5.0, headers=None, req_only=False,
                     http_proxy='', get_json=False, save_path='', retry=5, silence=False, res_only=False,
                     method=None):
-    _json = json.dumps(_json).encode('utf-8') if _json else None
+    _json = json.dumps(_json).encode('utf-8') if _json is not None else None
     params = urllib.parse.urlencode(params) if params else None
     host = host + '?' + params if params else host
     host = safe_url(host)
+    log_host = urllib.parse.urlsplit(host)._replace(query='', fragment='').geturl()
     req = urllib.request.Request(host, method=method)
     http_proxy = http_proxy or configs.script_proxy
     if http_proxy and not host.startswith(('http://127.0.0.1', 'http://localhost')):
@@ -81,6 +84,9 @@ def requests_urllib(host, params=None, _json=None, decode=False, timeout=5.0, he
             req.set_proxy(http_proxy, 'https')
     req.add_header('User-Agent', 'embyToLocalPlayer/1.1')
     headers and [req.add_header(k, v) for k, v in headers.items()]
+    has_protocol_header = any(k.lower() == ETLP_PROTOCOL_HEADER.lower() for k in (headers or {}))
+    if is_local_http_server_url(host) and not has_protocol_header:
+        req.add_header(ETLP_PROTOCOL_HEADER, ETLP_PROTOCOL_VERSION)
     if _json or get_json:
         req.add_header('Content-Type', 'application/json; charset=utf-8')
         req.add_header('Accept', 'application/json')
@@ -95,13 +101,13 @@ def requests_urllib(host, params=None, _json=None, decode=False, timeout=5.0, he
                 return response
             break
         except socket.timeout:
-            logger.error(f'urllib timeout {try_times=} {host=}', silence=silence)
+            logger.error(f'urllib timeout {try_times=} host={log_host}', silence=silence)
             if try_times == retry:
-                raise TimeoutError(f'{try_times=} {host=}') from None
+                raise TimeoutError(f'{try_times=} host={log_host}') from None
         except urllib.error.URLError as e:
-            logger.error(f'urllib {try_times=} {host=}\n{str(e)[:100]}', silence=silence)
+            logger.error(f'urllib {try_times=} host={log_host}\n{str(e)[:100]}', silence=silence)
             if try_times == retry:
-                raise ConnectionError(f'{try_times=} {host=} \n{str(e)[:100]}') from None
+                raise ConnectionError(f'{try_times=} host={log_host} \n{str(e)[:100]}') from None
     if decode:
         return response.read().decode()
     if get_json:
@@ -135,8 +141,13 @@ def check_miss_runtime_start_sec(netloc, item_id, basename, start_sec=0, stop_se
     if stop_sec is not None:
         params['stop_sec'] = stop_sec
         get_json = False
+    headers = {}
+    if not is_local_http_server_url(href):
+        token = configs.raw.get('dev', 'http_server_token', fallback='').strip()
+        if token:
+            headers['Authorization'] = bearer_header(token)
     try:
-        res = requests_urllib(url, params=params, get_json=get_json, timeout=3, retry=3)
+        res = requests_urllib(url, params=params, headers=headers, get_json=get_json, timeout=3, retry=3)
         if res and start_sec == 0:
             return res['start_sec']
     except Exception:

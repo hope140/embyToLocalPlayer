@@ -12,6 +12,7 @@ from typing import Union
 import unicodedata
 
 from utils.configs import configs, MyLogger
+from utils.http_security import media_signature
 
 _logger = MyLogger()
 
@@ -149,13 +150,15 @@ def open_local_folder(data):
     path = os.path.normpath(translate_path)
     # isdir = os.path.isdir(path)
     isdir = False if os.path.splitext(path)[1] else True
-    windows = f'explorer "{path}"' if isdir else f'explorer /select, "{path}"'
-    # -R 确保前台显示
-    darwin = f'open -R "{path}"'
-    linux = f'xdg-open "{path}"' if isdir else f'xdg-open "{os.path.dirname(path)}"'
-    cmd = dict(windows=windows, darwin=darwin, linux=linux)[configs.platform.lower()]
-    _logger.info(cmd)
-    os.system(cmd)
+    if configs.platform.lower() == 'windows':
+        cmd = ['explorer.exe', path] if isdir else ['explorer.exe', '/select,', path]
+    elif configs.platform.lower() == 'darwin':
+        # -R reveals the selected file in Finder.
+        cmd = ['open', '-R', path]
+    else:
+        cmd = ['xdg-open', path] if isdir else ['xdg-open', os.path.dirname(path)]
+    _logger.info('open local folder', cmd)
+    subprocess.Popen(cmd)
 
 
 def play_media_file(data):
@@ -171,13 +174,16 @@ def play_media_file(data):
     media_path = translate_path_by_ini(file_path)
 
     qb_play_via_http = configs.raw.getboolean('dev', 'qb_play_via_http', fallback=False)
-    server_token = configs.raw.get('dev', 'http_server_token', fallback='')
+    server_token = configs.raw.get('dev', 'http_server_token', fallback='').strip()
     if qb_play_via_http and server_token and not os.path.exists(media_path):
         _, ext = os.path.splitext(file_path)
-        params = {'token': server_token,
-                  'file_path': file_path}
-        params = {key: urllib.parse.quote(str(value)) for key, value in params.items()}
-        query_str = '&'.join(f'{key}={value}' for key, value in params.items())
+        expires = str(int(time.time()) + 60 * 60)
+        params = {
+            'file_path': file_path,
+            'expires': expires,
+            'sig': media_signature(server_token, file_path, expires),
+        }
+        query_str = urllib.parse.urlencode(params)
         media_path = f'{href}/send_media_file{ext}' + '?' + query_str
         _logger.info(f'{file_path=}')
 

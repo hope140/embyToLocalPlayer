@@ -7,6 +7,7 @@ import urllib.parse
 
 from utils.configs import configs, MyLogger
 from utils.emby_api_thin import EmbyApiThin
+from utils.http_security import bearer_header, is_local_http_server_url
 from utils.net_tools import requests_urllib, tg_notify
 from utils.tools import (load_json_file, dump_json_file, scan_cache_dir, safe_deleter, version_prefer_emby,
                          load_dict_jsons_in_folder, create_sparse_file)
@@ -131,8 +132,14 @@ class Downloader:
         open_mode = 'r+b' if os.path.exists(self.file) else 'wb'
         if open_mode == 'wb' and configs.raw.getboolean('gui', 'sparse_file_by_server', fallback=False):
             if server_href := configs.raw.get('dev', 'server_side_href', fallback=''):
+                headers = {}
+                if not is_local_http_server_url(server_href):
+                    token = configs.raw.get('dev', 'http_server_token', fallback='').strip()
+                    if token:
+                        headers['Authorization'] = bearer_header(token)
                 _res = requests_urllib(f'{server_href}/action/sparse_file',
-                                       _json={'name': self.id, 'size': self.size}, get_json=True)
+                                       _json={'name': self.id, 'size': self.size},
+                                       headers=headers, get_json=True)
                 if not _res.get('sparse_file'):
                     raise Exception('server sparse_file fail, check it.')
                 for _ in range(10):
