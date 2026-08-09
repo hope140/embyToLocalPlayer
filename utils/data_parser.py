@@ -438,9 +438,7 @@ def parse_received_data_plex(received_data):
             if not mount_disk_mode and sub_key else None
         media_path = translate_path_by_ini(file_path) if mount_disk_mode else stream_url
         basename = os.path.basename(file_path)
-        # The gateway URL contains only a nonce, so preserve the local STRM
-        # target filename for playlist and player metadata.
-        media_basename = os.path.basename(strm_cd2_local_path or media_path)
+        media_basename = os.path.basename(media_path)
         title = meta.get('title', basename)
         media_title = title if title == basename else f'{title} | {basename}'
         if title_trans:
