@@ -158,6 +158,15 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
     def _send_error(self, status, message):
         self._send_json_response({'error': message}, status)
 
+    def _send_empty_response(self, status=200):
+        if getattr(self, '_response_sent', False):
+            return False
+        self._response_sent = True
+        self.send_response(status)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+        return True
+
     def _read_json_body(self):
         content_type = self._header('Content-Type', '')
         media_type = content_type.split(';', 1)[0].strip().lower()
@@ -376,17 +385,22 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self._send_error(400, 'netloc and item_id are required')
             return
         key = f'{netloc}-{item_id}'
+        updated = False
         if stop_sec is not None and stop_sec != '':
             try:
                 value = float(stop_sec)
                 if value < 0 or value > 10 * 60 * 60:
                     raise ValueError
                 miss_runtime_start_sec[key] = int(value)
+                updated = True
             except (TypeError, ValueError):
                 self._send_error(400, 'stop_sec must be a valid non-negative number')
                 return
         start_sec = miss_runtime_start_sec.get(key, 0)
-        self._send_json_response({'start_sec': start_sec})
+        if updated:
+            self._send_empty_response()
+        else:
+            self._send_json_response({'start_sec': start_sec})
 
     def send_media_file(self):
         parsed_path = urllib.parse.urlparse(self.path)
