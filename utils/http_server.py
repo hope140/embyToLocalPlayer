@@ -47,13 +47,14 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 def run_server(ip='127.0.0.1', port=58000):
     listen_on_localhost = configs.raw.getboolean('dev', 'listen_on_localhost', fallback=True)
     if not listen_on_localhost:
+        ip = get_machine_ip()
+    if not listen_on_localhost or not is_loopback_address(ip):
         token = configs.raw.get('dev', 'http_server_token', fallback='').strip()
         if len(token) < 32:
             raise ValueError(
                 '[dev] http_server_token is required (at least 32 characters) when '
-                'listen_on_localhost = no; generate one with secrets.token_urlsafe(32)'
+                'binding a non-loopback address; generate one with secrets.token_urlsafe(32)'
             )
-        ip = get_machine_ip()
     server_address = (ip, port)
     httpd = ThreadingHTTPServer(server_address, UserScriptRequestHandler)
     actual_ip, actual_port = httpd.server_address[:2]
@@ -65,6 +66,11 @@ def run_server(ip='127.0.0.1', port=58000):
 class UserScriptRequestHandler(BaseHTTPRequestHandler):
 
     MAX_POST_BODY_BYTES = 1024 * 1024
+    MEDIA_EXTENSIONS = frozenset(
+        'webm mkv flv vob ogv ogg rrc gifv mng mov avi qt wmv yuv rm asf amv mp4 '
+        'm4p m4v mpg mp2 mpeg mpe mpv svi 3gp 3g2 mxf roq nsv f4v f4p f4a f4b mod '
+        'srt sub ass ssa vtt sbv smi sami mpl txt dks pjs stl usf cdg idx ttml'.split()
+    )
     POST_ROUTES = {
         '/gui', '/gui/', '/dl', '/dl/', '/pl', '/pl/',
         '/embyToLocalPlayer', '/embyToLocalPlayer/',
@@ -222,6 +228,27 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    @staticmethod
+    def _validate_sparse_request(data, cache_dir):
+        name = data.get('name') if isinstance(data, dict) else None
+        size = data.get('size') if isinstance(data, dict) else None
+        if (not isinstance(name, str) or not name.strip() or name in ('.', '..')
+                or os.path.isabs(name) or os.path.splitdrive(name)[0]
+                or os.path.basename(name) != name or '/' in name or '\\' in name):
+            raise ValueError('name must be a plain file name')
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise ValueError('size must be a positive integer')
+
+        cache_root = os.path.realpath(cache_dir)
+        target = os.path.realpath(os.path.join(cache_root, name))
+        try:
+            common_root = os.path.commonpath((cache_root, target))
+        except ValueError:
+            raise ValueError('sparse file path is outside the cache directory') from None
+        if os.path.normcase(common_root) != os.path.normcase(cache_root):
+            raise ValueError('sparse file path is outside the cache directory')
+        return target, size
+
     def _dispatch_post(self, path, data):
         canonical_path = path.rstrip('/') or '/'
         if canonical_path == '/action/sparse_file':
@@ -229,7 +256,8 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             if not cache_dir:
                 logger.error('gui[server_cache_path] missing, check it')
                 raise ValueError('server cache path is not configured')
-            create_sparse_file(os.path.join(cache_dir, data['name']), data['size'])
+            target, size = self._validate_sparse_request(data, cache_dir)
+            create_sparse_file(target, size)
             return {'sparse_file': True}
 
         thread_dict = {
@@ -320,6 +348,10 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
     @classmethod
     def _is_media_path(cls, path):
         return bool(cls._MEDIA_PATH_RE.fullmatch(path))
+
+    @classmethod
+    def _is_allowed_media_extension(cls, path):
+        return os.path.splitext(path)[1].lower().lstrip('.') in cls.MEDIA_EXTENSIONS
 
     @staticmethod
     def _is_cd2_path(path):
@@ -416,14 +448,7 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self._send_error(403, 'media URL signature invalid or expired')
             return
 
-        video_ext = ['webm', 'mkv', 'flv', 'vob', 'ogv', 'ogg', 'rrc', 'gifv', 'mng', 'mov', 'avi', 'qt', 'wmv', 'yuv',
-                     'rm', 'asf', 'amv', 'mp4', 'm4p', 'm4v', 'mpg', 'mp2', 'mpeg', 'mpe', 'mpv', 'm4v', 'svi', '3gp',
-                     '3g2', 'mxf', 'roq', 'nsv', 'flv', 'f4v', 'f4p', 'f4a', 'f4b', 'mod']
-        sub_ext = ['srt', 'sub', 'ass', 'ssa', 'vtt', 'sbv', 'smi', 'sami', 'mpl', 'txt', 'dks', 'pjs', 'stl', 'usf',
-                   'cdg', 'idx', 'ttml']
-        valid_ext = tuple(video_ext + sub_ext)
-
-        if not video_path.lower().endswith(valid_ext):
+        if not self._is_allowed_media_extension(video_path):
             self._send_error(404, 'media extension not allowed')
             return
 
@@ -470,7 +495,7 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
 
         if range_header:
             start, end = self.parse_range_header(range_header, file_size)
-            logger.info(f'range={start}-{end} | {video_path}')
+            logger.info(f'range={start}-{end}')
             if start is None or end is None:
                 self.send_response(416)
                 self.send_header('Content-Range', f'bytes */{file_size}')
@@ -499,7 +524,7 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
                     bytes_to_read -= len(chunk)
 
         else:
-            logger.info(f'range: 0- | {video_path}')
+            logger.info('range: 0-')
             self.send_response(200)
             self.send_header('Content-type', 'octet-stream')
             self.send_header('Content-Length', str(file_size))
@@ -631,7 +656,6 @@ def start_play(data):
             threading.Thread(target=dl_manager.delete, args=(data,), daemon=True).start()
     else:
         logger.info('run as not support player mod')
-        logger.info(cmd)
         player = subprocess.Popen(cmd)
         activate_window_by_pid(player.pid)
     player_is_running = False

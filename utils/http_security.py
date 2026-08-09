@@ -20,6 +20,8 @@ def is_loopback_address(address: str | None) -> bool:
 
     if not address:
         return False
+    if address.lower() == 'localhost':
+        return True
     try:
         return ipaddress.ip_address(address.split('%', 1)[0]).is_loopback
     except ValueError:
@@ -36,7 +38,7 @@ def is_local_http_server_url(url: str) -> bool:
         return False
     if parsed.scheme.lower() != 'http' or port != HTTP_SERVER_PORT:
         return False
-    return parsed.hostname == '127.0.0.1'
+    return parsed.hostname in {'127.0.0.1', 'localhost', '::1'}
 
 
 def protocol_header_valid(headers) -> bool:

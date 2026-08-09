@@ -157,7 +157,7 @@ def open_local_folder(data):
         cmd = ['open', '-R', path]
     else:
         cmd = ['xdg-open', path] if isdir else ['xdg-open', os.path.dirname(path)]
-    _logger.info('open local folder', cmd)
+    _logger.info('open local folder')
     subprocess.Popen(cmd)
 
 
@@ -185,7 +185,6 @@ def play_media_file(data):
         }
         query_str = urllib.parse.urlencode(params)
         media_path = f'{href}/send_media_file{ext}' + '?' + query_str
-        _logger.info(f'{file_path=}')
 
     cmd = get_player_cmd(media_path, file_path=file_path)
     player = subprocess.Popen(cmd)
@@ -403,7 +402,7 @@ def get_player_cmd(media_path, file_path, data=None):
     if player_by_path := select_player_by_path(file_path, data=data):
         exe = config['exe'][player_by_path]
     result = [exe, media_path]
-    _logger.info('command line:', result)
+    _logger.info('command line prepared')
     is_http_path = media_path.startswith('http')
     media_path_exists = is_http_path or os.path.exists(media_path)
     use_local_strm_path = bool(data and data.get('use_strm_local_path'))
