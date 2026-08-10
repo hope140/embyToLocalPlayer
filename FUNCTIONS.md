@@ -10,7 +10,7 @@
 | CloudDrive2 | `[clouddrive2]` 启用后，使用本地 CloudDrive2 gRPC API、`path_map` 和 ETLP 短期本地 gateway 解析 STRM；失败回退原挂载文件。 |
 | 独立远程控制 | `[remote_control]` 为当前 mpv/IINA 建立独立 Emby 会话控制通道，支持暂停/继续、seek、停止和消息显示；只作用于当前机器。 |
 | 实时反馈 | `[dev] playing_feedback_*` 面向 mpv/IINA 回传播放位置和暂停状态；最终回传仍由 `[emby] update_progress` 控制。 |
-| 明确排除 | 无同步观看房间；不对豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 联动等旁线能力提供支持承诺。 |
+| 明确排除 | 本项目不实现同步观看房间；该能力请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。同时不对豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 联动等旁线能力提供支持承诺。 |
 
 ## 2. 运行链路
 
@@ -111,4 +111,4 @@ flowchart LR
 - 修改播放流程至少回归：网络模式、读取硬盘模式、单集、播放列表、`.strm`、CloudDrive2 失败回退和播放器退出后的最终进度。
 - 修改实时反馈时要分别验证实时反馈、暂停/恢复、会话识别和退出后的最终回传，不能用其中一种结果替代另一种。
 - 新增播放器不能只验证“能启动”，还要记录其开始时间、字幕、连续播放、最终进度和实时反馈支持情况。
-- 上游或其他分支的同步观看、豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 等文案不属于当前 `beta` 验收依据；若代码重新引入相关能力，应另行设计范围和测试。
+- 同步观看房间不属于当前 `beta` 的实现范围；需要房间、参与者管理和跨设备跟随播放时，请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 等旁线文案也不属于当前 `beta` 验收依据；若代码重新引入相关能力，应另行设计范围和测试。
