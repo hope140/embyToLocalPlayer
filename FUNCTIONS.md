@@ -2,6 +2,10 @@
 
 本文以当前 `beta` 分支的代码、`embyToLocalPlayer_config.ini` 和 `user_script/embyToLocalPlayer.user.js` 为准，服务维护、排错和小范围改动。安装步骤看 [README.md](README.md)；不要把上游 README 或其他分支的历史功能当作本分支承诺。
 
+## 开源许可与致谢
+
+本项目遵循根目录 [Apache License, Version 2.0](LICENSE)。本仓库基于并跟踪上游 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)，感谢上游作者 **kjtsune** 及所有贡献者；再分发修改版本时，应保留许可证、版权和归属声明，并标注修改内容。
+
 ## 1. 分支边界
 
 | 项目 | 当前 `beta` 的结论 |

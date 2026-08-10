@@ -2,6 +2,12 @@
 
 > **当前定位**：这是 [hope140/embyToLocalPlayer](https://github.com/hope140/embyToLocalPlayer) 的 `beta` 分支，面向本地播放器、路径转换、STRM 和播放进度回传的独立实验版本。它基于并跟踪上游 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)，但不是上游默认能力的完整镜像；本文只描述本分支当前代码和配置实际提供的能力。
 
+## 开源许可与致谢
+
+本项目遵循 [Apache License, Version 2.0](LICENSE)。本仓库基于并跟踪上游 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)，在保留原有许可和归属信息的前提下进行独立维护与扩展。感谢上游作者 **kjtsune** 及所有贡献者的开源工作。
+
+再分发或发布修改版本时，请按 Apache License, Version 2.0 要求保留许可证、版权和归属声明，并明确标注已修改的文件或内容。
+
 ## 与上游及其他分支的差异
 
 | 范围 | 本 `beta` 分支 | 说明 |
