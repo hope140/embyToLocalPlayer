@@ -49,7 +49,12 @@
 - 结论：beta 更新器只接受固定资产名的单条 SHA-256 sidecar；下载写入 `.part`，
   哈希或下载失败时清理临时文件并保留旧 archive，验证成功后才原子替换。ZIP 先
   全量检查路径、符号链接和目标边界；live 配置不直接被更新包覆盖。
-- 验证：`scripts/package_beta.ps1`、`utils/update.py` 和 `tests/test_update.py`。
+- 成品清单：根目录只保留入口、配置、许可证、`requirements.txt` 和 Windows 启动脚本；
+  `utils` 只保留 Python 模块，`user_script` 只保留 JavaScript，`third_party` 只保留
+  bundled wheels；Markdown、`.proto` 源文件、替代启动入口和缓存不进入 beta ZIP。
+  打包脚本、更新器和实际 ZIP 测试必须同步维护这份清单。
+- 验证：`scripts/package_beta.ps1`、`utils/update.py`、`tests/test_update.py` 和
+  `tests/test_package_beta.py`。
 
 ## 7. 配置比较必须使用可信基线
 

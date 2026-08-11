@@ -85,14 +85,23 @@ class UpdateArchiveTests(unittest.TestCase):
                 root,
                 [
                     ("embyToLocalPlayer.py", "runtime"),
+                    ("embyToLocalPlayer_debug.bat", "launcher"),
+                    ("LICENSE", "license"),
+                    ("requirements.txt", "requirements"),
                     ("utils/runtime.py", "util"),
-                    ("third_party/runtime.bin", "third-party"),
+                    ("utils/notes.md", "docs"),
+                    ("utils/others/etlp_run.command", "alternate launcher"),
+                    ("third_party/runtime.whl", "third-party wheel"),
+                    ("third_party/runtime.bin", "not a wheel"),
+                    ("third_party/README.md", "third-party docs"),
+                    ("third_party/clouddrive2/clouddrive.proto", "source proto"),
                     ("user_script/runtime.user.js", "user-script"),
                     ("tests/test_should_not_ship.py", "test"),
                     ("docs/architecture.md", "docs"),
                     ("scripts/package_beta.ps1", "script"),
                     (".codex/state.json", "metadata"),
                     ("README.md", "readme"),
+                    ("FUNCTIONS.md", "functions"),
                     ("embyToLocalPlayer_config.ini", "[emby]\n"),
                 ],
             )
@@ -101,11 +110,25 @@ class UpdateArchiveTests(unittest.TestCase):
             update.extract_update_archive(archive, root, example, is_windows=False)
 
             self.assertEqual((root / "embyToLocalPlayer.py").read_text(), "runtime")
+            self.assertEqual((root / "embyToLocalPlayer_debug.bat").read_text(), "launcher")
+            self.assertEqual((root / "LICENSE").read_text(), "license")
+            self.assertEqual((root / "requirements.txt").read_text(), "requirements")
             self.assertEqual((root / "utils/runtime.py").read_text(), "util")
-            self.assertEqual((root / "third_party/runtime.bin").read_text(), "third-party")
+            self.assertEqual((root / "third_party/runtime.whl").read_text(), "third-party wheel")
             self.assertEqual((root / "user_script/runtime.user.js").read_text(), "user-script")
-            self.assertEqual((root / "README.md").read_text(), "readme")
-            for extra in ("tests", "docs", "scripts", ".codex"):
+            for extra in (
+                "tests",
+                "docs",
+                "scripts",
+                ".codex",
+                "README.md",
+                "FUNCTIONS.md",
+                "utils/notes.md",
+                "utils/others",
+                "third_party/runtime.bin",
+                "third_party/README.md",
+                "third_party/clouddrive2",
+            ):
                 self.assertFalse((root / extra).exists(), extra)
             self.assertEqual(example.read_text(), "[emby]\n")
 

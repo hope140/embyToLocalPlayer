@@ -84,19 +84,17 @@ def download_verified_update(cwd):
         raise
 
 # Keep the updater in lockstep with scripts/package_beta.ps1. The release asset
-# is the exact runtime archive produced by that script, while the allowlist
-# still protects installations if an unexpected extra member is ever added.
+# is the exact runtime archive produced by that script, while these rules also
+# protect installations if an unexpected extra member is ever added.
 PACKAGE_ROOT_FILES = frozenset(
     {
         'embyToLocalPlayer.py',
         'embyToLocalPlayer_config.ini',
-        'README.md',
-        'FUNCTIONS.md',
+        'embyToLocalPlayer_debug.bat',
         'LICENSE',
         'requirements.txt',
     }
 )
-PACKAGE_DIRECTORIES = frozenset({'utils', 'third_party', 'user_script'})
 
 
 def _is_runtime_member(name):
@@ -105,8 +103,18 @@ def _is_runtime_member(name):
         return False
     if '/' not in name:
         return name in PACKAGE_ROOT_FILES
-    top_level, _, remainder = name.partition('/')
-    return bool(remainder) and top_level in PACKAGE_DIRECTORIES
+
+    parts = name.split('/')
+    top_level = parts[0]
+    basename = parts[-1]
+    suffix = Path(basename).suffix.casefold()
+    if top_level == 'utils':
+        return suffix == '.py' and not any(part.casefold() == 'others' for part in parts[1:-1])
+    if top_level == 'user_script':
+        return suffix == '.js'
+    if top_level == 'third_party':
+        return len(parts) == 2 and suffix == '.whl'
+    return False
 
 
 def _normalise_member_name(name):

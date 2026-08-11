@@ -23,7 +23,6 @@ New-Item -ItemType Directory -Path $staging -Force | Out-Null
 $rootFiles = @(
     'embyToLocalPlayer.py',
     'embyToLocalPlayer_config.ini',
-    'README.md',
     'LICENSE',
     'requirements.txt'
 )
@@ -31,16 +30,50 @@ foreach ($file in $rootFiles) {
     Copy-Item -LiteralPath (Join-Path $root $file) -Destination (Join-Path $staging $file) -Force
 }
 
-foreach ($dir in @('utils', 'third_party', 'user_script')) {
-    Copy-Item -Path (Join-Path $root $dir) -Destination $staging -Recurse -Force
+# Keep only Python runtime modules from utils.  The source tree also contains
+# development/alternate launchers under utils/others, which are not needed by
+# the Windows beta package.
+$utilsSource = Join-Path $root 'utils'
+$utilsTarget = Join-Path $staging 'utils'
+foreach ($file in Get-ChildItem -LiteralPath $utilsSource -Recurse -File |
+    Where-Object { $_.Extension -eq '.py' -and $_.FullName -notlike (Join-Path $utilsSource 'others\*') }) {
+    $relative = $file.FullName.Substring($utilsSource.Length).TrimStart([char[]]@('\', '/'))
+    $destination = Join-Path $utilsTarget $relative
+    New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+    Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+}
+
+# The browser userscript is runtime input; keep JavaScript only.
+$userScriptSource = Join-Path $root 'user_script'
+$userScriptTarget = Join-Path $staging 'user_script'
+foreach ($file in Get-ChildItem -LiteralPath $userScriptSource -Recurse -File |
+    Where-Object { $_.Extension -eq '.js' }) {
+    $relative = $file.FullName.Substring($userScriptSource.Length).TrimStart([char[]]@('\', '/'))
+    $destination = Join-Path $userScriptTarget $relative
+    New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+    Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+}
+
+# Bundled Python distributions are required by the embedded runtime.  Keep
+# wheels only; the source .proto and explanatory README are not runtime input.
+$thirdPartySource = Join-Path $root 'third_party'
+$thirdPartyTarget = Join-Path $staging 'third_party'
+$wheels = @(Get-ChildItem -LiteralPath $thirdPartySource -Filter '*.whl' -File)
+if ($wheels.Count -eq 0) {
+    throw "No bundled Python wheels found under $thirdPartySource"
+}
+New-Item -ItemType Directory -Path $thirdPartyTarget -Force | Out-Null
+foreach ($wheel in $wheels) {
+    Copy-Item -LiteralPath $wheel.FullName -Destination (Join-Path $thirdPartyTarget $wheel.Name) -Force
 }
 
 # Ship the Windows launcher at the package root so it can be run directly,
 # matching the standalone install layout (it lives under utils/others/ in git).
 $launcher = Join-Path $root 'utils\others\embyToLocalPlayer_debug.bat'
-if (Test-Path -LiteralPath $launcher) {
-    Copy-Item -LiteralPath $launcher -Destination (Join-Path $staging 'embyToLocalPlayer_debug.bat') -Force
+if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
+    throw "Required Windows launcher is missing: $launcher"
 }
+Copy-Item -LiteralPath $launcher -Destination (Join-Path $staging 'embyToLocalPlayer_debug.bat') -Force
 
 # Remove bytecode caches and other non-runtime files from the package.
 Get-ChildItem -LiteralPath $staging -Recurse -Directory |

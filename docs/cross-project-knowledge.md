@@ -74,10 +74,10 @@ HTTP handler 必须先把 Emby/Plex 请求解析成完整播放数据，再把�
 - 更新器必须先严格解析只对应固定包名的 checksum，再下载到 `.part` 文件；哈希不匹配或下载异常时删除临时文件、保留旧包，验证成功后才原子替换。
 - ZIP 解压要先验证全部成员，拒绝 zip-slip、绝对路径、符号链接和越界目标；实时配置不能被更新包直接覆盖，示例配置应单独输出。
 - 配置比较按 `ConfigParser` 的 section/key/value 语义进行，忽略注释、空行、键顺序和选项键大小写；section 名称仍按 `ConfigParser` 的匹配语义处理。如果要比较当前配置，应先选定可信的示例或上游基线，不能把“两个文件相同”误判为没有本地改动。
-- 打包脚本的 root 文件列表、更新器 allowlist、实际 ZIP 内容和测试必须保持同一份契约。当前静态检查发现：`scripts/package_beta.ps1` 未复制 `FUNCTIONS.md`，而 `utils/update.py::PACKAGE_ROOT_FILES` 允许它；这可能是有意的兼容余量，但后续应明确并补一项契约测试。
+- beta 更新包采用最小运行清单：根目录只保留入口、配置、许可证、`requirements.txt` 和 Windows 启动脚本；`utils` 只保留 Python 模块，`user_script` 只保留 JavaScript，`third_party` 只保留 bundled wheels。`scripts/package_beta.ps1`、`utils/update.py`、实际 ZIP 和测试必须保持同一份契约；`tests/test_package_beta.py` 覆盖成品 ZIP，`tests/test_update.py` 覆盖更新解包过滤。
 
 当前证据：`scripts/package_beta.ps1`、`utils/update.py`、
-`utils/config_diff.py`、`tests/test_update.py`。
+`utils/config_diff.py`、`tests/test_update.py`、`tests/test_package_beta.py`。
 
 ### 2.7 验证要区分层级
 
