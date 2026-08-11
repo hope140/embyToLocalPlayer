@@ -116,3 +116,10 @@ flowchart LR
 - 修改实时反馈时要分别验证实时反馈、暂停/恢复、会话识别和退出后的最终回传，不能用其中一种结果替代另一种。
 - 新增播放器不能只验证“能启动”，还要记录其开始时间、字幕、连续播放、最终进度和实时反馈支持情况。
 - 同步观看房间不属于当前 `beta` 的实现范围；需要房间、参与者管理和跨设备跟随播放时，请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 等旁线文案也不属于当前 `beta` 验收依据；若代码重新引入相关能力，应另行设计范围和测试。
+
+## 7. 维护文档与 Knowledge Review
+
+- 当前模块边界和数据流见 [`docs/architecture.md`](docs/architecture.md)。它只描述当前代码已实现的结构，不记录计划中的功能。
+- 已验证、可复用的排错经验见 [`docs/lessons-learned.md`](docs/lessons-learned.md)。一次性任务日志、未复现推测和未决风险不直接写入经验库。
+- 跨模块且长期有效的取舍见 [`docs/adr/README.md`](docs/adr/README.md) 及其 ADR 文件；创建前先搜索是否已有相同决策。
+- 任务结束复盘使用 [`docs/knowledge-review-template.md`](docs/knowledge-review-template.md)。实质性代码、Bug、架构或兼容性任务必须在报告中给出 `Knowledge Findings`；无新增内容时明确写“无”。

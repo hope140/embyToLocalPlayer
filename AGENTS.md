@@ -6,6 +6,14 @@
 
 本仓库采用“主线程 + `luna_worker` 子代理 + PR Stack”工作流。详细操作、计划模板和派发模板见 `docs/pr-stack-workflow.md`。
 
+## 知识读取与复盘
+
+- 按任务范围读取知识：先看本文件，再看 [`docs/architecture.md`](docs/architecture.md)，然后按模块读取 [`docs/lessons-learned.md`](docs/lessons-learned.md) 和 [`docs/adr/README.md`](docs/adr/README.md)；不要机械全量加载无关历史。
+- 知识库只记录由当前代码、测试、实际运行/日志、可复现结果，或官方文档与当前实现交叉确认的事实。写入前搜索去重；发现旧经验失效时更新当前结论并保留验证依据。
+- 具有实质性代码修改、Bug、架构或兼容性调查的任务结束前执行 Knowledge Review：记录新增约束、隐蔽坑、被证明错误的假设和建议沉淀项；架构变化要评估是否更新 `architecture.md` 或创建 ADR。没有发现时，在完成报告中写明 `Knowledge Findings/Review: 无`，不为流程强行修改知识文档。
+- 子代理完成报告必须包含 `Knowledge Findings`；主线程负责核对证据、搜索去重，并决定是否写入经验库、架构文档或 ADR。
+- `docs/cross-project-knowledge.md` 如存在，只是另一项目资料的迁移摘要；正式事实以本项目代码、测试和本目录的正式知识文档为准。
+
 ## 本机操作手册（LOCAL_OPERATIONS.md）
 
 本仓库根目录存在本机专用操作手册 `LOCAL_OPERATIONS.md`，已通过 `.git/info/exclude` 排除，不提交、不推送。该文件记录本机确认的部署环境、服务器地址、部署/发布流程、发布约定与常用排查步骤。
