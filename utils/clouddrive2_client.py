@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import importlib
 import posixpath
 import re
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -19,6 +21,8 @@ except Exception:
 
 _PLACEHOLDER_RE = re.compile(r"\{(SCHEME|HOST|PREVIEW)\}")
 _TOKEN_PREFIX = re.compile(r"^Bearer\s+", re.I)
+_REFRESH_MAX_CALLS = 2
+_REFRESH_COOLDOWN_SECONDS = 0.5
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
@@ -151,6 +155,10 @@ class CloudDrive2Client:
         self._proto_loader = _proto_loader or _load_proto_modules
         self._stub = None
         self._channel = None
+        # Directory refresh is only a recovery path for a first lookup miss.
+        # One lock serializes refreshes and coalesces concurrent probes.
+        self._refresh_guard = threading.Lock()
+        self._refresh_cooldowns: dict[str, float] = {}
 
     def map_local_path_to_cloud_path(self, local_path: Any) -> str | None:
         local = _normalise_local(local_path)
@@ -224,17 +232,51 @@ class CloudDrive2Client:
         if loaded is None:
             return None
         stub, pb2 = loaded
+        file_info, state = self._find_file(stub, pb2, cloud_path)
+        if state == "error":
+            return None
+        if state == "missing":
+            # A successful refresh is followed by one and only one recheck.
+            # Concurrent callers are serialized by the refresh guard and
+            # short cooldown, so they do not create a refresh storm.
+            self._refresh_missing_path(stub, pb2, cloud_path)
+            file_info, state = self._find_file(stub, pb2, cloud_path)
+        if state != "found" or _is_directory(file_info):
+            return None
+        return self._download_url_for_file(stub, pb2, cloud_path, file_info)
+
+    def _find_file(self, stub: Any, pb2: Any, cloud_path: str,
+                   timeout: float | None = None) -> tuple[Any, str]:
+        """Return (response, state) without leaking lookup errors to playback."""
+        call_timeout = self._bounded_timeout(timeout)
+        if call_timeout <= 0:
+            return None, "error"
         try:
-            file_info = stub.FindFileByPath(_message(pb2, "FindFileByPathRequest", parentPath="", path=cloud_path),
-                metadata=self._metadata, timeout=self.request_timeout_seconds)
-            if _is_directory(file_info) or not _field(file_info, "fullPathName"):
-                return None
-            size = _field(file_info, "size", None)
+            file_info = stub.FindFileByPath(
+                _message(pb2, "FindFileByPathRequest", parentPath="", path=cloud_path),
+                metadata=self._metadata, timeout=call_timeout)
+        except Exception as exc:
+            if _is_not_found_error(exc):
+                return None, "missing"
+            self._log(f"CloudDrive2 file lookup failed ({type(exc).__name__})")
+            return None, "error"
+        if file_info is None or not _field(file_info, "fullPathName"):
+            return None, "missing"
+        return file_info, "found"
+
+    def _download_url_for_file(self, stub: Any, pb2: Any, cloud_path: str,
+                               file_info: Any) -> str | None:
+        size = _field(file_info, "size", None)
+        try:
             if size is None or int(size) < 0:
                 return None
-            url_info = stub.GetDownloadUrlPath(_message(pb2, "GetDownloadUrlPathRequest", path=cloud_path,
-                preview=False, lazy_read=False, get_direct_url=False), metadata=self._metadata,
-                timeout=self.request_timeout_seconds)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        try:
+            url_info = stub.GetDownloadUrlPath(
+                _message(pb2, "GetDownloadUrlPathRequest", path=cloud_path,
+                         preview=False, lazy_read=False, get_direct_url=False),
+                metadata=self._metadata, timeout=self.request_timeout_seconds)
             if _field(url_info, "directUrl") or _field(url_info, "externalUrl"):
                 return None
             url_path = _field(url_info, "downloadUrlPath") or _field(url_info, "placeholder")
@@ -242,6 +284,94 @@ class CloudDrive2Client:
         except Exception as exc:
             self._log(f"CloudDrive2 URL resolution failed ({type(exc).__name__})")
             return None
+
+    def _refresh_missing_path(self, stub: Any, pb2: Any, cloud_path: str) -> bool:
+        """Refresh at most the direct parent and its parent after a miss."""
+        total_timeout = max(self.request_timeout_seconds, 0.05) * _REFRESH_MAX_CALLS
+        deadline = time.monotonic() + total_timeout
+        if not self._refresh_guard.acquire(
+                timeout=self._remaining_timeout(deadline)):
+            return False
+        calls = 0
+        try:
+            direct_parent = _parent_path(cloud_path)
+            if not direct_parent:
+                return False
+            remaining = self._remaining_timeout(deadline)
+            if remaining <= 0:
+                return False
+            parent_info, parent_state = self._find_file(
+                stub, pb2, direct_parent, timeout=remaining)
+            if parent_state == "error":
+                return False
+            if parent_state == "found" and _is_directory(parent_info):
+                return self._refresh_directory(
+                    stub, pb2, direct_parent, deadline, calls)
+
+            # The direct parent is absent.  One level up is the hard limit;
+            # never walk to a higher ancestor or refresh the whole drive.
+            upper_parent = _parent_path(direct_parent)
+            if not upper_parent or upper_parent == direct_parent:
+                return False
+            remaining = self._remaining_timeout(deadline)
+            if remaining <= 0:
+                return False
+            upper_info, upper_state = self._find_file(
+                stub, pb2, upper_parent, timeout=remaining)
+            if upper_state != "found" or not _is_directory(upper_info):
+                return False
+            result = self._refresh_directory(
+                stub, pb2, upper_parent, deadline, calls)
+            calls += int(result)
+            if not result:
+                return False
+            return bool(self._refresh_directory(
+                stub, pb2, direct_parent, deadline, calls))
+        except Exception as exc:
+            self._log(f"CloudDrive2 refresh coordination failed ({type(exc).__name__})")
+            return False
+        finally:
+            self._refresh_cooldowns[cloud_path] = (
+                time.monotonic() + _REFRESH_COOLDOWN_SECONDS)
+            self._refresh_guard.release()
+
+    def _refresh_directory(self, stub: Any, pb2: Any, directory: str,
+                           deadline: float, calls: int) -> bool:
+        if calls >= _REFRESH_MAX_CALLS:
+            return False
+        now = time.monotonic()
+        if self._refresh_cooldowns.get(directory, 0.0) > now:
+            return False
+        remaining = self._bounded_timeout(self._remaining_timeout(deadline))
+        if remaining <= 0:
+            return False
+        try:
+            response = stub.GetSubFiles(
+                _message(pb2, "ListSubFileRequest", path=directory,
+                         forceRefresh=True, checkExpires=True),
+                metadata=self._metadata, timeout=remaining)
+            # GetSubFiles is unary-stream. Pull one item to start the RPC,
+            # while avoiding an unbounded directory walk.
+            if response is not None:
+                next(iter(response), None)
+            return True
+        except Exception as exc:
+            self._log(f"CloudDrive2 directory refresh failed ({type(exc).__name__})")
+            return False
+        finally:
+            self._refresh_cooldowns[directory] = (
+                time.monotonic() + _REFRESH_COOLDOWN_SECONDS)
+
+    def _bounded_timeout(self, timeout: float | None) -> float:
+        value = self.request_timeout_seconds if timeout is None else timeout
+        try:
+            return max(0.0, min(self.request_timeout_seconds, float(value)))
+        except (TypeError, ValueError):
+            return self.request_timeout_seconds
+
+    @staticmethod
+    def _remaining_timeout(deadline: float) -> float:
+        return max(0.0, deadline - time.monotonic())
 
     def _validate_url(self, value: Any) -> str | None:
         if not isinstance(value, str) or not value.strip():
@@ -274,6 +404,31 @@ def _is_directory(value: Any) -> bool:
     if isinstance(file_type, str):
         return file_type.casefold() in {"directory", "dir"}
     return file_type == 0
+
+
+def _parent_path(path: str) -> str | None:
+    normal = _normalise_posix(path)
+    if not normal or normal == "/":
+        return None
+    parent = posixpath.dirname(normal) or "/"
+    return _normalise_posix(parent)
+
+
+def _is_not_found_error(exc: BaseException) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    code = getattr(exc, "code", None)
+    try:
+        code = code() if callable(code) else code
+    except Exception:
+        code = None
+    code_name = getattr(code, "name", "") or str(code or "")
+    if "NOT_FOUND" in str(code_name).upper().replace("-", "_"):
+        return True
+    message = str(exc).casefold()
+    return any(token in message for token in (
+        "not found", "notfound", "no such file", "不存在", "找不到",
+    ))
 
 def _message(pb2: Any, name: str, **values: Any) -> Any:
     cls = getattr(pb2, name, None) if pb2 is not None else None
