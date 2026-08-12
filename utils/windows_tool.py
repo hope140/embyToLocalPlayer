@@ -2,6 +2,7 @@
 
 import ctypes
 import json
+import ntpath
 import re
 import subprocess
 import time
@@ -14,9 +15,43 @@ kernel32 = ctypes.windll.kernel32
 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
 
 
-def list_pid_and_cmd(name_re: str = '.') -> list:
-    cmd = 'Get-WmiObject Win32_Process | Select-Object ProcessId, CommandLine | ConvertTo-Json'
-    name_re = re.compile(name_re)
+# These are the executable names that ETLP can start as independent players.
+# Matching the process image name (rather than the complete command line) is
+# important for Electron-based clients, whose command line may contain an
+# embedded ``mpv.exe`` path without being an mpv process themselves.
+WINDOWS_PLAYER_EXECUTABLE_NAMES = frozenset({
+    'mpv.exe',
+    'mpvnet.exe',
+    'mpc.exe',
+    'mpc-hc.exe',
+    'mpc-hc64.exe',
+    'mpc-be.exe',
+    'mpc-be64.exe',
+    'vlc.exe',
+    'potplayer.exe',
+    'potplayermini.exe',
+    'potplayermini64.exe',
+})
+
+
+def list_pid_and_cmd(name_re: str = '.', executable_names=None) -> list:
+    """Return matching ``(pid, command_line)`` pairs from Windows processes.
+
+    When *executable_names* is supplied, process selection uses the exact
+    process image name (``Name``/``ExecutablePath``) and only uses *name_re*
+    for explicitly requested command-line markers such as the legacy
+    ``embyToLocalPlayer.py`` process.  This prevents a player path embedded in
+    an unrelated process command line from selecting that process.
+
+    Omitting *executable_names* preserves the original command-line-only
+    filtering used by callers outside the startup cleanup path.
+    """
+    cmd = ('Get-WmiObject Win32_Process | '
+           'Select-Object ProcessId, Name, ExecutablePath, CommandLine | '
+           'ConvertTo-Json')
+    commandline_re = re.compile(name_re, re.IGNORECASE) if name_re else None
+    executable_names = ({str(name).casefold() for name in executable_names}
+                        if executable_names is not None else None)
     try:
         proc = subprocess.run(['chcp', '65001', '>', 'NUL', '&', 'powershell', cmd],
                               capture_output=True, encoding='utf-8-sig', shell=True)
@@ -31,8 +66,35 @@ def list_pid_and_cmd(name_re: str = '.') -> list:
         logger.error(f'{stdout=}')
         logger.error('powershell stdout error, kill python by yourself in task manager if you need to restart script')
         return []
-    result = [(i['ProcessId'], i['CommandLine']) for i in stdout
-              if i['ProcessId'] and i['CommandLine'] and name_re.search(i['CommandLine'])]
+    if isinstance(stdout, dict):
+        stdout = [stdout]
+    if not isinstance(stdout, list):
+        return []
+
+    result = []
+    for process in stdout:
+        if not isinstance(process, dict):
+            continue
+        pid = process.get('ProcessId')
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if not pid:
+            continue
+
+        command_line = str(process.get('CommandLine') or '')
+        process_name = process.get('Name') or ''
+        executable_path = process.get('ExecutablePath') or ''
+        executable_name = ntpath.basename(str(executable_path)) or ntpath.basename(str(process_name))
+        if executable_names is None:
+            matches = bool(commandline_re and commandline_re.search(command_line))
+        else:
+            matches = executable_name.casefold() in executable_names
+            if commandline_re and commandline_re.search(command_line):
+                matches = True
+        if matches:
+            result.append((pid, command_line))
     return result
 
 

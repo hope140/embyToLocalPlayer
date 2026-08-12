@@ -25,9 +25,23 @@ if __name__ == '__main__':
     os.chdir(configs.cwd)
     configs.print_version()
     if configs.raw.getboolean('dev', 'kill_process_at_start', fallback=True):
-        kill_multi_process(name_re=f'(embyToLocalPlayer.py|autohotkey_tool|' +
-                                   r'mpv.*exe|mpc-.*exe|vlc.exe|PotPlayer.*exe|' +
-                                   r'/IINA|/VLC|/mpv)',
+        if os.name == 'nt':
+            # On Windows, player selection must use the process image name.
+            # Keep command-line matching only for the legacy ETLP Python
+            # process (and its historical AutoHotkey helper marker).
+            from utils.windows_tool import WINDOWS_PLAYER_EXECUTABLE_NAMES
+
+            process_name_re = (r'embyToLocalPlayer\.py(?=["\'\s]|$)|'
+                               r'autohotkey_tool')
+            executable_names = WINDOWS_PLAYER_EXECUTABLE_NAMES
+        else:
+            # Preserve the existing ps/command-line behavior on non-Windows.
+            process_name_re = (f'(embyToLocalPlayer.py|autohotkey_tool|' +
+                               r'mpv.*exe|mpc-.*exe|vlc.exe|PotPlayer.*exe|' +
+                               r'/IINA|/VLC|/mpv)')
+            executable_names = None
+        kill_multi_process(name_re=process_name_re,
+                           executable_names=executable_names,
                            not_re='(tmux|greasyfork|github)')
 
     logger = MyLogger()

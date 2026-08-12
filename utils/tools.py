@@ -191,10 +191,13 @@ def play_media_file(data):
     activate_window_by_pid(player.pid)
 
 
-def kill_multi_process(name_re, not_re=None):
+def kill_multi_process(name_re, not_re=None, executable_names=None):
     if os.name == 'nt':
         from utils.windows_tool import list_pid_and_cmd
-        pid_cmd = list_pid_and_cmd(name_re)
+        if executable_names is None:
+            pid_cmd = list_pid_and_cmd(name_re)
+        else:
+            pid_cmd = list_pid_and_cmd(name_re, executable_names=executable_names)
     else:
         ps_out = subprocess.Popen(['ps', '-eo', 'pid,command'], stdout=subprocess.PIPE,
                                   encoding='utf-8').stdout.readlines()
