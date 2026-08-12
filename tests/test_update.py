@@ -1,4 +1,5 @@
 import hashlib
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,6 +90,7 @@ class UpdateArchiveTests(unittest.TestCase):
                     ("LICENSE", "license"),
                     ("requirements.txt", "requirements"),
                     ("utils/runtime.py", "util"),
+                    ("utils/release_info.py", "release"),
                     ("utils/notes.md", "docs"),
                     ("utils/others/etlp_run.command", "alternate launcher"),
                     ("third_party/runtime.whl", "third-party wheel"),
@@ -114,6 +116,7 @@ class UpdateArchiveTests(unittest.TestCase):
             self.assertEqual((root / "LICENSE").read_text(), "license")
             self.assertEqual((root / "requirements.txt").read_text(), "requirements")
             self.assertEqual((root / "utils/runtime.py").read_text(), "util")
+            self.assertEqual((root / "utils/release_info.py").read_text(), "release")
             self.assertEqual((root / "third_party/runtime.whl").read_text(), "third-party wheel")
             self.assertEqual((root / "user_script/runtime.user.js").read_text(), "user-script")
             for extra in (
@@ -131,6 +134,27 @@ class UpdateArchiveTests(unittest.TestCase):
             ):
                 self.assertFalse((root / extra).exists(), extra)
             self.assertEqual(example.read_text(), "[emby]\n")
+
+    def test_release_info_member_is_accepted_by_legacy_update_rules(self):
+        legacy_source = subprocess.check_output(
+            ["git", "show", "23a107c:utils/update.py"],
+            cwd=Path(__file__).resolve().parents[1],
+            text=True,
+        )
+        self.assertNotIn("etlp_release.json", legacy_source)
+
+        def legacy_runtime_member(name):
+            if not name or "/" not in name:
+                return False
+            parts = name.split("/")
+            if parts[0] == "utils":
+                suffix = Path(parts[-1]).suffix.casefold()
+                return suffix == ".py" and not any(
+                    part.casefold() == "others" for part in parts[1:-1]
+                )
+            return False
+
+        self.assertTrue(legacy_runtime_member("utils/release_info.py"))
 
     def test_zip_slip_paths_are_rejected_before_writing(self):
         unsafe_names = ("/absolute.txt", "C:/drive.txt", "../parent.txt", "a/../../parent.txt", r"..\parent.txt")

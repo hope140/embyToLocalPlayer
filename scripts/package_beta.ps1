@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._+\-]{0,63}$')]
+    [string]$ReleaseVersion
 )
 
 Set-StrictMode -Version Latest
@@ -14,6 +17,20 @@ if (-not $OutputDirectory) {
 $staging = Join-Path $OutputDirectory 'etlp-remote-control-beta'
 $archivePath = Join-Path $OutputDirectory 'etlp-remote-control-beta.zip'
 $checksumPath = "$archivePath.sha256"
+
+if ($ReleaseVersion -notmatch '^[A-Za-z0-9][A-Za-z0-9._+\-]{0,63}$') {
+    throw "ReleaseVersion must contain only bounded release identifier characters"
+}
+
+$commit = ''
+try {
+    $commit = ((& git -C $root rev-parse --short=12 HEAD 2>$null) | Select-Object -First 1).ToString().Trim()
+} catch {
+    $commit = ''
+}
+if ($commit -notmatch '^[0-9a-fA-F]{12}$') {
+    throw "Unable to resolve a 12-character build commit"
+}
 
 if (Test-Path -LiteralPath $staging) {
     [System.IO.Directory]::Delete($staging, $true)
@@ -42,6 +59,30 @@ foreach ($file in Get-ChildItem -LiteralPath $utilsSource -Recurse -File |
     New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
     Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
 }
+
+# Embed release metadata in an existing runtime Python member so older
+# updaters, which only accept utils/*.py, can install this package.
+$releaseInfoPath = Join-Path $utilsTarget 'release_info.py'
+if (-not (Test-Path -LiteralPath $releaseInfoPath -PathType Leaf)) {
+    throw "Required release metadata module is missing: $releaseInfoPath"
+}
+$releaseInfoText = [System.IO.File]::ReadAllText($releaseInfoPath)
+$releaseMarker = 'RELEASE_VERSION = "source"'
+$commitMarker = 'RELEASE_COMMIT = "unknown"'
+if (([regex]::Matches($releaseInfoText, [regex]::Escape($releaseMarker))).Count -ne 1 -or
+    ([regex]::Matches($releaseInfoText, [regex]::Escape($commitMarker))).Count -ne 1) {
+    throw "Release metadata placeholders are missing or ambiguous"
+}
+$releaseValue = "RELEASE_VERSION = `"$ReleaseVersion`""
+$commitValue = "RELEASE_COMMIT = `"$commit`""
+$releaseInfoText = $releaseInfoText.Replace($releaseMarker, $releaseValue)
+$releaseInfoText = $releaseInfoText.Replace($commitMarker, $commitValue)
+if (([regex]::Matches($releaseInfoText, [regex]::Escape($releaseValue))).Count -ne 1 -or
+    ([regex]::Matches($releaseInfoText, [regex]::Escape($commitValue))).Count -ne 1) {
+    throw "Release metadata replacement failed"
+}
+$utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+[System.IO.File]::WriteAllText($releaseInfoPath, $releaseInfoText, $utf8NoBom)
 
 # The browser userscript is runtime input; keep JavaScript only.
 $userScriptSource = Join-Path $root 'user_script'
@@ -98,7 +139,6 @@ if (Test-Path -LiteralPath $archivePath) {
 Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $archivePath -Force
 
 $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
-$utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
 [System.IO.File]::WriteAllText(
     $checksumPath,
     "$archiveHash  $(Split-Path -Leaf $archivePath)$([Environment]::NewLine)",

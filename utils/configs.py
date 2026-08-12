@@ -164,8 +164,16 @@ class Configs:
 
     def print_version(self):
         from utils.tools import show_version_info
+        try:
+            from utils.release_info import load_release_info
+            release, commit = load_release_info()
+        except Exception:
+            # Older/source installs may not carry the generated module; a
+            # malformed metadata module must not block startup diagnostics.
+            release, commit = 'source', 'unknown'
         MyLogger.log(MyLogger.mix_args_str(f'Python path: {sys.executable}'))
         MyLogger.log(MyLogger.mix_args_str(f'ini path: {self.path}'))
+        MyLogger.log(f'ETLP release={release} commit={commit}')
         MyLogger.log(f'{platform.platform(True)} Python-{platform.python_version()} PyScript-{show_version_info()}')
 
     def _get_cache_db(self):

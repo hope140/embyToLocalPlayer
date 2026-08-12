@@ -1,4 +1,5 @@
 import hashlib
+import ast
 import shutil
 import subprocess
 import tempfile
@@ -29,6 +30,8 @@ class BetaPackageTests(unittest.TestCase):
                     str(ROOT / "scripts" / "package_beta.ps1"),
                     "-OutputDirectory",
                     str(output),
+                    "-ReleaseVersion",
+                    "2026.08.12.2-beta",
                 ],
                 cwd=ROOT,
                 capture_output=True,
@@ -68,8 +71,25 @@ class BetaPackageTests(unittest.TestCase):
                     for info in archive.infolist()
                     if not info.is_dir()
                 }
+                release_info_source = archive.read("utils/release_info.py").decode("utf-8")
+
+            self.assertFalse(release_info_source.startswith("\ufeff"))
+            assignments = {}
+            for node in ast.parse(release_info_source).body:
+                if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                    target = node.targets[0]
+                    if isinstance(target, ast.Name) and target.id in {
+                            "RELEASE_VERSION", "RELEASE_COMMIT"}:
+                        assignments[target.id] = ast.literal_eval(node.value)
 
             self.assertEqual(actual, expected)
+            self.assertEqual(assignments["RELEASE_VERSION"], "2026.08.12.2-beta")
+            self.assertEqual(assignments["RELEASE_COMMIT"], subprocess.check_output(
+                ["git", "rev-parse", "--short=12", "HEAD"],
+                cwd=ROOT,
+                text=True,
+            ).strip())
+            self.assertNotIn("etlp_release.json", actual)
             self.assertTrue(any(name.endswith(".whl") for name in actual))
             self.assertFalse(any(name.casefold().endswith(".md") for name in actual))
             self.assertFalse(any(name.endswith(".proto") for name in actual))
@@ -79,6 +99,28 @@ class BetaPackageTests(unittest.TestCase):
                 checksum_path.read_text(encoding="utf-8").strip().lower(),
                 f"{digest}  {archive_path.name}",
             )
+
+            missing_version_output = output / "missing-version"
+            missing_version = subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(ROOT / "scripts" / "package_beta.ps1"),
+                    "-OutputDirectory",
+                    str(missing_version_output),
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(missing_version.returncode, 0)
+            self.assertFalse(
+                (missing_version_output / "etlp-remote-control-beta.zip").exists())
 
 
 if __name__ == "__main__":
