@@ -22,7 +22,7 @@ except Exception:
 _PLACEHOLDER_RE = re.compile(r"\{(SCHEME|HOST|PREVIEW)\}")
 _TOKEN_PREFIX = re.compile(r"^Bearer\s+", re.I)
 _REFRESH_MAX_CALLS = 2
-_REFRESH_COOLDOWN_SECONDS = 0.5
+_REFRESH_COOLDOWN_SECONDS = 5.0
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
@@ -135,7 +135,8 @@ class CloudDrive2Client:
                  request_timeout_seconds: float = 2, logger: Any = None, *,
                  _stub_factory: Callable[..., Any] | None = None,
                  _channel_factory: Callable[..., Any] | None = None,
-                 _proto_loader: Callable[[], tuple[Any, Any, Any]] | None = None) -> None:
+                 _proto_loader: Callable[[], tuple[Any, Any, Any]] | None = None,
+                 _clock: Callable[[], float] | None = None) -> None:
         self.origin = str(origin or "").strip().rstrip("/")
         self._origin = _origin_parts(self.origin)
         if self._origin:
@@ -153,6 +154,7 @@ class CloudDrive2Client:
         self._stub_factory = _stub_factory
         self._channel_factory = _channel_factory
         self._proto_loader = _proto_loader or _load_proto_modules
+        self._clock = _clock or time.monotonic
         self._stub = None
         self._channel = None
         # Directory refresh is only a recovery path for a first lookup miss.
@@ -288,12 +290,14 @@ class CloudDrive2Client:
     def _refresh_missing_path(self, stub: Any, pb2: Any, cloud_path: str) -> bool:
         """Refresh at most the direct parent and its parent after a miss."""
         total_timeout = max(self.request_timeout_seconds, 0.05) * _REFRESH_MAX_CALLS
-        deadline = time.monotonic() + total_timeout
+        deadline = self._clock() + total_timeout
         if not self._refresh_guard.acquire(
                 timeout=self._remaining_timeout(deadline)):
             return False
         calls = 0
         try:
+            if self._refresh_cooldowns.get(cloud_path, 0.0) > self._clock():
+                return False
             direct_parent = _parent_path(cloud_path)
             if not direct_parent:
                 return False
@@ -332,14 +336,14 @@ class CloudDrive2Client:
             return False
         finally:
             self._refresh_cooldowns[cloud_path] = (
-                time.monotonic() + _REFRESH_COOLDOWN_SECONDS)
+                self._clock() + _REFRESH_COOLDOWN_SECONDS)
             self._refresh_guard.release()
 
     def _refresh_directory(self, stub: Any, pb2: Any, directory: str,
                            deadline: float, calls: int) -> bool:
         if calls >= _REFRESH_MAX_CALLS:
             return False
-        now = time.monotonic()
+        now = self._clock()
         if self._refresh_cooldowns.get(directory, 0.0) > now:
             return False
         remaining = self._bounded_timeout(self._remaining_timeout(deadline))
@@ -350,17 +354,26 @@ class CloudDrive2Client:
                 _message(pb2, "ListSubFileRequest", path=directory,
                          forceRefresh=True, checkExpires=True),
                 metadata=self._metadata, timeout=remaining)
-            # GetSubFiles is unary-stream. Pull one item to start the RPC,
-            # while avoiding an unbounded directory walk.
+            # GetSubFiles is unary-stream. Consume it to EOF without retaining
+            # entries, while the RPC deadline bounds the whole refresh.
             if response is not None:
-                next(iter(response), None)
+                iterator = iter(response)
+                while self._remaining_timeout(deadline) > 0:
+                    try:
+                        next(iterator)
+                    except StopIteration:
+                        return True
+                cancel = getattr(response, "cancel", None)
+                if callable(cancel):
+                    cancel()
+                return False
             return True
         except Exception as exc:
             self._log(f"CloudDrive2 directory refresh failed ({type(exc).__name__})")
             return False
         finally:
             self._refresh_cooldowns[directory] = (
-                time.monotonic() + _REFRESH_COOLDOWN_SECONDS)
+                self._clock() + _REFRESH_COOLDOWN_SECONDS)
 
     def _bounded_timeout(self, timeout: float | None) -> float:
         value = self.request_timeout_seconds if timeout is None else timeout
@@ -369,9 +382,8 @@ class CloudDrive2Client:
         except (TypeError, ValueError):
             return self.request_timeout_seconds
 
-    @staticmethod
-    def _remaining_timeout(deadline: float) -> float:
-        return max(0.0, deadline - time.monotonic())
+    def _remaining_timeout(self, deadline: float) -> float:
+        return max(0.0, deadline - self._clock())
 
     def _validate_url(self, value: Any) -> str | None:
         if not isinstance(value, str) or not value.strip():

@@ -1,4 +1,5 @@
 import types
+import threading
 import unittest
 from utils.clouddrive2_client import CloudDrive2Client
 
@@ -27,9 +28,11 @@ class RefreshStub:
         self.known_directories = set(known_directories)
         self.refresh_results = dict(refresh_results or {})
         self.calls = []
+        self.events = []
 
     def FindFileByPath(self, req, **kwargs):
         self.calls.append(('find', req.path, kwargs))
+        self.events.append(('find', req.path))
         if req.path in self.known_files or req.path in self.known_directories:
             return types.SimpleNamespace(
                 fullPathName=req.path,
@@ -43,6 +46,15 @@ class RefreshStub:
         result = self.refresh_results.get(req.path)
         if isinstance(result, BaseException):
             raise result
+        if result and 'batches' in result:
+            def stream():
+                for batch in result['batches']:
+                    self.events.append(('batch', req.path, batch))
+                    yield batch
+                self.known_files.update(result.get('files_after_eof', ()))
+                self.known_directories.update(result.get('directories_after_eof', ()))
+                self.events.append(('eof', req.path))
+            return stream()
         if result:
             self.known_files.update(result.get('files', ()))
             self.known_directories.update(result.get('directories', ()))
@@ -87,10 +99,13 @@ class CloudDrive2ClientTests(unittest.TestCase):
             _stub_factory=lambda *_: stub, _proto_loader=loader,
             request_timeout_seconds=0.2, **kw)
 
-    def test_missing_file_refreshes_known_parent_then_rechecks(self):
+    def test_missing_file_consumes_parent_stream_to_eof_then_rechecks(self):
         stub = RefreshStub(
             known_directories={'/library'},
-            refresh_results={'/library': {'files': {'/library/new.mkv'}}},
+            refresh_results={'/library': {
+                'batches': ('first', 'second'),
+                'files_after_eof': {'/library/new.mkv'},
+            }},
         )
         self.assertEqual(
             self.make_refresh_client(stub).resolve_cloud_path('/library/new.mkv'),
@@ -106,6 +121,10 @@ class CloudDrive2ClientTests(unittest.TestCase):
         refresh = next(call for call in stub.calls if call[0] == 'refresh')
         self.assertTrue(refresh[2])
         self.assertTrue(refresh[3])
+        target_find = [index for index, event in enumerate(stub.events)
+                       if event == ('find', '/library/new.mkv')][-1]
+        eof = stub.events.index(('eof', '/library'))
+        self.assertLess(eof, target_find)
 
     def test_missing_parent_refreshes_upper_then_parent(self):
         stub = RefreshStub(
@@ -130,15 +149,29 @@ class CloudDrive2ClientTests(unittest.TestCase):
             self.make_refresh_client(stub).resolve_cloud_path('/library/new/video.mkv'))
         self.assertEqual([], [call for call in stub.calls if call[0] == 'refresh'])
 
-    def test_refresh_failure_is_soft_and_short_cooldown_deduplicates(self):
+    def test_refresh_cooldown_coalesces_concurrent_and_one_second_retries(self):
         stub = RefreshStub(
             known_directories={'/library'},
             refresh_results={'/library': RuntimeError('refresh failed')},
         )
-        client = self.make_refresh_client(stub)
+        now = [100.0]
+        client = self.make_refresh_client(stub, _clock=lambda: now[0])
+        barrier = threading.Barrier(4)
+        threads = [threading.Thread(
+            target=lambda: (barrier.wait(), client.resolve_cloud_path('/library/new.mkv')))
+            for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        refreshes = lambda: len([call for call in stub.calls if call[0] == 'refresh'])
+        self.assertEqual(1, refreshes())
+        now[0] += 1.0
         self.assertIsNone(client.resolve_cloud_path('/library/new.mkv'))
+        self.assertEqual(1, refreshes())
+        now[0] += 5.0
         self.assertIsNone(client.resolve_cloud_path('/library/new.mkv'))
-        self.assertEqual(1, len([call for call in stub.calls if call[0] == 'refresh']))
+        self.assertEqual(2, refreshes())
 
     def test_existing_file_does_not_refresh(self):
         stub = RefreshStub(known_files={'/library/existing.mkv'})
