@@ -104,6 +104,12 @@ def requests_urllib(host, params=None, _json=None, decode=False, timeout=5.0, he
             logger.error(f'urllib timeout {try_times=} host={log_host}', silence=silence)
             if try_times == retry:
                 raise TimeoutError(f'{try_times=} host={log_host}') from None
+        except urllib.error.HTTPError as e:
+            if e.code == 304 and res_only:
+                return e
+            logger.error(f'urllib {try_times=} host={log_host}\n{str(e)[:100]}', silence=silence)
+            if try_times == retry:
+                raise ConnectionError(f'{try_times=} host={log_host} \n{str(e)[:100]}') from None
         except urllib.error.URLError as e:
             logger.error(f'urllib {try_times=} host={log_host}\n{str(e)[:100]}', silence=silence)
             if try_times == retry:
@@ -389,8 +395,91 @@ def save_sub_file(url, name='tmp_sub.srt'):
     return srt
 
 
+def _subtitle_cache_hash(file_path):
+    digest = hashlib.sha256()
+    with open(file_path, 'rb') as file:
+        while chunk := file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _subtitle_cache_metadata_path(cache_path):
+    return f'{cache_path}.meta.json'
+
+
+def _load_subtitle_cache_metadata(metadata_path, cache_path, cache_key):
+    try:
+        with open(metadata_path, encoding='utf-8') as file:
+            metadata = json.load(file)
+        if not isinstance(metadata, dict):
+            return None
+        content_hash = metadata.get('sha256')
+        file_size = metadata.get('size')
+        if (metadata.get('version') != 1 or metadata.get('source') != cache_key
+                or not re.fullmatch(r'[0-9a-f]{64}', content_hash or '')
+                or not isinstance(file_size, int) or isinstance(file_size, bool)
+                or file_size <= 0 or file_size != os.path.getsize(cache_path)):
+            return None
+        if _subtitle_cache_hash(cache_path) != content_hash:
+            return None
+        return metadata
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _subtitle_response_status(response):
+    status = getattr(response, 'status', None)
+    if status is None:
+        status = getattr(response, 'code', None)
+    if status is None and hasattr(response, 'getcode'):
+        status = response.getcode()
+    return status or 200
+
+
+def _subtitle_response_header(response, name):
+    headers = getattr(response, 'headers', None)
+    value = headers.get(name) if headers is not None else None
+    if value is None and hasattr(response, 'getheader'):
+        value = response.getheader(name)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _download_subtitle_cache(url, temp_path, headers=None):
+    response = requests_urllib(url, headers=headers, res_only=True, retry=3)
+    try:
+        status = _subtitle_response_status(response)
+        if status == 304:
+            return None
+        if not 200 <= status < 300:
+            raise ConnectionError(f'subtitle response status={status}')
+        with open(temp_path, 'wb') as file:
+            while chunk := response.read(1024 * 1024):
+                file.write(chunk)
+        return {
+            'etag': _subtitle_response_header(response, 'ETag'),
+            'last_modified': _subtitle_response_header(response, 'Last-Modified'),
+        }
+    finally:
+        response.close()
+
+
+def _write_subtitle_cache_metadata(metadata_path, metadata):
+    temp_path = f'{metadata_path}.{threading.get_ident()}.part'
+    try:
+        with open(temp_path, 'w', encoding='utf-8', newline='\n') as file:
+            json.dump(metadata, file, ensure_ascii=False, sort_keys=True)
+            file.write('\n')
+        os.replace(temp_path, metadata_path)
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+
 def cache_sub_file(url):
-    """Cache an Emby subtitle URL without exposing its API key in the file name."""
+    """Cache an Emby subtitle URL while revalidating reused cache paths."""
     global subtitle_cache_cleaned
     cache_dir = os.path.join(configs.cwd, '.tmp', 'subtitles')
     os.makedirs(cache_dir, exist_ok=True)
@@ -434,17 +523,43 @@ def cache_sub_file(url):
         url_parts.scheme, url_parts.netloc, url_parts.path, '', ''))
     cache_key = hashlib.sha256(cache_key_url.encode('utf-8')).hexdigest()[:24]
     cache_path = os.path.join(cache_dir, f'{cache_key}{sub_ext}')
-    if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
-        logger.info(f'strm local subtitle cache hit: {os.path.basename(cache_path)}')
-        return cache_path
+    metadata_path = _subtitle_cache_metadata_path(cache_path)
+    cache_exists = os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0
+    metadata = _load_subtitle_cache_metadata(metadata_path, cache_path, cache_key) if cache_exists else None
+    request_headers = {}
+    if metadata:
+        if metadata.get('etag'):
+            request_headers['If-None-Match'] = metadata['etag']
+        if metadata.get('last_modified'):
+            request_headers['If-Modified-Since'] = metadata['last_modified']
 
     temp_path = f'{cache_path}.{threading.get_ident()}.part'
     try:
-        requests_urllib(url, save_path=temp_path, retry=3)
+        response_metadata = _download_subtitle_cache(url, temp_path, headers=request_headers or None)
+        if response_metadata is None:
+            logger.info(f'strm local subtitle cache revalidated: {os.path.basename(cache_path)}')
+            return cache_path
         if not os.path.isfile(temp_path) or os.path.getsize(temp_path) == 0:
             raise OSError('downloaded subtitle is empty')
-        os.replace(temp_path, cache_path)
-        logger.info(f'strm local subtitle cached: {os.path.basename(cache_path)}')
+        content_hash = _subtitle_cache_hash(temp_path)
+        old_hash = metadata.get('sha256') if metadata else (
+            _subtitle_cache_hash(cache_path) if cache_exists else None)
+        if not cache_exists or content_hash != old_hash:
+            os.replace(temp_path, cache_path)
+        else:
+            os.remove(temp_path)
+        new_metadata = {
+            'version': 1,
+            'source': cache_key,
+            'sha256': content_hash,
+            'size': os.path.getsize(cache_path),
+        }
+        for key in ('etag', 'last_modified'):
+            if response_metadata.get(key):
+                new_metadata[key] = response_metadata[key]
+        _write_subtitle_cache_metadata(metadata_path, new_metadata)
+        action = 'refreshed' if cache_exists else 'cached'
+        logger.info(f'strm local subtitle {action}: {os.path.basename(cache_path)}')
         return cache_path
     except Exception as exc:
         try:
