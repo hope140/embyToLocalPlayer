@@ -3,7 +3,7 @@
 // @name:zh-CN   embyToLocalPlayer
 // @name:en      embyToLocalPlayer
 // @namespace    https://github.com/hope140/embyToLocalPlayer
-// @version      2026.08.09
+// @version      2026.08.12
 // @updateURL    https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js
 // @downloadURL  https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js
 // @description  Emby/Jellyfin 调用外部本地播放器，并回传播放记录。适配 Plex。
@@ -337,6 +337,7 @@
     let allPlaybackCache = {};
     let allItemDataCache = {};
     let episodesWithPathCache = {};
+    let subtitleSelectionCache = {};
 
     let metadataChangeRe = /\/MetadataEditor|\/Refresh\?/;
     let metadataMayChange = false;
@@ -349,6 +350,106 @@
         allItemDataCache = {};
         episodesInfoCache = [];
         episodesWithPathCache = {};
+    }
+
+    function clearItemCache(itemId) {
+        if (!itemId) return;
+        [resumePlaybackCache, resumeItemDataCache, allPlaybackCache, allItemDataCache].forEach(cache => {
+            delete cache[itemId];
+        });
+    }
+
+    function subtitleStreamSignature(stream) {
+        if (!stream) return '';
+        return [
+            stream.Type,
+            Boolean(stream.IsExternal),
+            stream.Path || '',
+            stream.Title || '',
+            stream.DisplayTitle || '',
+            stream.Language || '',
+            stream.Codec || '',
+        ].join('\u001f');
+    }
+
+    function getPlaybackMediaSource(playbackData, url) {
+        const mediaSources = playbackData?.MediaSources || [];
+        let mediaSourceId = null;
+        try {
+            mediaSourceId = new URL(url, window.location.origin).searchParams.get('MediaSourceId');
+        } catch (_error) {
+            // Keep the existing first-source fallback for malformed or synthetic URLs.
+        }
+        return mediaSources.find(source => source?.Id == mediaSourceId) || mediaSources[0] || null;
+    }
+
+    function getValidSubtitleIndex(mediaSource, index) {
+        if (index === null || index === undefined || index === '') return null;
+        const numericIndex = Number(index);
+        const streams = mediaSource?.MediaStreams || [];
+        if (!Number.isInteger(numericIndex) || numericIndex < 0) return null;
+        return streams[numericIndex]?.Type == 'Subtitle' ? numericIndex : null;
+    }
+
+    function rememberSubtitleSelection(itemId, playbackData, index, url) {
+        const mediaSource = getPlaybackMediaSource(playbackData, url);
+        const validIndex = getValidSubtitleIndex(mediaSource, index);
+        if (validIndex === null) {
+            delete subtitleSelectionCache[itemId];
+            return;
+        }
+        const stream = mediaSource.MediaStreams[validIndex];
+        subtitleSelectionCache[itemId] = {
+            index: validIndex,
+            signature: subtitleStreamSignature(stream),
+            mediaSourceId: mediaSource.Id,
+        };
+    }
+
+    function getSelectedSubtitleIndex(itemId, playbackData, url) {
+        const mediaSource = getPlaybackMediaSource(playbackData, url);
+        const streams = mediaSource?.MediaStreams || [];
+        const remembered = subtitleSelectionCache[itemId];
+        if (remembered) {
+            if (remembered.signature && (!remembered.mediaSourceId || remembered.mediaSourceId == mediaSource?.Id)) {
+                const signatureIndex = streams.findIndex(stream => stream?.Type == 'Subtitle'
+                    && subtitleStreamSignature(stream) == remembered.signature);
+                if (signatureIndex >= 0) return signatureIndex;
+            } else if (!remembered.signature) {
+                const rememberedIndex = getValidSubtitleIndex(mediaSource, remembered.index);
+                if (rememberedIndex !== null) return rememberedIndex;
+            }
+        }
+
+        const defaultIndex = getValidSubtitleIndex(mediaSource, mediaSource?.DefaultSubtitleStreamIndex);
+        if (defaultIndex !== null) return defaultIndex;
+
+        const isDefaultIndex = streams.findIndex(stream => stream?.Type == 'Subtitle' && stream.IsDefault);
+        return isDefaultIndex >= 0 ? isDefaultIndex : null;
+    }
+
+    function applySubtitleSelection(url, itemId, playbackData) {
+        let parsedUrl;
+        try {
+            parsedUrl = new URL(url, window.location.origin);
+        } catch (_error) {
+            return url;
+        }
+
+        const requestedIndex = parsedUrl.searchParams.get('SubtitleStreamIndex');
+        const mediaSource = getPlaybackMediaSource(playbackData, parsedUrl.toString());
+        const validRequestedIndex = requestedIndex === null
+            ? null
+            : getValidSubtitleIndex(mediaSource, requestedIndex);
+        const selectedIndex = validRequestedIndex !== null
+            ? validRequestedIndex
+            : getSelectedSubtitleIndex(itemId, playbackData, parsedUrl.toString());
+        if (selectedIndex === null) {
+            parsedUrl.searchParams.delete('SubtitleStreamIndex');
+        } else {
+            parsedUrl.searchParams.set('SubtitleStreamIndex', String(selectedIndex));
+        }
+        return parsedUrl.toString();
     }
 
     function throttle(fn, delay) {
@@ -475,17 +576,19 @@
         fistTime = false;
     }
 
-    async function apiClientGetWithCache(itemId, cacheList, funName) {
+    async function apiClientGetWithCache(itemId, cacheList, funName, forceRefresh = false) {
         if (!itemId) {
             logger.info(`Skip ${funName} ${itemId}`);
         }
-        for (const cache of cacheList) {
-            if (itemId in cache) {
-                logger.info(`HIT ${funName} itemId=${itemId}`)
-                return cache[itemId];
+        if (!forceRefresh) {
+            for (const cache of cacheList) {
+                if (itemId in cache) {
+                    logger.info(`HIT ${funName} itemId=${itemId}`)
+                    return cache[itemId];
+                }
             }
         }
-        logger.info(`MISS ${funName} itemId=${itemId}`)
+        logger.info(`${forceRefresh ? 'REFRESH' : 'MISS'} ${funName} itemId=${itemId}`)
         let resInfo;
         switch (funName) {
             case 'getPlaybackInfo':
@@ -519,12 +622,12 @@
         return resInfo;
     }
 
-    async function getPlaybackWithCace(itemId) {
-        return apiClientGetWithCache(itemId, [resumePlaybackCache, allPlaybackCache], 'getPlaybackInfo');
+    async function getPlaybackWithCace(itemId, forceRefresh = false) {
+        return apiClientGetWithCache(itemId, [resumePlaybackCache, allPlaybackCache], 'getPlaybackInfo', forceRefresh);
     }
 
-    async function getItemInfoWithCace(itemId) {
-        return apiClientGetWithCache(itemId, [resumeItemDataCache, allItemDataCache], 'getItem');
+    async function getItemInfoWithCace(itemId, forceRefresh = false) {
+        return apiClientGetWithCache(itemId, [resumeItemDataCache, allItemDataCache], 'getItem', forceRefresh);
     }
 
     async function getEpisodesWithCace(seasonId) {
@@ -537,8 +640,8 @@
         episodesInfoCache = episodesInfoCache[0] ? episodesInfoCache[1].clone() : null;
         let itemId = rawId;
         let [playbackData, mainEpInfo, episodesInfoData] = await Promise.all([
-            getPlaybackWithCace(itemId), // originFetch(raw_url, request), 可能会 NoCompatibleStream
-            getItemInfoWithCace(itemId),
+            getPlaybackWithCace(itemId, true), // originFetch(raw_url, request), 可能会 NoCompatibleStream
+            getItemInfoWithCace(itemId, true),
             episodesInfoCache?.json(),
         ]);
         console.timeEnd('dealWithPlaybackInfo');
@@ -549,12 +652,22 @@
         if (itemId != correctId) {
             itemId = correctId;
             [playbackData, mainEpInfo] = await Promise.all([
-                getPlaybackWithCace(itemId),
-                getItemInfoWithCace(itemId),
+                getPlaybackWithCace(itemId, true),
+                getItemInfoWithCace(itemId, true),
             ]);
             let startPos = mainEpInfo.UserData.PlaybackPositionTicks;
             url = url.replace('StartTimeTicks=0', `StartTimeTicks=${startPos}`);
         }
+        const playbackUrlObject = new URL(url, window.location.origin);
+        if (playbackUrlObject.searchParams.has('SubtitleStreamIndex')) {
+            rememberSubtitleSelection(
+                itemId,
+                playbackData,
+                playbackUrlObject.searchParams.get('SubtitleStreamIndex'),
+                url,
+            );
+        }
+        url = applySubtitleSelection(url, itemId, playbackData);
         let playlistData = (playlistInfoCache && playlistInfoCache.Items) ? playlistInfoCache.Items : null;
         episodesInfoCache = []
         let extraData = {
@@ -585,14 +698,15 @@
     async function deailWithItemInfo(item) {
         let itemId = item.Id;
         let seasonId = item.SeasonId;
+        clearItemCache(itemId);
 
         let [mainEpInfo, playbackData, episodesInfoData] = await Promise.all([
-            getItemInfoWithCace(itemId),
-            getPlaybackWithCace(itemId),
+            getItemInfoWithCace(itemId, true),
+            getPlaybackWithCace(itemId, true),
             (seasonId) ? getEpisodesWithCace(seasonId) : null,
         ]);
 
-        let positonTicks = item.UserData.PlaybackPositionTicks;
+        let positonTicks = mainEpInfo?.UserData?.PlaybackPositionTicks ?? item.UserData.PlaybackPositionTicks;
         let userId = ApiClient._serverInfo.UserId;
         let deviceId = ApiClient._deviceId;
         let accessToken = ApiClient._userAuthInfo?.AccessToken || ApiClient._serverInfo?.AccessToken;
@@ -609,6 +723,7 @@
         let baseUrl = `${window.location.origin}/emby/Items/${itemId}/PlaybackInfo`;
         let searchParams = new URLSearchParams(urlParams);
         let playbackUrl = `${baseUrl}?${searchParams.toString()}`;
+        playbackUrl = applySubtitleSelection(playbackUrl, itemId, playbackData);
         let episodesInfo = episodesInfoData?.Items || [];
         let extraData = {
             mainEpInfo: mainEpInfo,
