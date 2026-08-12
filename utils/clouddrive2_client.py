@@ -295,9 +295,11 @@ class CloudDrive2Client:
                 timeout=self._remaining_timeout(deadline)):
             return False
         calls = 0
+        target_cooldown_started = False
         try:
             if self._refresh_cooldowns.get(cloud_path, 0.0) > self._clock():
                 return False
+            target_cooldown_started = True
             direct_parent = _parent_path(cloud_path)
             if not direct_parent:
                 return False
@@ -335,8 +337,9 @@ class CloudDrive2Client:
             self._log(f"CloudDrive2 refresh coordination failed ({type(exc).__name__})")
             return False
         finally:
-            self._refresh_cooldowns[cloud_path] = (
-                self._clock() + _REFRESH_COOLDOWN_SECONDS)
+            if target_cooldown_started:
+                self._refresh_cooldowns[cloud_path] = (
+                    self._clock() + _REFRESH_COOLDOWN_SECONDS)
             self._refresh_guard.release()
 
     def _refresh_directory(self, stub: Any, pb2: Any, directory: str,

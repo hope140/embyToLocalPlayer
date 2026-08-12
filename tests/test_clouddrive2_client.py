@@ -169,7 +169,7 @@ class CloudDrive2ClientTests(unittest.TestCase):
         now[0] += 1.0
         self.assertIsNone(client.resolve_cloud_path('/library/new.mkv'))
         self.assertEqual(1, refreshes())
-        now[0] += 5.0
+        now[0] += 4.0
         self.assertIsNone(client.resolve_cloud_path('/library/new.mkv'))
         self.assertEqual(2, refreshes())
 
