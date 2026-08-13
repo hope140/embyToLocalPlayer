@@ -1,8 +1,7 @@
 import types
 import threading
 import unittest
-from unittest import mock
-from utils.clouddrive2_client import CloudDrive2Client, CloudDrive2DownloadTarget
+from utils.clouddrive2_client import CloudDrive2Client
 
 class Req:
     def __init__(self, **kw): self.__dict__.update(kw)
@@ -10,25 +9,15 @@ class PB2:
     FindFileByPathRequest = Req
     GetDownloadUrlPathRequest = Req
 class FakeStub:
-    def __init__(self, *, url='/static/{SCHEME}/{HOST}/{PREVIEW}/video.mkv', directory=False,
-                 direct='', expires_in=None, user_agent=None, additional_headers=None):
+    def __init__(self, *, url='/static/{SCHEME}/{HOST}/{PREVIEW}/video.mkv', directory=False, direct=''):
         self.url, self.directory, self.direct = url, directory, direct
-        self.expires_in = expires_in
-        self.user_agent = user_agent
-        self.additional_headers = additional_headers
         self.calls=[]
     def FindFileByPath(self, req, **kwargs):
         self.calls.append(('find', req, kwargs))
         return types.SimpleNamespace(fullPathName=req.path, size=10, isDirectory=self.directory)
     def GetDownloadUrlPath(self, req, **kwargs):
         self.calls.append(('url', req, kwargs))
-        return types.SimpleNamespace(
-            downloadUrlPath=self.url,
-            directUrl=self.direct,
-            expiresIn=self.expires_in,
-            userAgent=self.user_agent,
-            additionalHeaders=self.additional_headers,
-        )
+        return types.SimpleNamespace(downloadUrlPath=self.url, directUrl=self.direct)
 
 def loader(): return types.SimpleNamespace(), PB2, types.SimpleNamespace()
 
@@ -75,16 +64,6 @@ class RefreshStub:
         self.calls.append(('url', req.path, kwargs))
         return types.SimpleNamespace(downloadUrlPath='/static/video.mkv')
 
-class LegacyDownloadRequest:
-    def __init__(self, *, path, preview, lazy_read):
-        self.path, self.preview, self.lazy_read = path, preview, lazy_read
-
-
-class LegacyPB2:
-    FindFileByPathRequest = Req
-    GetDownloadUrlPathRequest = LegacyDownloadRequest
-
-
 class CloudDrive2ClientTests(unittest.TestCase):
     def make(self, stub, **kw):
         return CloudDrive2Client('https://CD2.example:8443/api', 'Bearer secret',
@@ -109,75 +88,6 @@ class CloudDrive2ClientTests(unittest.TestCase):
         self.assertIsNone(self.make(FakeStub(direct='https://other/file')).resolve_cloud_path('/x'))
         self.assertIsNone(self.make(FakeStub(url='https://other/file')).resolve_cloud_path('/x'))
         self.assertIsNone(self.make(FakeStub(url='javascript:alert(1)')).resolve_cloud_path('/x'))
-
-    def test_opt_in_returns_direct_target_with_metadata_and_fallback(self):
-        stub = FakeStub(
-            direct='https://cdn.example/video.mkv?signature=synthetic',
-            expires_in=600,
-            user_agent='CloudDrive2 synthetic UA',
-            additional_headers={
-                'Authorization': 'Bearer synthetic',
-                'X-Cloud-Header': 'enabled',
-                'x-cloud-header': 'last-value-wins',
-                'Host': 'must-not-forward',
-                'Connection': 'must-not-forward',
-            },
-        )
-        target = self.make(stub, get_direct_url=True).resolve_cloud_path_target('/x')
-
-        self.assertIsInstance(target, CloudDrive2DownloadTarget)
-        self.assertTrue(target.is_direct)
-        self.assertEqual(target.url, 'https://cdn.example/video.mkv?signature=synthetic')
-        self.assertEqual(target.expires_in, 600)
-        self.assertEqual(target.user_agent, 'CloudDrive2 synthetic UA')
-        self.assertEqual(target.additional_headers, (
-            ('Authorization', 'Bearer synthetic'),
-            ('x-cloud-header', 'last-value-wins'),
-        ))
-        self.assertEqual(
-            target.fallback_url,
-            'https://cd2.example:8443/api/static/https/cd2.example:8443/false/video.mkv',
-        )
-        self.assertTrue(stub.calls[1][1].get_direct_url)
-
-    def test_invalid_or_expired_direct_url_falls_back_to_download_path(self):
-        for direct, expires_in in (
-                ('https://cdn.example/video.mkv', 0),
-                ('ftp://cdn.example/video.mkv', 600),
-                ('https://user:password@cdn.example/video.mkv', 600)):
-            with self.subTest(direct=direct, expires_in=expires_in):
-                stub = FakeStub(direct=direct, expires_in=expires_in)
-                target = self.make(stub, get_direct_url=True).resolve_cloud_path_target('/x')
-                self.assertIsInstance(target, CloudDrive2DownloadTarget)
-                self.assertFalse(target.is_direct)
-                self.assertEqual(
-                    target.url,
-                    'https://cd2.example:8443/api/static/https/cd2.example:8443/false/video.mkv',
-                )
-
-    def test_direct_url_request_is_compatible_with_old_proto(self):
-        stub = FakeStub()
-        client = CloudDrive2Client(
-            'https://cd2.example:8443/api', 'token', get_direct_url=True,
-            _stub_factory=lambda *_: stub,
-            _proto_loader=lambda: (types.SimpleNamespace(), LegacyPB2, types.SimpleNamespace()),
-        )
-
-        target = client.resolve_cloud_path_target('/x')
-        self.assertFalse(target.is_direct)
-        self.assertEqual(stub.calls[1][1].path, '/x')
-        self.assertFalse(hasattr(stub.calls[1][1], 'get_direct_url'))
-
-    def test_direct_url_failures_do_not_write_url_to_logs(self):
-        direct = 'https://cdn.example/video.mkv?signature=synthetic-secret'
-        logger = mock.Mock()
-        target = self.make(
-            FakeStub(direct=direct, expires_in=600),
-            get_direct_url=True,
-            logger=logger,
-        ).resolve_cloud_path_target('/x')
-        self.assertEqual(target.url, direct)
-        self.assertNotIn(direct, repr(logger.mock_calls))
     def test_invalid_configuration_and_missing_dependency_are_soft_failures(self):
         c = CloudDrive2Client('not a url', '   ')
         self.assertIsNone(c.resolve_download_url('/x'))

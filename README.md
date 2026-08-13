@@ -83,7 +83,6 @@ origin = http://127.0.0.1:19798
 api_token =
 path_map = X:\115=>/115open/115
 request_timeout_seconds = 2
-get_direct_url = no
 ```
 
 使用前必须满足：
@@ -92,11 +91,6 @@ get_direct_url = no
 2. 提供 CloudDrive2 API token。优先设置环境变量 `ETLP_CLOUDDRIVE2_TOKEN`，否则填写 `api_token`；不要把真实 token 提交到仓库。
 3. 为 Windows 盘符或 UNC 路径配置明确的 `path_map`，格式为 `本地前缀=>云端前缀`。它必须和 `[src]/[dst]` 产出的本地挂载路径一致。
 4. ETLP 会把可解析的本地 `.strm` 路径登记到本地短期 `/cd2/<nonce>` gateway，再按需解析 CloudDrive2 URL；解析失败会回退原挂载盘文件，不应把 gateway 当成公网媒体服务。
-
-`get_direct_url = yes` 是可选的直链实验开关。CloudDrive2 返回有效 `directUrl` 时，ETLP
-会在本地 gateway 内代理直链，并转发 CloudDrive2 返回的必要请求头和播放器的 `Range`；
-直链不可用或代理失败时，先回退 `downloadUrlPath`，再回退原挂载盘文件。直链可能包含
-短期签名信息，只保留在进程内存和本地请求处理中，不写入 `Location` 或普通日志。
 
 没有 token、`path_map` 或可用 gRPC 依赖时，CloudDrive2 gateway 不会接管播放；这不等同于 CloudDrive2 已经配置成功。
 

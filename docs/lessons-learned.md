@@ -72,16 +72,6 @@
 - 验证：当前测试覆盖各模块边界；README/FUNCTIONS.md 定义了实际播放器和服务端
   支持范围，发布前仍需按任务范围执行成品或客户端验证。
 
-## 9. CloudDrive2 直链必须在本地 gateway 内消费
-
-- 结论：`get_direct_url` 默认关闭；启用后只把 CloudDrive2 的 `directUrl` 留在进程内，
-  由本地 gateway 转发 `Range` 和必要请求头，不通过 `Location` 暴露。直链代理失败先
-  回退 `downloadUrlPath`，再回退原挂载文件；旧 protobuf 不支持请求字段时保持普通 URL
-  模式。直链能力是否被具体云盘实现，仍需真实 CD2 响应和播放器验收确认。
-- 验证：`utils/clouddrive2_client.py`、`utils/clouddrive2_gateway.py`、
-  `utils/http_server.py`、`tests/test_clouddrive2_client.py` 和
-  `tests/test_clouddrive2_gateway.py`。
-
 ## 不应直接沉淀的内容
 
 - 未能由当前 ETLP 代码、测试或运行结果确认的另一项目规则。

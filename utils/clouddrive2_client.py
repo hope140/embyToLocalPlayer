@@ -21,12 +21,6 @@ except Exception:
 
 _PLACEHOLDER_RE = re.compile(r"\{(SCHEME|HOST|PREVIEW)\}")
 _TOKEN_PREFIX = re.compile(r"^Bearer\s+", re.I)
-_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
-_HOP_BY_HOP_HEADERS = frozenset({
-    'connection', 'content-length', 'host', 'keep-alive',
-    'proxy-authenticate', 'proxy-authorization', 'te', 'trailer',
-    'transfer-encoding', 'upgrade',
-})
 _REFRESH_MAX_CALLS = 2
 _REFRESH_COOLDOWN_SECONDS = 5.0
 
@@ -50,60 +44,6 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
             except (AttributeError, TypeError):
                 pass
     return default
-
-
-def _optional_field(value: Any, name: str) -> Any:
-    """Read an optional protobuf field without treating absent as zero."""
-    has_field = getattr(value, 'HasField', None)
-    if callable(has_field):
-        candidates = (name, name[:1].lower() + name[1:])
-        for candidate in candidates:
-            try:
-                if not has_field(candidate):
-                    return None
-                break
-            except (AttributeError, TypeError, ValueError):
-                continue
-    return _field(value, name)
-
-
-def _parse_expires_in(value: Any) -> tuple[bool, int | None]:
-    if value is None:
-        return True, None
-    try:
-        expires_in = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return False, None
-    return (expires_in > 0, expires_in) if expires_in > 0 else (False, None)
-
-
-def _normalise_header_value(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text or '\r' in text or '\n' in text or len(text) > 8192:
-        return None
-    return text
-
-
-def _normalise_additional_headers(value: Any) -> tuple[tuple[str, str], ...]:
-    if value is None:
-        return ()
-    try:
-        items = value.items()
-    except AttributeError:
-        return ()
-    result: list[tuple[str, str]] = []
-    for raw_name, raw_value in items:
-        name = str(raw_name).strip()
-        header_value = _normalise_header_value(raw_value)
-        if (not name or not _HEADER_NAME_RE.fullmatch(name)
-                or name.casefold() in _HOP_BY_HOP_HEADERS
-                or header_value is None):
-            continue
-        result = [item for item in result if item[0].casefold() != name.casefold()]
-        result.append((name, header_value))
-    return tuple(result)
 
 def _normalise_posix(path: Any) -> str | None:
     if path is None:
@@ -189,24 +129,10 @@ class CloudDrive2Config:
     api_token: str
     path_map: Any = None
     request_timeout_seconds: float = 2.0
-    get_direct_url: bool = False
-
-
-@dataclass(frozen=True)
-class CloudDrive2DownloadTarget:
-    """Validated URL plus metadata required by the local gateway."""
-
-    url: str
-    is_direct: bool = False
-    expires_in: int | None = None
-    user_agent: str | None = None
-    additional_headers: tuple[tuple[str, str], ...] = ()
-    fallback_url: str | None = None
 
 class CloudDrive2Client:
     def __init__(self, origin: str, api_token: str, path_map: Any = None,
                  request_timeout_seconds: float = 2, logger: Any = None, *,
-                 get_direct_url: bool = False,
                  _stub_factory: Callable[..., Any] | None = None,
                  _channel_factory: Callable[..., Any] | None = None,
                  _proto_loader: Callable[[], tuple[Any, Any, Any]] | None = None,
@@ -224,7 +150,6 @@ class CloudDrive2Client:
         except (TypeError, ValueError):
             self.request_timeout_seconds = 2.0
         self._path_map = _parse_path_map(path_map)
-        self.get_direct_url = bool(get_direct_url)
         self._logger = logger
         self._stub_factory = _stub_factory
         self._channel_factory = _channel_factory
@@ -250,18 +175,10 @@ class CloudDrive2Client:
         return None if self._path_map else _normalise_posix(local_path)
 
     def resolve_cloud_path(self, cloud_path: Any) -> str | None:
-        target = self.resolve_cloud_path_target(cloud_path)
-        return target.url if target else None
-
-    def resolve_cloud_path_target(self, cloud_path: Any) -> CloudDrive2DownloadTarget | None:
         return self._resolve(_normalise_posix(cloud_path))
 
     def resolve_download_url(self, local_path_or_cloud_path: Any) -> str | None:
-        target = self.resolve_download_target(local_path_or_cloud_path)
-        return target.url if target else None
-
-    def resolve_download_target(self, local_path_or_cloud_path: Any) -> CloudDrive2DownloadTarget | None:
-        return self.resolve_cloud_path_target(self.map_local_path_to_cloud_path(local_path_or_cloud_path))
+        return self.resolve_cloud_path(self.map_local_path_to_cloud_path(local_path_or_cloud_path))
 
     def _log(self, message: str) -> None:
         if self._logger is None:
@@ -310,7 +227,7 @@ class CloudDrive2Client:
             self._log(f"CloudDrive2 disabled: optional gRPC unavailable ({type(exc).__name__})")
             return None
 
-    def _resolve(self, cloud_path: str | None) -> CloudDrive2DownloadTarget | None:
+    def _resolve(self, cloud_path: str | None) -> str | None:
         if not cloud_path or not self._origin:
             return None
         loaded = self._get_stub()
@@ -350,7 +267,7 @@ class CloudDrive2Client:
         return file_info, "found"
 
     def _download_url_for_file(self, stub: Any, pb2: Any, cloud_path: str,
-                               file_info: Any) -> CloudDrive2DownloadTarget | None:
+                               file_info: Any) -> str | None:
         size = _field(file_info, "size", None)
         try:
             if size is None or int(size) < 0:
@@ -358,72 +275,17 @@ class CloudDrive2Client:
         except (TypeError, ValueError, OverflowError):
             return None
         try:
-            request_values = {
-                'path': cloud_path,
-                'preview': False,
-                'lazy_read': False,
-                'get_direct_url': self.get_direct_url,
-            }
-            request_get_direct_url = self.get_direct_url
-            try:
-                request = _message(pb2, "GetDownloadUrlPathRequest", **request_values)
-            except Exception as exc:
-                if self.get_direct_url:
-                    self._log(f"CloudDrive2 direct-url request unavailable ({type(exc).__name__})")
-                request_values.pop('get_direct_url', None)
-                request_get_direct_url = False
-                request = _message(pb2, "GetDownloadUrlPathRequest", **request_values)
             url_info = stub.GetDownloadUrlPath(
-                request, metadata=self._metadata, timeout=self.request_timeout_seconds)
-            expiry_ok, expires_in = _parse_expires_in(
-                _optional_field(url_info, "expiresIn"))
-            direct_url = _field(url_info, "directUrl")
-            if request_get_direct_url and direct_url and expiry_ok:
-                direct_url = self._validate_direct_url(direct_url)
-                if direct_url:
-                    fallback_url = self._validate_url(
-                        _field(url_info, "downloadUrlPath") or _field(url_info, "placeholder"))
-                    return CloudDrive2DownloadTarget(
-                        url=direct_url,
-                        is_direct=True,
-                        expires_in=expires_in,
-                        user_agent=_normalise_header_value(_field(url_info, "userAgent")),
-                        additional_headers=_normalise_additional_headers(
-                            _field(url_info, "additionalHeaders")),
-                        fallback_url=fallback_url,
-                    )
-                self._log("CloudDrive2 direct URL rejected")
-            elif request_get_direct_url and direct_url and not expiry_ok:
-                self._log("CloudDrive2 direct URL has invalid expiry")
-            if not request_get_direct_url and (
-                    _field(url_info, "directUrl") or _field(url_info, "externalUrl")):
+                _message(pb2, "GetDownloadUrlPathRequest", path=cloud_path,
+                         preview=False, lazy_read=False, get_direct_url=False),
+                metadata=self._metadata, timeout=self.request_timeout_seconds)
+            if _field(url_info, "directUrl") or _field(url_info, "externalUrl"):
                 return None
             url_path = _field(url_info, "downloadUrlPath") or _field(url_info, "placeholder")
-            url_path = self._validate_url(url_path)
-            return CloudDrive2DownloadTarget(url=url_path) if url_path else None
+            return self._validate_url(url_path)
         except Exception as exc:
             self._log(f"CloudDrive2 URL resolution failed ({type(exc).__name__})")
             return None
-
-    @staticmethod
-    def _validate_direct_url(value: Any) -> str | None:
-        if not isinstance(value, str) or not value.strip():
-            return None
-        value = value.strip()
-        if '\r' in value or '\n' in value:
-            return None
-        parsed = urlparse(value)
-        if (parsed.scheme.casefold() not in {"http", "https"}
-                or not parsed.hostname
-                or parsed.username is not None
-                or parsed.password is not None
-                or parsed.fragment):
-            return None
-        try:
-            parsed.port
-        except ValueError:
-            return None
-        return urlunparse(parsed)
 
     def _refresh_missing_path(self, stub: Any, pb2: Any, cloud_path: str) -> bool:
         """Refresh at most the direct parent and its parent after a miss."""
@@ -601,5 +463,5 @@ def _load_proto_modules() -> tuple[Any, Any, Any]:
     pb2_grpc = importlib.import_module("utils.clouddrive2_proto.clouddrive_pb2_grpc")
     return grpc, pb2, pb2_grpc
 
-__all__ = ["CloudDrive2Client", "CloudDrive2Config", "CloudDrive2DownloadTarget"]
+__all__ = ["CloudDrive2Client", "CloudDrive2Config"]
 
