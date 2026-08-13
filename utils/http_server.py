@@ -81,6 +81,11 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         '/action/sparse_file',
     }
     _MEDIA_PATH_RE = re.compile(r'^/send_media_file(?:\.[A-Za-z0-9]+)?$')
+    # .strm pointer files are plain text; the media location is on the first
+    # line.  Bound both the read and the redirected URL so a corrupt pointer
+    # cannot turn the gateway into a large-memory or arbitrary-scheme relay.
+    _STRM_MAX_READ_BYTES = 64 * 1024
+    _STRM_MAX_URL_LENGTH = 8192
 
     @staticmethod
     def _is_client_disconnect_error(exc):
@@ -512,6 +517,21 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
+        # A derived local path that is still a .strm pointer cannot be played
+        # as media, and its CD2 cloud counterpart (if any) is the same pointer
+        # text rather than the media.  Read the pointer and redirect to the
+        # real URL inside it, which is the mounted-file fallback applied to
+        # .strm files; skip CD2 resolution for this case entirely.
+        if entry.local_path.lower().endswith('.strm'):
+            if not getattr(entry, 'allow_local_fallback', False):
+                self.send_response(404)
+                self.end_headers()
+                return
+            if UserScriptRequestHandler._send_cd2_strm_fallback(self, entry.local_path):
+                return
+            self.send_response(404)
+            self.end_headers()
+            return
         cd2_url = gateway.resolve_entry(entry)
         if cd2_url:
             self.send_response(307)
@@ -525,11 +545,83 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        if not self._is_allowed_media_extension(entry.local_path):
-            self.send_response(404)
-            self.end_headers()
+        if self._is_allowed_media_extension(entry.local_path) and os.path.isfile(entry.local_path):
+            self._send_local_file(entry.local_path)
             return
-        self._send_local_file(entry.local_path)
+        # The derived media file is missing or not a media path (e.g. a cold
+        # mount that has not materialized the large file yet).  The tiny
+        # sibling .strm pointer is usually available even then; redirect to
+        # the real URL stored inside it.
+        strm_path = os.path.splitext(entry.local_path)[0] + '.strm'
+        if UserScriptRequestHandler._send_cd2_strm_fallback(self, strm_path):
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    @staticmethod
+    def _read_strm_content(local_path):
+        """Read at most ``_STRM_MAX_READ_BYTES`` bytes of a .strm file.
+
+        Returns ``None`` (not an empty body) when the file cannot be read,
+        so the caller can tell "unreadable" apart from "empty pointer".
+        """
+        try:
+            with open(local_path, 'rb') as stream:
+                return stream.read(UserScriptRequestHandler._STRM_MAX_READ_BYTES)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _parse_strm_url(content):
+        """Return the first http(s) URL of a .strm body, else ``None``.
+
+        A .strm pointer is plain text and the first non-empty line carries
+        the media location.  Only absolute http(s) URLs are accepted so the
+        gateway never redirects to a local scheme, and URLs embedding
+        credentials are rejected to keep them out of player request logs.
+        """
+        if isinstance(content, (bytes, bytearray)):
+            try:
+                content = bytes(content).decode('utf-8')
+            except UnicodeDecodeError:
+                return None
+        if not isinstance(content, str):
+            return None
+        text = content.lstrip('\ufeff \t\r\n')
+        if not text:
+            return None
+        candidate = text.splitlines()[0].strip()
+        if not candidate or len(candidate) > UserScriptRequestHandler._STRM_MAX_URL_LENGTH:
+            return None
+        if any(ord(char) < 32 or ord(char) == 127 for char in candidate):
+            return None
+        parsed = urllib.parse.urlparse(candidate)
+        if parsed.scheme.casefold() not in ('http', 'https') or not parsed.netloc:
+            return None
+        if parsed.username is not None or parsed.password is not None:
+            return None
+        return candidate
+
+    @staticmethod
+    def _send_cd2_strm_fallback(handler, local_path):
+        """Best-effort .strm playback when CD2 resolution is unavailable.
+
+        Redirects the player to the URL stored inside the .strm pointer
+        file, mirroring what the mounted-file fallback does for real media.
+        Returns ``False`` when the file is unreadable or its content is not
+        a usable URL, leaving the caller to answer 404.
+        """
+        content = UserScriptRequestHandler._read_strm_content(local_path)
+        url = UserScriptRequestHandler._parse_strm_url(content) if content is not None else None
+        if not url:
+            logger.info('cd2 strm fallback failed, no usable url in', os.path.basename(local_path))
+            return False
+        logger.info('cd2 strm fallback redirect, host', urllib.parse.urlparse(url).netloc)
+        handler.send_response(307)
+        handler.send_header('Location', url)
+        handler.send_header('Cache-Control', 'no-store')
+        handler.end_headers()
+        return True
 
     def _cd2_client_key(self) -> str:
         """Return a stable, in-memory client binding for a CD2 nonce."""

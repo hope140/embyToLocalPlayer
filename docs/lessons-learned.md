@@ -72,6 +72,19 @@
 - 验证：当前测试覆盖各模块边界；README/FUNCTIONS.md 定义了实际播放器和服务端
   支持范围，发布前仍需按任务范围执行成品或客户端验证。
 
+## 9. .strm 指针文件不能当媒体直发，CD2 回退必须读指针重定向
+
+- 现象：strm 内部 URL 不带媒体后缀时，`strm_local_media_path` 推导出的本地路径
+  仍是 `.strm`；此时 CD2 云路径（若存在）也是同一份指针文本而不是媒体。旧回退
+  链在扩展名白名单处拒绝 `.strm`，CD2 解析临时失败就硬 404，表现为时好时坏。
+- 结论：`/cd2/` 回退只接受两类目标：扩展名合法且存在的本地媒体文件，或 .strm
+  指针文件内容中的首个 http(s) URL（307 重定向）。`.strm` 派生路径直接跳过 CD2
+  解析；派生媒体文件缺失时尝试同名 `.strm` 兄弟文件，因为小指针文件在冷挂载下
+  通常比大媒体文件更早可见。指针 URL 只接受绝对 http(s) 且拒绝内嵌账号密码，
+  避免把凭据带进播放器请求日志。
+- 验证：`utils/http_server.py` 的 `_send_cd2_strm_fallback` 及
+  `tests/test_clouddrive2_gateway.py` 的 `HttpGatewayRouteTests`、`StrmContentParseTests`。
+
 ## 不应直接沉淀的内容
 
 - 未能由当前 ETLP 代码、测试或运行结果确认的另一项目规则。

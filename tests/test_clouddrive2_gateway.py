@@ -214,11 +214,36 @@ class HttpGatewayRouteTests(unittest.TestCase):
         fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
             local_path='movie.mkv', allow_local_fallback=True)
         fake_gateway.resolve_entry.return_value = None
-        with mock.patch.object(http_server, 'gateway', fake_gateway):
+        with mock.patch.object(http_server, 'gateway', fake_gateway), \
+                mock.patch.object(http_server.os.path, 'isfile', return_value=True):
             http_server.UserScriptRequestHandler.send_cd2_file(handler)
 
         handler._send_local_file.assert_called_once_with('movie.mkv')
         self.assertEqual(handler.responses, [])
+
+    def test_send_cd2_file_sibling_strm_fallback_when_media_missing(self):
+        with tempfile.NamedTemporaryFile('w', suffix='.strm', delete=False,
+                                         encoding='utf-8') as stream:
+            stream.write('https://cdn.example.com/real-media?id=9\n')
+            strm_path = stream.name
+        media_path = os.path.splitext(strm_path)[0] + '.mkv'  # does not exist
+        try:
+            handler = _FakeHandler()
+            handler.path = '/cd2/opaque-nonce'
+            handler._send_local_file = mock.Mock()
+            fake_gateway = mock.Mock()
+            fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
+                local_path=media_path, allow_local_fallback=True)
+            fake_gateway.resolve_entry.return_value = None
+            with mock.patch.object(http_server, 'gateway', fake_gateway):
+                http_server.UserScriptRequestHandler.send_cd2_file(handler)
+        finally:
+            os.unlink(strm_path)
+
+        self.assertEqual(handler.responses, [307])
+        self.assertIn(('Location', 'https://cdn.example.com/real-media?id=9'),
+                      handler.headers_sent)
+        handler._send_local_file.assert_not_called()
 
     def test_send_cd2_file_does_not_fallback_for_direct_register_entry(self):
         handler = _FakeHandler()
@@ -247,6 +272,115 @@ class HttpGatewayRouteTests(unittest.TestCase):
 
         self.assertEqual(handler.responses, [404])
         handler._send_local_file.assert_not_called()
+
+    def test_send_cd2_file_strm_fallback_redirects_to_inner_url(self):
+        with tempfile.NamedTemporaryFile('w', suffix='.strm', delete=False,
+                                         encoding='utf-8') as stream:
+            stream.write('https://cdn.example.com/video?id=123\n')
+            strm_path = stream.name
+        try:
+            handler = _FakeHandler()
+            handler.path = '/cd2/opaque-nonce'
+            handler._send_local_file = mock.Mock()
+            fake_gateway = mock.Mock()
+            fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
+                local_path=strm_path, allow_local_fallback=True)
+            fake_gateway.resolve_entry.return_value = 'https://cd2.example/video.mkv'
+            with mock.patch.object(http_server, 'gateway', fake_gateway):
+                http_server.UserScriptRequestHandler.send_cd2_file(handler)
+        finally:
+            os.unlink(strm_path)
+
+        self.assertEqual(handler.responses, [307])
+        self.assertIn(('Location', 'https://cdn.example.com/video?id=123'),
+                      handler.headers_sent)
+        self.assertIn(('Cache-Control', 'no-store'), handler.headers_sent)
+        # A .strm pointer is never resolved through CD2: its cloud counterpart
+        # would be the same pointer text, not the media.
+        fake_gateway.resolve_entry.assert_not_called()
+
+    def test_send_cd2_file_strm_fallback_404_when_content_not_usable(self):
+        for content in ('not a url\n', '', '   \n', 'file:///C:/Windows/win.ini\n',
+                        'rtsp://host/video\n', 'http://user:pass@example.com/video.mkv\n',
+                        'http://' + 'a' * 9000 + '/video.mkv\n'):
+            with self.subTest(content=content):
+                with tempfile.NamedTemporaryFile('w', suffix='.strm', delete=False,
+                                                 encoding='utf-8') as stream:
+                    stream.write(content)
+                    strm_path = stream.name
+                try:
+                    handler = _FakeHandler()
+                    handler.path = '/cd2/opaque-nonce'
+                    handler._send_local_file = mock.Mock()
+                    fake_gateway = mock.Mock()
+                    fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
+                        local_path=strm_path, allow_local_fallback=True)
+                    fake_gateway.resolve_entry.return_value = None
+                    with mock.patch.object(http_server, 'gateway', fake_gateway):
+                        http_server.UserScriptRequestHandler.send_cd2_file(handler)
+                finally:
+                    os.unlink(strm_path)
+
+                self.assertEqual(handler.responses, [404])
+                handler._send_local_file.assert_not_called()
+
+    def test_send_cd2_file_strm_fallback_requires_mapped_entry(self):
+        handler = _FakeHandler()
+        handler.path = '/cd2/opaque-nonce'
+        handler._send_local_file = mock.Mock()
+        fake_gateway = mock.Mock()
+        fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
+            local_path='movie.strm', allow_local_fallback=False)
+        fake_gateway.resolve_entry.return_value = None
+        with mock.patch.object(http_server, 'gateway', fake_gateway):
+            http_server.UserScriptRequestHandler.send_cd2_file(handler)
+
+        self.assertEqual(handler.responses, [404])
+        handler._send_local_file.assert_not_called()
+        fake_gateway.resolve_entry.assert_not_called()
+
+    def test_send_cd2_file_strm_fallback_404_when_pointer_unreadable(self):
+        handler = _FakeHandler()
+        handler.path = '/cd2/opaque-nonce'
+        handler._send_local_file = mock.Mock()
+        fake_gateway = mock.Mock()
+        fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
+            local_path=r'Z:\missing\movie.strm', allow_local_fallback=True)
+        fake_gateway.resolve_entry.return_value = None
+        with mock.patch.object(http_server, 'gateway', fake_gateway):
+            http_server.UserScriptRequestHandler.send_cd2_file(handler)
+
+        self.assertEqual(handler.responses, [404])
+        handler._send_local_file.assert_not_called()
+
+
+class StrmContentParseTests(unittest.TestCase):
+    """Unit coverage for the .strm pointer parsing helper."""
+
+    parse = staticmethod(http_server.UserScriptRequestHandler._parse_strm_url)
+
+    def test_accepts_http_and_https_first_line(self):
+        self.assertEqual(
+            self.parse(b'https://cdn.example/video.mkv\n'), 'https://cdn.example/video.mkv')
+        self.assertEqual(
+            self.parse('http://a.example/x?id=1#frag\n'), 'http://a.example/x?id=1#frag')
+        self.assertEqual(
+            self.parse('\ufeffhttps://a.example/x\n'), 'https://a.example/x')
+        self.assertEqual(
+            self.parse(' \nhttps://a.example/x\n'), 'https://a.example/x')
+
+    def test_rejects_non_http_and_embedded_credentials(self):
+        for content in (
+                '', '   ', 'not a url', 'file:///C:/x.mkv', 'rtsp://host/x',
+                '//host/path', 'http://', 'https://',
+                'http://user:pass@host/x',
+                'http://' + 'a' * 9000, 'line1\nline2'):
+            with self.subTest(content=content):
+                self.assertIsNone(self.parse(content))
+
+    def test_rejects_non_text_content(self):
+        self.assertIsNone(self.parse(b'\xff\xfe\x00garbage'))
+        self.assertIsNone(self.parse(123))
 
     def test_head_range_sets_headers_without_writing_body(self):
         handler = _FakeHandler(range_header='bytes=2-4', command='HEAD')
