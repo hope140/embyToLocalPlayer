@@ -29,7 +29,6 @@ _HOP_BY_HOP_HEADERS = frozenset({
 })
 _REFRESH_MAX_CALLS = 2
 _REFRESH_COOLDOWN_SECONDS = 5.0
-_DIRECT_LINK_RETRY_COOLDOWN_SECONDS = 30.0
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
@@ -237,12 +236,6 @@ class CloudDrive2Client:
         # One lock serializes refreshes and coalesces concurrent probes.
         self._refresh_guard = threading.Lock()
         self._refresh_cooldowns: dict[str, float] = {}
-        # Direct-link enabling is a CD2 configuration side effect.  Coalesce
-        # concurrent attempts and avoid retrying a missing permission on every
-        # Range request, while allowing a later retry after the user fixes the
-        # token or CD2 configuration.
-        self._direct_link_state_lock = threading.Lock()
-        self._direct_link_state: dict[tuple[str, str], float] = {}
 
     def map_local_path_to_cloud_path(self, local_path: Any) -> str | None:
         local = _normalise_local(local_path)
@@ -335,92 +328,7 @@ class CloudDrive2Client:
             file_info, state = self._find_file(stub, pb2, cloud_path)
         if state != "found" or _is_directory(file_info):
             return None
-        if self.get_direct_url:
-            self._ensure_direct_link_enabled(stub, pb2, cloud_path, file_info)
         return self._download_url_for_file(stub, pb2, cloud_path, file_info)
-
-    def _ensure_direct_link_enabled(self, stub: Any, pb2: Any,
-                                    cloud_path: str, file_info: Any) -> bool:
-        """Enable CD2's per-cloud direct-link switch when the token permits it.
-
-        The operation is deliberately best-effort.  A missing permission,
-        unsupported provider, old CD2 API, or transient RPC error must leave
-        the normal ``downloadUrlPath`` path available to playback.
-        """
-        identity = self._cloud_api_identity(stub, pb2, cloud_path, file_info)
-        if identity is None:
-            return False
-        cloud_name, user_name = identity
-        key = (cloud_name, user_name)
-        now = self._clock()
-        with self._direct_link_state_lock:
-            retry_at = self._direct_link_state.get(key)
-            if retry_at is not None and retry_at > now:
-                return retry_at == float("inf")
-            self._direct_link_state[key] = now + _DIRECT_LINK_RETRY_COOLDOWN_SECONDS
-
-        request = _message(
-            pb2, "GetCloudAPIConfigRequest",
-            cloudName=cloud_name, userName=user_name)
-        try:
-            config = stub.GetCloudAPIConfig(
-                request, metadata=self._metadata, timeout=self.request_timeout_seconds)
-            if not bool(_optional_field(config, "supportDirectDownloadUrl")):
-                self._log("CloudDrive2 direct-link provider capability unavailable")
-                return False
-            if bool(_field(config, "supportDirectLink", False)):
-                with self._direct_link_state_lock:
-                    self._direct_link_state[key] = float("inf")
-                return True
-
-            # Mutate the response object so all other mutable per-cloud
-            # settings are preserved.  CD2 documents the capability/limit
-            # fields as read-only and ignores them on SetCloudAPIConfig.
-            setattr(config, "supportDirectLink", True)
-            stub.SetCloudAPIConfig(
-                _message(pb2, "SetCloudAPIConfigRequest",
-                         cloudName=cloud_name, userName=user_name, config=config),
-                metadata=self._metadata, timeout=self.request_timeout_seconds)
-            verified = stub.GetCloudAPIConfig(
-                request, metadata=self._metadata, timeout=self.request_timeout_seconds)
-            if bool(_field(verified, "supportDirectLink", False)):
-                with self._direct_link_state_lock:
-                    self._direct_link_state[key] = float("inf")
-                self._log("CloudDrive2 direct-link enabled")
-                return True
-            self._log("CloudDrive2 direct-link enable was not confirmed")
-        except Exception as exc:
-            # Do not include the RPC text: CD2 errors can contain URLs or
-            # account details.  Playback continues through the fallback path.
-            self._log(f"CloudDrive2 direct-link auto-enable failed ({type(exc).__name__})")
-        return False
-
-    def _cloud_api_identity(self, stub: Any, pb2: Any, cloud_path: str,
-                            file_info: Any) -> tuple[str, str] | None:
-        cloud_api = _field(file_info, "CloudAPI")
-        cloud_name = str(_field(cloud_api, "name", "") or "").strip()
-        user_name = str(_field(cloud_api, "userName", "") or "").strip()
-        if not cloud_name:
-            normal = _normalise_posix(cloud_path) or ""
-            parts = [part for part in normal.split("/") if part]
-            cloud_name = parts[0] if parts else ""
-        if cloud_name and user_name:
-            return cloud_name, user_name
-        if not cloud_name:
-            return None
-        try:
-            apis = stub.GetAllCloudApis(
-                _empty_message(pb2), metadata=self._metadata,
-                timeout=self.request_timeout_seconds)
-            for api in getattr(apis, "apis", ()):
-                if str(_field(api, "name", "") or "").strip() != cloud_name:
-                    continue
-                user_name = str(_field(api, "userName", "") or "").strip()
-                if user_name:
-                    return cloud_name, user_name
-        except Exception as exc:
-            self._log(f"CloudDrive2 direct-link identity lookup failed ({type(exc).__name__})")
-        return None
 
     def _find_file(self, stub: Any, pb2: Any, cloud_path: str,
                    timeout: float | None = None) -> tuple[Any, str]:
@@ -686,17 +594,6 @@ def _message(pb2: Any, name: str, **values: Any) -> Any:
                 setattr(obj, key, value)
             return obj
     return SimpleNamespace(**values)
-
-
-def _empty_message(pb2: Any) -> Any:
-    cls = getattr(pb2, "Empty", None) if pb2 is not None else None
-    if cls is not None:
-        return cls()
-    try:
-        from google.protobuf.empty_pb2 import Empty
-        return Empty()
-    except Exception:
-        return SimpleNamespace()
 
 def _load_proto_modules() -> tuple[Any, Any, Any]:
     grpc = importlib.import_module("grpc")

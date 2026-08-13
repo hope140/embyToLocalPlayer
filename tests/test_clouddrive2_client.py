@@ -30,50 +30,6 @@ class FakeStub:
             additionalHeaders=self.additional_headers,
         )
 
-
-class DirectLinkConfigStub(FakeStub):
-    def __init__(self, *, support_direct=False, support_download=True,
-                 user_name='cloud-user', fail_set=False, **kwargs):
-        super().__init__(**kwargs)
-        self.support_direct = support_direct
-        self.support_download = support_download
-        self.user_name = user_name
-        self.fail_set = fail_set
-        self.config_calls = []
-        self.set_calls = []
-
-    def FindFileByPath(self, req, **kwargs):
-        self.calls.append(('find', req, kwargs))
-        return types.SimpleNamespace(
-            fullPathName=req.path,
-            size=10,
-            isDirectory=False,
-            CloudAPI=types.SimpleNamespace(name='115open', userName=self.user_name),
-        )
-
-    def GetCloudAPIConfig(self, req, **kwargs):
-        self.config_calls.append((req, kwargs))
-        return types.SimpleNamespace(
-            supportDirectDownloadUrl=self.support_download,
-            supportDirectLink=self.support_direct,
-            maxDownloadThreads=8,
-        )
-
-    def SetCloudAPIConfig(self, req, **kwargs):
-        self.set_calls.append((req, kwargs))
-        if self.fail_set:
-            raise RuntimeError('permission denied')
-        self.support_direct = bool(req.config.supportDirectLink)
-
-
-class DirectLinkIdentityLookupStub(DirectLinkConfigStub):
-    def __init__(self, **kwargs):
-        super().__init__(user_name='', **kwargs)
-
-    def GetAllCloudApis(self, _req, **kwargs):
-        return types.SimpleNamespace(
-            apis=[types.SimpleNamespace(name='115open', userName='cloud-user')])
-
 def loader(): return types.SimpleNamespace(), PB2, types.SimpleNamespace()
 
 
@@ -183,54 +139,6 @@ class CloudDrive2ClientTests(unittest.TestCase):
             'https://cd2.example:8443/api/static/https/cd2.example:8443/false/video.mkv',
         )
         self.assertTrue(stub.calls[1][1].get_direct_url)
-
-    def test_auto_enable_direct_link_preserves_config_and_verifies(self):
-        stub = DirectLinkConfigStub(
-            direct='https://cdn.example/video.mkv?signature=synthetic',
-            expires_in=600,
-        )
-        client = self.make(stub, get_direct_url=True)
-
-        target = client.resolve_cloud_path_target('/115open/video.mkv')
-
-        self.assertTrue(target.is_direct)
-        self.assertEqual(len(stub.set_calls), 1)
-        self.assertTrue(stub.set_calls[0][0].config.supportDirectLink)
-        self.assertEqual(stub.set_calls[0][0].config.maxDownloadThreads, 8)
-        self.assertEqual(len(stub.config_calls), 2)
-        self.assertTrue(stub.calls[-1][1].get_direct_url)
-
-        client.resolve_cloud_path_target('/115open/video.mkv')
-        self.assertEqual(len(stub.set_calls), 1)
-
-    def test_auto_enable_uses_cloud_api_lookup_when_file_has_no_user(self):
-        stub = DirectLinkIdentityLookupStub(
-            direct='https://cdn.example/video.mkv?signature=synthetic',
-            expires_in=600,
-        )
-        target = self.make(stub, get_direct_url=True).resolve_cloud_path_target(
-            '/115open/video.mkv')
-
-        self.assertTrue(target.is_direct)
-        self.assertEqual(stub.set_calls[0][0].userName, 'cloud-user')
-
-    def test_auto_enable_skips_provider_without_direct_download_capability(self):
-        stub = DirectLinkConfigStub(support_download=False)
-        target = self.make(stub, get_direct_url=True).resolve_cloud_path_target(
-            '/115open/video.mkv')
-
-        self.assertFalse(target.is_direct)
-        self.assertEqual(stub.set_calls, [])
-        self.assertEqual(len(stub.config_calls), 1)
-
-    def test_auto_enable_failure_keeps_download_path_fallback(self):
-        stub = DirectLinkConfigStub(fail_set=True)
-        target = self.make(stub, get_direct_url=True).resolve_cloud_path_target(
-            '/115open/video.mkv')
-
-        self.assertFalse(target.is_direct)
-        self.assertTrue(target.url.startswith('https://cd2.example:8443/api/'))
-        self.assertEqual(len(stub.set_calls), 1)
 
     def test_invalid_or_expired_direct_url_falls_back_to_download_path(self):
         for direct, expires_in in (

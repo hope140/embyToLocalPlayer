@@ -47,9 +47,8 @@ flowchart LR
 4. 控制命令必须绑定当前播放 session、控制设备和用户上下文；状态回传中的 Item/
    MediaSource 要跟随当前播放项目，旧 session 的命令不能被新播放确认。
 5. STRM 本地预热和 CloudDrive2 解析均是 best-effort：超时或不可用时保留原有
-   路径判断和回退路径，不能阻塞播放启动。CloudDrive2 直链默认关闭；开启后按需读取
-   并自动开启映射云盘的 `supportDirectLink`，直链只在本地 gateway 内代理，不通过
-   `Location` 暴露，失败先回退 `downloadUrlPath`。
+   路径判断和回退路径，不能阻塞播放启动。CloudDrive2 直链默认关闭；开启后直链只
+   在本地 gateway 内代理，不通过 `Location` 暴露，失败先回退 `downloadUrlPath`。
 6. 更新器只在固定 beta 包的 SHA-256 sidecar 校验通过后替换 live archive；配置
    文件不由更新包直接覆盖，ZIP 成员必须先经过安全校验。
 
