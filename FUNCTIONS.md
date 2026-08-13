@@ -89,6 +89,10 @@ flowchart LR
 - token 优先从 `ETLP_CLOUDDRIVE2_TOKEN` 读取；配置文件中的 `api_token` 只能作为回退来源，禁止提交真实 token。
 - `path_map` 使用 `本地前缀=>云端前缀`，例如 `X:\115=>/115open/115`。没有 token、映射或可用 gRPC 时，gateway 不会登记路径。
 - `get_direct_url` 默认关闭。开启后只有 CloudDrive2 返回有效 `directUrl` 时才走本地直链代理；`expiresIn`、`userAgent` 和 `additionalHeaders` 只用于当前请求，不能写入日志。
+- 开启 `get_direct_url` 后，若映射云盘支持直链但 `supportDirectLink` 未开启，ETLP 会通过
+  `GetCloudAPIConfig`/`SetCloudAPIConfig` 自动开启并回读确认。CD2 Token 需要
+  `allow_get_cloud_apis`、`allow_modify_cloud_apis`，账户/云盘还需具备
+  `enable_direct_link` 角色或会员资格；失败时保持普通回退链路。
 - gateway URL 只暴露随机 nonce；本地路径、CloudDrive2 凭据和直链签名留在进程内存。直链代理失败先回退 `downloadUrlPath`，解析失败再走原挂载文件回退路径。
 - 不要把 gateway 或本地 HTTP 服务配置为公网媒体服务；其设计目标是本机播放和受控的局部接口。
 

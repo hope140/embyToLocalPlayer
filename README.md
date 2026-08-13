@@ -98,6 +98,13 @@ get_direct_url = no
 直链不可用或代理失败时，先回退 `downloadUrlPath`，再回退原挂载盘文件。直链可能包含
 短期签名信息，只保留在进程内存和本地请求处理中，不写入 `Location` 或普通日志。
 
+开启该选项后，ETLP 会按需读取映射云盘配置；当云盘声明支持直链但
+`supportDirectLink` 尚未开启时，会通过 CD2 API 自动开启并重新校验。对应的 CD2 API
+Token 需要同时具备 `allow_get_cloud_apis` 和 `allow_modify_cloud_apis` 权限，账户/云盘
+还必须具备 CD2 的 `enable_direct_link` 直链角色或会员资格，且云盘自身需要报告
+`supportDirectDownloadUrl = true`。权限不足、云盘不支持或 API 失败时不会阻断播放，仍按
+`downloadUrlPath` 和本地挂载文件回退。
+
 没有 token、`path_map` 或可用 gRPC 依赖时，CloudDrive2 gateway 不会接管播放；这不等同于 CloudDrive2 已经配置成功。
 
 ### 进度回传与 Emby 控制台

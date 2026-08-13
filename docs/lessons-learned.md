@@ -74,10 +74,12 @@
 
 ## 9. CloudDrive2 直链必须在本地 gateway 内消费
 
-- 结论：`get_direct_url` 默认关闭；启用后只把 CloudDrive2 的 `directUrl` 留在进程内，
-  由本地 gateway 转发 `Range` 和必要请求头，不通过 `Location` 暴露。直链代理失败先
-  回退 `downloadUrlPath`，再回退原挂载文件；旧 protobuf 不支持请求字段时保持普通 URL
-  模式。直链能力是否被具体云盘实现，仍需真实 CD2 响应和播放器验收确认。
+- 结论：`get_direct_url` 默认关闭；启用后按需读取并自动开启映射云盘的
+  `supportDirectLink`，只把 CloudDrive2 的 `directUrl` 留在进程内，由本地 gateway
+  转发 `Range` 和必要请求头，不通过 `Location` 暴露。直链代理失败先回退
+  `downloadUrlPath`，再回退原挂载文件；旧 protobuf、权限不足或不支持直链时保持普通
+  URL 模式。自动开启需要 CD2 Token 的 `allow_get_cloud_apis`、
+  `allow_modify_cloud_apis`，以及账户/云盘的直链角色或会员资格。
 - 验证：`utils/clouddrive2_client.py`、`utils/clouddrive2_gateway.py`、
   `utils/http_server.py`、`tests/test_clouddrive2_client.py` 和
   `tests/test_clouddrive2_gateway.py`。
