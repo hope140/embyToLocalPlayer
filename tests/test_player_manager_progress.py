@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 
+import utils.net_tools as net_tools
 import utils.player_manager as player_manager
 from utils.player_manager import PlayerManager
 
@@ -60,6 +61,35 @@ class PlaylistPositionFallbackTests(unittest.TestCase):
         self.assertEqual(manager.playlist_time, {'EP1': 45})
 
 
+class RealtimePlayingSenderTests(unittest.TestCase):
+    def make_data(self):
+        return {
+            'server': 'emby',
+            'scheme': 'https',
+            'netloc': 'emby.example',
+            'api_key': 'api-key',
+            'device_id': 'device',
+            'headers': {},
+            'item_id': 'item',
+            'media_source_id': 'source',
+            'play_session_id': 'session',
+        }
+
+    def test_successful_request_returns_true(self):
+        with mock.patch.object(net_tools, 'requests_urllib') as request:
+            self.assertTrue(net_tools.realtime_playing_request_sender(
+                self.make_data(), cur_sec=12, method='playing'))
+        request.assert_called_once()
+
+    def test_retried_failure_returns_false_without_claiming_success(self):
+        with mock.patch.object(net_tools, 'requests_urllib', side_effect=RuntimeError('offline')) as request, \
+                mock.patch.object(net_tools.time, 'sleep') as sleep:
+            self.assertFalse(net_tools.realtime_playing_request_sender(
+                self.make_data(), cur_sec=12, method='end'))
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+
 class UpdatePlaybackForEpsTests(unittest.TestCase):
     def make_manager(self, times=None):
         manager = PlayerManager.__new__(PlayerManager)
@@ -109,6 +139,36 @@ class UpdatePlaybackForEpsTests(unittest.TestCase):
             manager.update_playback_for_eps()
 
         self.assertEqual(updated, [100, 200])
+
+    def test_failed_realtime_end_falls_back_for_unknown_short_episode(self):
+        manager = self.make_manager(times={'EP1': 10})
+        manager.playlist_data['EP1']['_playing_feedback_started'] = True
+        fallback = []
+        with mock.patch.object(player_manager, 'realtime_playing_request_sender', return_value=False), \
+                mock.patch.object(
+                    player_manager, 'update_server_playback_progress',
+                    side_effect=lambda stop_sec, data: fallback.append(
+                        (stop_sec, data.get('total_sec'), data.get('update_success')))), \
+                mock.patch.object(manager, 'prefetch_next_ep_playback_info'):
+            manager.update_playback_for_eps()
+
+        self.assertEqual(fallback, [(10, 86400, None)])
+        self.assertNotIn('update_success', manager.playlist_data['EP1'])
+
+    def test_successful_realtime_end_only_needs_stopped_fallback(self):
+        manager = self.make_manager(times={'EP1': 100})
+        manager.playlist_data['EP1']['total_sec'] = 3000
+        manager.playlist_data['EP1']['_playing_feedback_started'] = True
+        update_success = []
+        with mock.patch.object(player_manager, 'realtime_playing_request_sender', return_value=True), \
+                mock.patch.object(
+                    player_manager, 'update_server_playback_progress',
+                    side_effect=lambda stop_sec, data: update_success.append(
+                        data.get('update_success'))), \
+                mock.patch.object(manager, 'prefetch_next_ep_playback_info'):
+            manager.update_playback_for_eps()
+
+        self.assertEqual(update_success, [True])
 
 
 if __name__ == '__main__':

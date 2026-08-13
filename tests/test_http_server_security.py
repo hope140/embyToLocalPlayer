@@ -6,6 +6,7 @@ import unittest
 import urllib.error
 import urllib.request
 from configparser import ConfigParser
+from types import SimpleNamespace
 from unittest import mock
 
 import utils.http_server as http_server
@@ -43,6 +44,58 @@ class HttpSecurityUnitTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         http_server.run_server(ip='0.0.0.0', port=0)
                 server_cls.assert_not_called()
+
+    def test_cd2_non_loopback_auth_allows_same_host_player_but_gates_remote_client(self):
+        raw = ConfigParser()
+        token = 't' * 32
+        raw.read_dict({'dev': {'http_server_token': token}})
+
+        def route(client_ip, authorization=None):
+            handler = object.__new__(http_server.UserScriptRequestHandler)
+            handler.command = 'GET'
+            handler.path = '/cd2/opaque'
+            handler.client_address = (client_ip, 12345)
+            handler.server = SimpleNamespace(server_address=('192.0.2.10', 58000))
+            handler.headers = {}
+            if authorization is not None:
+                handler.headers['Authorization'] = authorization
+            handler.send_cd2_file = mock.Mock()
+            handler._send_error = mock.Mock()
+            return handler
+
+        with mock.patch.object(http_server.configs, 'raw', raw):
+            local_player = route('192.0.2.10')
+            http_server.UserScriptRequestHandler.do_GET(local_player)
+            local_player.send_cd2_file.assert_called_once_with()
+            local_player._send_error.assert_not_called()
+
+            for authorization in (None, 'Bearer wrong'):
+                with self.subTest(authorization=authorization):
+                    remote = route('192.0.2.11', authorization)
+                    http_server.UserScriptRequestHandler.do_GET(remote)
+                    remote.send_cd2_file.assert_not_called()
+                    remote._send_error.assert_called_once()
+
+            remote = route('192.0.2.11', f'Bearer {token}')
+            http_server.UserScriptRequestHandler.do_GET(remote)
+            remote.send_cd2_file.assert_called_once_with()
+
+    def test_cd2_head_uses_the_same_authorization_boundary(self):
+        raw = ConfigParser()
+        token = 't' * 32
+        raw.read_dict({'dev': {'http_server_token': token}})
+        handler = object.__new__(http_server.UserScriptRequestHandler)
+        handler.command = 'HEAD'
+        handler.path = '/cd2/opaque'
+        handler.client_address = ('192.0.2.11', 12345)
+        handler.server = SimpleNamespace(server_address=('192.0.2.10', 58000))
+        handler.headers = {'Authorization': f'Bearer {token}'}
+        handler.send_cd2_file = mock.Mock()
+        handler._send_error = mock.Mock()
+        with mock.patch.object(http_server.configs, 'raw', raw):
+            http_server.UserScriptRequestHandler.do_HEAD(handler)
+        handler.send_cd2_file.assert_called_once_with()
+        handler._send_error.assert_not_called()
 
     def test_explicit_localhost_bind_does_not_require_token(self):
         raw = ConfigParser()
@@ -196,6 +249,109 @@ class HttpServerRouteTests(unittest.TestCase):
             urllib.request.urlopen(request, timeout=3)
         self.assertEqual(context.exception.code, 403)
         self.assertNotIn('Access-Control-Allow-Origin', context.exception.headers)
+
+    def _start_play_data(self):
+        return {
+            'file_path': 'movie.mkv',
+            'media_path': 'movie.mkv',
+            'start_sec': 0,
+            'sub_file': None,
+            'media_title': 'movie',
+            'mount_disk_mode': False,
+            'use_strm_cd2_url': False,
+            'netloc': 'media.example',
+        }
+
+    def test_start_play_resets_player_is_running_when_get_player_cmd_fails(self):
+        raw = ConfigParser()
+        raw.read_dict({'dev': {'one_instance_mode': 'yes'}})
+        with mock.patch.object(http_server, 'player_is_running', False), \
+                mock.patch.object(http_server.configs, 'raw', raw), \
+                mock.patch.object(http_server, 'ThreadWithReturnValue') as thread_cls, \
+                mock.patch.object(http_server, 'get_player_cmd', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                http_server.start_play(self._start_play_data())
+            self.assertFalse(http_server.player_is_running)
+        thread_cls.return_value.start.assert_called_once_with()
+
+    def test_start_play_resets_player_is_running_when_player_start_fails(self):
+        raw = ConfigParser()
+        raw.read_dict({'dev': {'one_instance_mode': 'yes'}})
+        manager = mock.Mock()
+        manager.start_player.side_effect = RuntimeError('start failed')
+        with mock.patch.object(http_server, 'player_is_running', False), \
+                mock.patch.object(http_server.configs, 'raw', raw), \
+                mock.patch.object(http_server, 'ThreadWithReturnValue'), \
+                mock.patch.object(http_server, 'get_player_cmd', return_value=['mpv.exe', 'movie.mkv']), \
+                mock.patch.object(http_server, 'PlayerManager', return_value=manager), \
+                mock.patch.object(http_server.configs, 'check_str_match', return_value=True):
+            with self.assertRaises(RuntimeError):
+                http_server.start_play(self._start_play_data())
+            self.assertFalse(http_server.player_is_running)
+
+    def test_start_play_resets_player_is_running_when_stop_sec_fails(self):
+        raw = ConfigParser()
+        raw.read_dict({'dev': {'one_instance_mode': 'yes'}})
+        start_player = mock.Mock(return_value={'handle': object()})
+        stop_sec = mock.Mock(side_effect=RuntimeError('stop failed'))
+        with mock.patch.object(http_server, 'player_is_running', False), \
+                mock.patch.object(http_server.configs, 'raw', raw), \
+                mock.patch.object(http_server, 'ThreadWithReturnValue'), \
+                mock.patch.object(http_server, 'get_player_cmd', return_value=['vlc.exe', 'movie.mkv']), \
+                mock.patch.object(http_server, 'start_player_func_dict', {'vlc': start_player}), \
+                mock.patch.object(http_server, 'stop_sec_func_dict', {'vlc': stop_sec}), \
+                mock.patch.object(http_server.configs, 'check_str_match', return_value=False):
+            with self.assertRaises(RuntimeError):
+                http_server.start_play(self._start_play_data())
+            self.assertFalse(http_server.player_is_running)
+
+    def test_start_play_resets_player_is_running_when_playlist_join_fails(self):
+        raw = ConfigParser()
+        raw.read_dict({'dev': {'one_instance_mode': 'yes'}})
+        manager = mock.Mock()
+        thread = mock.Mock()
+        thread.join.side_effect = RuntimeError('list failed')
+        with mock.patch.object(http_server, 'player_is_running', False), \
+                mock.patch.object(http_server.configs, 'raw', raw), \
+                mock.patch.object(http_server, 'ThreadWithReturnValue', return_value=thread), \
+                mock.patch.object(http_server, 'get_player_cmd', return_value=['mpv.exe', 'movie.mkv']), \
+                mock.patch.object(http_server, 'PlayerManager', return_value=manager), \
+                mock.patch.object(http_server.configs, 'check_str_match', return_value=True):
+            with self.assertRaises(RuntimeError):
+                http_server.start_play(self._start_play_data())
+            self.assertFalse(http_server.player_is_running)
+
+    def test_start_play_failed_realtime_stop_uses_full_fallback_for_short_unknown_watch(self):
+        raw = ConfigParser()
+        raw.read_dict({'dev': {'one_instance_mode': 'yes'}})
+        thread = mock.Mock()
+        thread.join.return_value = [{'file_path': 'movie.mkv'}]
+        feedback_manager = mock.Mock()
+        start_player = mock.Mock(return_value={'mpv': object()})
+        stop_sec = mock.Mock(return_value=10)
+        data = self._start_play_data()
+        data.update({
+            'server': 'emby',
+            'scheme': 'https',
+            'total_sec': 86400,
+            '_playing_feedback_started': True,
+        })
+        with mock.patch.object(http_server, 'player_is_running', False), \
+                mock.patch.object(http_server.configs, 'raw', raw), \
+                mock.patch.object(http_server.configs, 'gui_is_enable', False), \
+                mock.patch.object(http_server, 'ThreadWithReturnValue', return_value=thread), \
+                mock.patch.object(http_server, 'get_player_cmd', return_value=['mpv.exe', 'movie.mkv']), \
+                mock.patch.object(http_server, 'start_player_func_dict', {'mpv': start_player}), \
+                mock.patch.object(http_server, 'stop_sec_func_dict', {'mpv': stop_sec}), \
+                mock.patch.object(http_server, 'PlayerManager', return_value=feedback_manager), \
+                mock.patch.object(http_server.configs, 'check_str_match', return_value=False), \
+                mock.patch.object(http_server, 'realtime_playing_request_sender', return_value=False), \
+                mock.patch.object(http_server, 'update_server_playback_progress') as update:
+            http_server.start_play(data)
+
+        update.assert_called_once_with(stop_sec=10, data=data)
+        self.assertNotIn('update_success', data)
+        self.assertFalse(http_server.player_is_running)
 
 
 if __name__ == '__main__':

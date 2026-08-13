@@ -2,9 +2,9 @@
 
 The gateway intentionally keeps the URL opaque.  A player receives only a
 random nonce; the local path and CD2 credentials remain in process memory.
-When a request arrives we resolve the CD2 URL just-in-time.  Any resolution
-failure falls back to the original mounted file so enabling this feature never
-breaks the existing disk mode.
+When a request arrives we resolve the CD2 URL just-in-time.  Entries created
+by the configured path_map may fall back to the original mounted file when
+resolution fails; direct/internal registrations never expose that file.
 """
 from __future__ import annotations
 
@@ -24,12 +24,20 @@ from utils.configs import configs
 class GatewayEntry:
     local_path: str
     expires_at: float
+    # The first requester owns the opaque URL for its lifetime.  This is a
+    # continuity guard for Range/reconnect, not a strong client identity.
+    first_client_key: Optional[str] = None
+    # Only entries created after a successful configured path_map lookup may
+    # use the mounted-file fallback.  Direct register() calls are retained
+    # for internal/tests-only URL registration and must never become an
+    # arbitrary local-file server.
+    allow_local_fallback: bool = False
 
 
 class CloudDrive2Gateway:
     def __init__(self, *, clock: Callable[[], float] = time.time,
                  token_urlsafe: Callable[[int], str] = secrets.token_urlsafe,
-                 max_entries: int = 500, ttl_seconds: int = 24 * 60 * 60) -> None:
+                 max_entries: int = 500, ttl_seconds: int = 6 * 60 * 60) -> None:
         self._clock = clock
         self._token_urlsafe = token_urlsafe
         self.max_entries = max(1, int(max_entries))
@@ -70,7 +78,7 @@ class CloudDrive2Gateway:
                 self._client_key = key
             return self._client
 
-    def register(self, local_path: str) -> Optional[str]:
+    def register(self, local_path: str, *, allow_local_fallback: bool = False) -> Optional[str]:
         if not self._base_url or not local_path:
             return None
         now = self._clock()
@@ -82,7 +90,10 @@ class CloudDrive2Gateway:
             for _ in range(3):
                 nonce = self._token_urlsafe(24)
                 if nonce not in self._entries:
-                    self._entries[nonce] = GatewayEntry(str(local_path), now + self.ttl_seconds)
+                    self._entries[nonce] = GatewayEntry(
+                        str(local_path), now + self.ttl_seconds,
+                        allow_local_fallback=bool(allow_local_fallback),
+                    )
                     return f'{self._base_url}/cd2/{quote(nonce, safe="")}'
         return None
 
@@ -105,16 +116,47 @@ class CloudDrive2Gateway:
         # fast path, while the actual request still has a local fallback.
         if not client.map_local_path_to_cloud_path(local_path):
             return None
-        return self.register(local_path)
+        return self.register(local_path, allow_local_fallback=True)
 
     def pop_entry(self, nonce: str) -> Optional[GatewayEntry]:
+        """Look up a legacy entry name without consuming the URL.
+
+        A media player may issue several Range requests and reconnect after
+        a redirect.  Consumption would break those normal requests, so the
+        nonce remains valid only until its TTL and requester binding expire.
+        New callers should use :meth:`lookup_or_claim` with a client key.
+        """
+
+        return self.lookup_or_claim(nonce, None)
+
+    def lookup_or_claim(self, nonce: str,
+                        client_key: Optional[str]) -> Optional[GatewayEntry]:
+        """Return an entry when it is live and bound to this requester.
+
+        The binding is deliberately based on the observed peer IP and
+        normalized User-Agent supplied by the HTTP layer.  It allows a
+        player's Range/reconnect sequence while rejecting a different
+        client, but it is not a cryptographic identity guarantee.
+        """
+
         now = self._clock()
         with self._lock:
             self._prune(now)
             entry = self._entries.get(nonce)
             if entry is None or entry.expires_at <= now:
                 return None
-            return entry
+            if entry.first_client_key is None:
+                if client_key is not None:
+                    entry = GatewayEntry(
+                        entry.local_path, entry.expires_at,
+                        allow_local_fallback=entry.allow_local_fallback,
+                        first_client_key=client_key,
+                    )
+                    self._entries[nonce] = entry
+                return entry
+            if client_key is not None and entry.first_client_key == client_key:
+                return entry
+            return None
 
     def resolve_entry(self, entry: GatewayEntry) -> Optional[str]:
         client = self._client_from_config()

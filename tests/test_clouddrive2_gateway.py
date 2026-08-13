@@ -16,10 +16,23 @@ class _FakeHandler:
         self.command = command
         self.parse_range_header = http_server.UserScriptRequestHandler.parse_range_header
         self.headers = {} if range_header is None else {'Range': range_header}
+        self.client_ip = '127.0.0.1'
         self.wfile = io.BytesIO()
         self.responses = []
         self.headers_sent = []
         self.ended = False
+
+    def _client_ip(self):
+        return self.client_ip
+
+    def _header(self, name, default=None):
+        return self.headers.get(name, default)
+
+    def _cd2_client_key(self):
+        return f"{self.client_ip}\n{self._header('User-Agent', '').strip().casefold()}"
+
+    def _is_allowed_media_extension(self, path):
+        return http_server.UserScriptRequestHandler._is_allowed_media_extension(path)
 
     def send_response(self, status):
         self.responses.append(status)
@@ -60,6 +73,27 @@ class CloudDrive2GatewayTests(unittest.TestCase):
         now[0] = 160.0
         self.assertIsNone(gateway.pop_entry('first nonce'))
 
+    def test_lookup_binds_first_client_and_allows_reconnect_only_for_same_client(self):
+        now = [100.0]
+        gateway = gateway_module.CloudDrive2Gateway(
+            clock=lambda: now[0], token_urlsafe=lambda _: 'nonce-one', ttl_seconds=60)
+        gateway.configure('http://127.0.0.1:58000')
+        gateway.register(r'C:\Media\movie.mkv')
+
+        first = gateway.lookup_or_claim('nonce-one', '127.0.0.1\nmpv')
+        self.assertEqual(first.first_client_key, '127.0.0.1\nmpv')
+        self.assertEqual(
+            gateway.lookup_or_claim('nonce-one', '127.0.0.1\nmpv').local_path,
+            r'C:\Media\movie.mkv')
+        self.assertIsNone(gateway.lookup_or_claim('nonce-one', '127.0.0.1\nother'))
+
+        now[0] = 161.0
+        self.assertIsNone(gateway.lookup_or_claim('nonce-one', '127.0.0.1\nmpv'))
+
+    def test_default_ttl_is_shorter_than_legacy_day(self):
+        gateway = gateway_module.CloudDrive2Gateway()
+        self.assertEqual(gateway.ttl_seconds, 6 * 60 * 60)
+
     def test_maybe_register_requires_configured_client_mapping(self):
         gateway = gateway_module.CloudDrive2Gateway(token_urlsafe=lambda _: 'nonce')
         gateway.configure('http://localhost:1')
@@ -71,6 +105,7 @@ class CloudDrive2GatewayTests(unittest.TestCase):
             gateway.maybe_register(r'C:\Media\movie.mkv'),
             'http://localhost:1/cd2/nonce',
         )
+        self.assertTrue(gateway._entries['nonce'].allow_local_fallback)
         mapped.map_local_path_to_cloud_path.assert_called_once_with(
             r'C:\Media\movie.mkv')
 
@@ -159,7 +194,8 @@ class HttpGatewayRouteTests(unittest.TestCase):
         handler = _FakeHandler()
         handler.path = '/cd2/opaque-nonce'
         fake_gateway = mock.Mock()
-        fake_gateway.pop_entry.return_value = SimpleNamespace(local_path='movie.mkv')
+        fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
+            local_path='movie.mkv', allow_local_fallback=False)
         fake_gateway.resolve_entry.return_value = 'https://cd2.example/video.mkv'
         with mock.patch.object(http_server, 'gateway', fake_gateway):
             http_server.UserScriptRequestHandler.send_cd2_file(handler)
@@ -167,20 +203,50 @@ class HttpGatewayRouteTests(unittest.TestCase):
         self.assertEqual(handler.responses, [307])
         self.assertIn(('Location', 'https://cd2.example/video.mkv'), handler.headers_sent)
         self.assertIn(('Cache-Control', 'no-store'), handler.headers_sent)
-        fake_gateway.pop_entry.assert_called_once_with('opaque-nonce')
+        fake_gateway.lookup_or_claim.assert_called_once_with(
+            'opaque-nonce', '127.0.0.1\n')
 
     def test_send_cd2_file_falls_back_to_local_file_when_resolution_fails(self):
         handler = _FakeHandler()
         handler.path = '/cd2/opaque-nonce'
         handler._send_local_file = mock.Mock()
         fake_gateway = mock.Mock()
-        fake_gateway.pop_entry.return_value = SimpleNamespace(local_path='movie.mkv')
+        fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
+            local_path='movie.mkv', allow_local_fallback=True)
         fake_gateway.resolve_entry.return_value = None
         with mock.patch.object(http_server, 'gateway', fake_gateway):
             http_server.UserScriptRequestHandler.send_cd2_file(handler)
 
         handler._send_local_file.assert_called_once_with('movie.mkv')
         self.assertEqual(handler.responses, [])
+
+    def test_send_cd2_file_does_not_fallback_for_direct_register_entry(self):
+        handler = _FakeHandler()
+        handler.path = '/cd2/opaque-nonce'
+        handler._send_local_file = mock.Mock()
+        fake_gateway = mock.Mock()
+        fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
+            local_path='movie.mkv', allow_local_fallback=False)
+        fake_gateway.resolve_entry.return_value = None
+        with mock.patch.object(http_server, 'gateway', fake_gateway):
+            http_server.UserScriptRequestHandler.send_cd2_file(handler)
+
+        self.assertEqual(handler.responses, [404])
+        handler._send_local_file.assert_not_called()
+
+    def test_send_cd2_file_rejects_non_media_extension_on_mapped_fallback(self):
+        handler = _FakeHandler()
+        handler.path = '/cd2/opaque-nonce'
+        handler._send_local_file = mock.Mock()
+        fake_gateway = mock.Mock()
+        fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
+            local_path='movie.exe', allow_local_fallback=True)
+        fake_gateway.resolve_entry.return_value = None
+        with mock.patch.object(http_server, 'gateway', fake_gateway):
+            http_server.UserScriptRequestHandler.send_cd2_file(handler)
+
+        self.assertEqual(handler.responses, [404])
+        handler._send_local_file.assert_not_called()
 
     def test_head_range_sets_headers_without_writing_body(self):
         handler = _FakeHandler(range_header='bytes=2-4', command='HEAD')

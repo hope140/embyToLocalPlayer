@@ -2,6 +2,7 @@ import base64
 import json
 import os.path
 import platform
+import re
 import subprocess
 import threading
 import time
@@ -18,6 +19,145 @@ logger = MyLogger()
 prefetch_data = dict(on=True, stop_sec_dict={}, done_list=[])
 pipe_port_stack = list(reversed(range(25)))
 mpv_play_speed = {'media_title': 'speed'}
+
+
+def _ipc_key_name(value):
+    return ''.join(char for char in str(value).casefold() if char.isalnum())
+
+
+# The IPC debug message is an optional diagnostic channel.  Keep only fields
+# useful for playlist presentation/progress inspection; paths, commands and
+# server/session identity are deliberately not part of its contract.
+_IPC_SAFE_KEYS = frozenset(_ipc_key_name(key) for key in (
+    'basename', 'media_basename', 'media_title', 'title', 'order', 'index',
+    'total_sec', 'start_sec', 'stop_sec', 'size', 'intro_start', 'intro_end',
+    'sub_inner_idx', 'is_start_file', 'season_number', 'episode_number',
+    'container', 'codec', 'language',
+))
+_IPC_BLOCKED_KEYS = frozenset(_ipc_key_name(key) for key in (
+    'api_key', 'token', 'access_token', 'refresh_token', 'headers',
+    'authorization', 'cookie', 'x-emby-token', 'x-plex-token',
+    'play_session_id', 'item_id',
+    'media_source_id', 'device_id', 'user_id', 'stream_url', 'sub_file',
+    'file_path', 'media_path', 'source_path', 'strm_cd2_local_path',
+    'mpv_cmd', 'options', 'command', 'cmd', 'url', 'uri', 'path',
+))
+_IPC_SENSITIVE_QUERY_KEYS = frozenset(_ipc_key_name(key) for key in (
+    'api_key', 'token', 'access_token', 'refresh_token', 'x-emby-token',
+    'x-plex-token', 'authorization', 'cookie', 'play_session_id',
+))
+_IPC_URL_RE = re.compile(r'https?://[^\s<>"\']+', re.IGNORECASE)
+_IPC_BEARER_RE = re.compile(r'(?i)\bBearer\s+[^\s&;,<>"\']+')
+_IPC_COOKIE_RE = re.compile(r'(?i)\bCookie\s*:\s*[^\r\n]+')
+_IPC_ASSIGNMENT_RE = re.compile(
+    r'(?i)(\b(?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|'
+    r'x[-_]?emby[-_]?token|x[-_]?plex[-_]?token|authorization|cookie|'
+    r'play[_-]?session[_-]?id)\b\s*[:=]\s*)[^&\s,;<>"\']+'
+)
+
+
+def _redact_ipc_url(url):
+    """Drop credential/session query parameters from one URL string."""
+
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        safe_pairs = [
+            (key, value) for key, value in pairs
+            if _ipc_key_name(key) not in _IPC_SENSITIVE_QUERY_KEYS
+        ]
+        # Credentials in a URL authority and fragments are not useful to the
+        # diagnostic channel either, so omit them as well.
+        netloc = parsed.netloc
+        if parsed.username or parsed.password:
+            host = parsed.hostname or ''
+            try:
+                port = parsed.port
+            except ValueError:
+                port = None
+            netloc = f'[{host}]' if ':' in host and not host.startswith('[') else host
+            if port is not None:
+                netloc = f'{netloc}:{port}'
+        return urllib.parse.urlunsplit((
+            parsed.scheme, netloc, parsed.path,
+            urllib.parse.urlencode(safe_pairs, doseq=True), '',
+        ))
+    except (TypeError, ValueError):
+        return url
+
+
+def _redact_ipc_string(value):
+    text = str(value)
+
+    def replace_url(match):
+        raw_url = match.group(0)
+        suffix = ''
+        while raw_url and raw_url[-1] in '.,;)]}':
+            suffix = raw_url[-1] + suffix
+            raw_url = raw_url[:-1]
+        return _redact_ipc_url(raw_url) + suffix
+
+    text = _IPC_URL_RE.sub(replace_url, text)
+    text = _IPC_COOKIE_RE.sub('<redacted>', text)
+    text = _IPC_BEARER_RE.sub('<redacted>', text)
+    return _IPC_ASSIGNMENT_RE.sub('<redacted>', text)
+
+
+def _redact_ipc_value(value, *, allow_dynamic_keys=False):
+    if isinstance(value, dict):
+        return _redact_ipc_mapping(value, allow_dynamic_keys=allow_dynamic_keys)
+    if isinstance(value, (list, tuple)):
+        result = []
+        for item in value:
+            if isinstance(item, (dict, list, tuple)):
+                result.append(_redact_ipc_value(item, allow_dynamic_keys=False))
+            elif isinstance(item, (str, int, float, bool)) or item is None:
+                result.append(_redact_ipc_value(item))
+        return result
+    if isinstance(value, str):
+        return _redact_ipc_string(value)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return None
+
+
+def _redact_ipc_mapping(value, *, allow_dynamic_keys=False):
+    result = {}
+    for key, item in value.items():
+        normalized_key = _ipc_key_name(key)
+        if normalized_key in _IPC_BLOCKED_KEYS:
+            continue
+        if normalized_key in _IPC_SAFE_KEYS:
+            result[str(key)] = _redact_ipc_value(item, allow_dynamic_keys=False)
+            continue
+        if isinstance(item, dict):
+            nested = _redact_ipc_mapping(item, allow_dynamic_keys=False)
+            if nested:
+                safe_key = _redact_ipc_string(key)
+                if safe_key and _ipc_key_name(safe_key) not in _IPC_BLOCKED_KEYS:
+                    result[safe_key] = nested
+            continue
+        if isinstance(item, (list, tuple)):
+            nested = _redact_ipc_value(item, allow_dynamic_keys=False)
+            if nested:
+                safe_key = _redact_ipc_string(key)
+                if safe_key and _ipc_key_name(safe_key) not in _IPC_BLOCKED_KEYS:
+                    result[safe_key] = nested
+    return result
+
+
+def redact_playlist_data_for_ipc(playlist_data):
+    """Return a JSON-safe, credential-free playlist diagnostic payload.
+
+    Episode-map keys remain available for the optional mpv diagnostic script,
+    while each episode object is reduced to presentation/progress fields.
+    Unknown nested containers are traversed only to retain safe fields; path,
+    command and identity fields are never copied through.
+    """
+
+    if isinstance(playlist_data, dict):
+        return _redact_ipc_mapping(playlist_data, allow_dynamic_keys=True)
+    return _redact_ipc_value(playlist_data)
 
 
 def prepare_subtitle(sub_file, data=None):
@@ -386,7 +526,9 @@ def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
         pre_thread = threading.Thread(target=loop_episodes, args=(reversed(pre_list), True))
         _ = [suf_thread.start(), pre_thread.start()]
         if configs.raw.getboolean('dev', 'mpv_ipc_playlist_data', fallback=False):
-            mpv.command('script-message', 'etlp-playlist-data', json.dumps(playlist_data, ensure_ascii=False))
+            safe_playlist_data = redact_playlist_data_for_ipc(playlist_data)
+            mpv.command('script-message', 'etlp-playlist-data',
+                        json.dumps(safe_playlist_data, ensure_ascii=False))
         _ = [suf_thread.join(), pre_thread.join()]
         mpv.command('script-message', 'etlp-playlist-done')
 

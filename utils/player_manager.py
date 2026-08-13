@@ -181,10 +181,20 @@ class BaseManager(BaseInit):
                 feedback_started = ep.pop('_playing_feedback_started', False)
                 if feedback_started:
                     # 先独立关闭实时会话，后续进度逻辑即使跳过也不会残留 Now Playing。
-                    realtime_playing_request_sender(
-                        data=ep, cur_sec=_stop_sec, method='end', is_paused=False)
-                    # 后续需要更新进度时只补 Stopped，不能再创建新的 Playing。
-                    ep['update_success'] = True
+                    ep.pop('update_success', None)
+                    if realtime_playing_request_sender(
+                            data=ep, cur_sec=_stop_sec, method='end', is_paused=False):
+                        # 后续需要更新进度时只补 Stopped，不能再创建新的 Playing。
+                        ep['update_success'] = True
+                    else:
+                        # A failed realtime Stopped must take the complete
+                        # Playing+Stopped fallback, even for short watches or
+                        # an unknown 24-hour placeholder duration.  Do this
+                        # before the normal progress branches can skip it.
+                        update_server_playback_progress(stop_sec=_stop_sec, data=ep)
+                        ep['_stop_sec'] = _stop_sec
+                        need_update_eps.append(ep)
+                        continue
                 if abs(_stop_sec - int(start_sec)) < 20:
                     logger.info(f"skip update progress, {ep['basename']} start_sec stop_sec too close")
                     continue
@@ -313,8 +323,7 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
         with self.playing_feedback_request_lock:
             if self.playing_feedback_stop_event.is_set():
                 return False
-            realtime_playing_request_sender(**kwargs)
-            return True
+            return bool(realtime_playing_request_sender(**kwargs))
 
     def mpv_cache_via_nas_loop(self):
         mpv = self.player_kwargs.get('mpv')

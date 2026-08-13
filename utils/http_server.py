@@ -24,6 +24,7 @@ from utils.tools import (configs, MyLogger, open_local_folder, play_media_file,
                          create_sparse_file)
 
 player_is_running = False
+player_state_lock = threading.Lock()
 logger = MyLogger()
 dl_manager = DownloadManager(configs.cache_path, speed_limit=configs.speed_limit)
 miss_runtime_start_sec = {}
@@ -380,6 +381,35 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _is_local_player_client(self):
+        """Return whether the peer is the machine hosting this listener.
+
+        A non-loopback listener is commonly reached by mpv through the
+        machine's LAN address.  That request is still local playback, but
+        mpv must not receive the global HTTP server token because a 307 to a
+        CloudDrive2 URL could forward it to another host.  The gateway nonce
+        and its IP/User-Agent continuity binding remain the capability guard.
+        """
+
+        client_ip = self._client_ip()
+        if is_loopback_address(client_ip):
+            return True
+        server = getattr(self, 'server', None)
+        server_address = getattr(server, 'server_address', ())
+        bound_ip = server_address[0] if server_address else ''
+        if bound_ip == client_ip:
+            return True
+        if str(bound_ip).lower() in ('0.0.0.0', '::', ''):
+            return client_ip == get_machine_ip()
+        return False
+
+    def _authorize_cd2_get(self):
+        """Authorize a CD2 request without turning the route into public media."""
+
+        if self._is_local_player_client():
+            return True
+        return self._authorize_runtime_get()
+
     def do_GET(self):
         path = self._request_path()
         if path in ('/', '/favicon.ico'):
@@ -392,7 +422,8 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self.send_media_file()
             return
         if self._is_cd2_path(path):
-            self.send_cd2_file()
+            if self._authorize_cd2_get():
+                self.send_cd2_file()
             return
         if path == '/miss_runtime_start_sec':
             if self._authorize_runtime_get():
@@ -406,7 +437,8 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self.send_media_file()
             return
         if self._is_cd2_path(path):
-            self.send_cd2_file()
+            if self._authorize_cd2_get():
+                self.send_cd2_file()
             return
         self.send_response(404)
         self.end_headers()
@@ -475,7 +507,7 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         parsed_path = urllib.parse.urlparse(self.path)
         parts = parsed_path.path.split('/')
         nonce = urllib.parse.unquote(parts[2]) if len(parts) == 3 and parts[1] == 'cd2' else ''
-        entry = gateway.pop_entry(nonce) if nonce else None
+        entry = gateway.lookup_or_claim(nonce, self._cd2_client_key()) if nonce else None
         if entry is None:
             self.send_response(404)
             self.end_headers()
@@ -489,7 +521,21 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             return
         # CD2 is optional.  Keep the old mounted-file path as a transparent
         # fallback when the proxy is offline, unconfigured, or out of scope.
+        if not getattr(entry, 'allow_local_fallback', False):
+            self.send_response(404)
+            self.end_headers()
+            return
+        if not self._is_allowed_media_extension(entry.local_path):
+            self.send_response(404)
+            self.end_headers()
+            return
         self._send_local_file(entry.local_path)
+
+    def _cd2_client_key(self) -> str:
+        """Return a stable, in-memory client binding for a CD2 nonce."""
+
+        user_agent = self._header('User-Agent', '')
+        return f"{self._client_ip()}\n{user_agent.strip().casefold()}"
 
     def _send_local_file(self, video_path):
         if not os.path.isfile(video_path):
@@ -591,81 +637,93 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
 
 def start_play(data):
     global player_is_running
-    if player_is_running:
-        logger.error('player_is_running, skip. You may want to disable one_instance_mode, see detail in config file')
-        return
-    file_path = data['file_path']
-    start_sec = data['start_sec']
-    sub_file = data['sub_file']
-    media_title = data['media_title']
-    mount_disk_mode = data['mount_disk_mode']
-    eps_data_thread = ThreadWithReturnValue(target=list_episodes, args=(data,))
-    eps_data_thread.start()
+    one_instance_mode = configs.raw.getboolean('dev', 'one_instance_mode', fallback=True)
+    with player_state_lock:
+        if player_is_running:
+            logger.error('player_is_running, skip. You may want to disable one_instance_mode, see detail in config file')
+            return
+        if one_instance_mode:
+            player_is_running = True
+    try:
+        file_path = data['file_path']
+        start_sec = data['start_sec']
+        sub_file = data['sub_file']
+        media_title = data['media_title']
+        mount_disk_mode = data['mount_disk_mode']
+        eps_data_thread = ThreadWithReturnValue(target=list_episodes, args=(data,))
+        eps_data_thread.start()
 
-    # Keep the original disk-mode decision for subtitle/cache/progress logic,
-    # but make the actual player transport HTTP when CD2 supplied the URL.
-    player_data = dict(data)
-    if data.get('use_strm_cd2_url'):
-        player_data['mount_disk_mode'] = False
-    cmd = get_player_cmd(media_path=data['media_path'], file_path=file_path, data=player_data)
-    player_path = cmd[0]
-    player_path_lower = player_path.lower()
-    # 播放器特殊处理
-    player_is_running = True if configs.raw.getboolean('dev', 'one_instance_mode', fallback=True) else False
-    player_alias_dict = {'ddplay': 'dandanplay'}
-    legal_player_name = list(start_player_func_dict) + list(player_alias_dict)
-    player_name = [i for i in legal_player_name if i in player_path_lower]
-    if player_name:
-        player_name = player_name[0]
-        player_name = player_alias_dict.get(player_name, player_name)
-        if configs.check_str_match(_str=data['netloc'], section='playlist', option='enable_host', fallback=True) \
-                and player_name in ('mpv', 'vlc', 'mpc', 'potplayer', 'iina') \
-                or (player_name == 'dandanplay' and mount_disk_mode):
-            player_manager = PlayerManager(data=player_data, player_name=player_name, player_path=player_path)
-            player_manager.start_player(cmd=cmd, start_sec=start_sec, sub_file=sub_file, media_title=media_title,
-                                        mount_disk_mode=player_data['mount_disk_mode'], data=player_data)
+        # Keep the original disk-mode decision for subtitle/cache/progress logic,
+        # but make the actual player transport HTTP when CD2 supplied the URL.
+        player_data = dict(data)
+        if data.get('use_strm_cd2_url'):
+            player_data['mount_disk_mode'] = False
+        cmd = get_player_cmd(media_path=data['media_path'], file_path=file_path, data=player_data)
+        player_path = cmd[0]
+        player_path_lower = player_path.lower()
+        # 播放器特殊处理
+        player_alias_dict = {'ddplay': 'dandanplay'}
+        legal_player_name = list(start_player_func_dict) + list(player_alias_dict)
+        player_name = [i for i in legal_player_name if i in player_path_lower]
+        if player_name:
+            player_name = player_name[0]
+            player_name = player_alias_dict.get(player_name, player_name)
+            if configs.check_str_match(_str=data['netloc'], section='playlist', option='enable_host', fallback=True) \
+                    and player_name in ('mpv', 'vlc', 'mpc', 'potplayer', 'iina') \
+                    or (player_name == 'dandanplay' and mount_disk_mode):
+                player_manager = PlayerManager(data=player_data, player_name=player_name, player_path=player_path)
+                player_manager.start_player(cmd=cmd, start_sec=start_sec, sub_file=sub_file, media_title=media_title,
+                                            mount_disk_mode=player_data['mount_disk_mode'], data=player_data)
+                eps_data = eps_data_thread.join()
+                player_manager.playlist_add(eps_data=eps_data)
+                player_manager.update_playlist_time_loop()
+                player_manager.update_playback_for_eps()
+                return
+
+            player_function = start_player_func_dict[player_name]
+            stop_sec_kwargs = player_function(cmd=cmd, start_sec=start_sec, sub_file=sub_file, media_title=media_title,
+                                              mount_disk_mode=player_data['mount_disk_mode'], data=player_data)
+            if 'mpv' in stop_sec_kwargs:
+                feedback_manager = PlayerManager(data=data, player_name=player_name, player_path=player_path)
+                feedback_manager.player_kwargs = stop_sec_kwargs
+                feedback_manager.start_realtime_playing_feedback()
+            stop_sec = stop_sec_func_dict[player_name](**stop_sec_kwargs)
+            feedback_started = False
+            if 'mpv' in stop_sec_kwargs:
+                feedback_manager.stop_realtime_playing_feedback()
+                feedback_started = data.pop('_playing_feedback_started', False)
+            logger.info('stop_sec', stop_sec)
+            if stop_sec is None:
+                return
+            fallback_sent = False
+            if feedback_started:
+                data.pop('update_success', None)
+                if realtime_playing_request_sender(
+                        data=data, cur_sec=stop_sec, method='end', is_paused=False):
+                    data['update_success'] = True
+                else:
+                    # Do not let the normal short-watch/unknown-duration
+                    # branches skip the complete Playing+Stopped fallback.
+                    update_server_playback_progress(stop_sec=stop_sec, data=data)
+                    fallback_sent = True
+            total_sec = data['total_sec']
+            progress_percent = stop_sec / total_sec
+            if not fallback_sent and (total_sec != 86400 or progress_percent > 0.9):
+                update_server_playback_progress(stop_sec=stop_sec, data=data)
+            if total_sec == 86400:
+                logger.info('skip update progress, cuz miss runtime data, may need to enable playlist')
             eps_data = eps_data_thread.join()
-            player_manager.playlist_add(eps_data=eps_data)
-            player_manager.update_playlist_time_loop()
-            player_manager.update_playback_for_eps()
-            player_is_running = False
-            return
-
-        player_function = start_player_func_dict[player_name]
-        stop_sec_kwargs = player_function(cmd=cmd, start_sec=start_sec, sub_file=sub_file, media_title=media_title,
-                                          mount_disk_mode=player_data['mount_disk_mode'], data=player_data)
-        if 'mpv' in stop_sec_kwargs:
-            feedback_manager = PlayerManager(data=data, player_name=player_name, player_path=player_path)
-            feedback_manager.player_kwargs = stop_sec_kwargs
-            feedback_manager.start_realtime_playing_feedback()
-        stop_sec = stop_sec_func_dict[player_name](**stop_sec_kwargs)
-        feedback_started = False
-        if 'mpv' in stop_sec_kwargs:
-            feedback_manager.stop_realtime_playing_feedback()
-            feedback_started = data.pop('_playing_feedback_started', False)
-        logger.info('stop_sec', stop_sec)
-        if stop_sec is None:
-            player_is_running = False
-            return
-        if feedback_started:
-            realtime_playing_request_sender(
-                data=data, cur_sec=stop_sec, method='end', is_paused=False)
-            data['update_success'] = True
-        total_sec = data['total_sec']
-        progress_percent = stop_sec / total_sec
-        if total_sec != 86400 or progress_percent > 0.9:
-            update_server_playback_progress(stop_sec=stop_sec, data=data)
-        if total_sec == 86400:
-            logger.info('skip update progress, cuz miss runtime data, may need to enable playlist')
-        eps_data = eps_data_thread.join()
-        current_ep = [i for i in eps_data if i['file_path'] == data['file_path']][0]
-        current_ep['_stop_sec'] = stop_sec
-        if configs.gui_is_enable \
-                and progress_percent * 100 > configs.raw.getfloat('gui', 'delete_at', fallback=99.9):
-            logger.info('watched, delete cache')
-            threading.Thread(target=dl_manager.delete, args=(data,), daemon=True).start()
-    else:
-        logger.info('run as not support player mod')
-        player = subprocess.Popen(cmd)
-        activate_window_by_pid(player.pid)
-    player_is_running = False
+            current_ep = [i for i in eps_data if i['file_path'] == data['file_path']][0]
+            current_ep['_stop_sec'] = stop_sec
+            if configs.gui_is_enable \
+                    and progress_percent * 100 > configs.raw.getfloat('gui', 'delete_at', fallback=99.9):
+                logger.info('watched, delete cache')
+                threading.Thread(target=dl_manager.delete, args=(data,), daemon=True).start()
+        else:
+            logger.info('run as not support player mod')
+            player = subprocess.Popen(cmd)
+            activate_window_by_pid(player.pid)
+    finally:
+        if one_instance_mode:
+            with player_state_lock:
+                player_is_running = False
