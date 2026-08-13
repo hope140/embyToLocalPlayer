@@ -11,7 +11,7 @@
 | 项目 | 当前 `beta` 的结论 |
 | --- | --- |
 | 上游关系 | 仓库为 [hope140/embyToLocalPlayer](https://github.com/hope140/embyToLocalPlayer) 的 `beta`，基于并跟踪 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)，但按本分支代码独立维护。 |
-| CloudDrive2 | `[clouddrive2]` 启用后，使用本地 CloudDrive2 gRPC API、`path_map` 和 ETLP 短期本地 gateway 解析 STRM；失败回退原挂载文件。 |
+| CloudDrive2 | `[clouddrive2]` 启用后，使用本地 CloudDrive2 gRPC API、`path_map` 和 ETLP 短期本地 gateway 解析 STRM；可选请求 `directUrl`；失败回退 `downloadUrlPath` 或原挂载文件。 |
 | 独立远程控制 | `[remote_control]` 为当前 mpv/IINA 建立独立 Emby 会话控制通道，支持暂停/继续、seek、停止和消息显示；只作用于当前机器。 |
 | 实时反馈 | `[dev] playing_feedback_*` 面向 mpv/IINA 回传播放位置和暂停状态；最终回传仍由 `[emby] update_progress` 控制。 |
 | 明确排除 | 本项目不实现同步观看房间；该能力请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。同时不对豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 联动等旁线能力提供支持承诺。 |
@@ -76,7 +76,7 @@ flowchart LR
 | `[exe]` | `mpv`、`iina`、`pot` 等 | 播放器可执行文件路径和别名。 |
 | `[emby]` | `player`、`update_progress`、`fullscreen` | 默认播放器、最终进度回传、自动全屏。 |
 | `[src]` / `[dst]` | 同名前缀键 | 把服务端显示路径映射为本地或挂载路径；按配置顺序匹配。 |
-| `[clouddrive2]` | `enable`、`origin`、`api_token`、`path_map`、`request_timeout_seconds` | CloudDrive2 gRPC 和 STRM gateway。Windows/UNC 路径必须有明确 `path_map`。 |
+| `[clouddrive2]` | `enable`、`origin`、`api_token`、`path_map`、`request_timeout_seconds`、`get_direct_url` | CloudDrive2 gRPC 和 STRM gateway。Windows/UNC 路径必须有明确 `path_map`；直链开关默认关闭。 |
 | `[playlist]` | `enable_host`、`version_filter`、`item_limit`、`http_sub_auto_next_ep` | 连续播放范围、版本匹配、条数限制和简易自动下一集。 |
 | `[dev]` | `listen_on_localhost`、`http_server_token`、`strm_*`、`playing_feedback_*`、`force_disk_mode_path` | 本地 HTTP 安全、STRM、本地预热、实时反馈、代理、日志和高级播放策略。 |
 | `[remote_control]` | `enable` | 当前 mpv/IINA 的 Emby 控制 WebSocket；默认 `yes`。 |
@@ -88,7 +88,8 @@ flowchart LR
 - `origin` 默认是 `http://127.0.0.1:19798`，指向 CloudDrive2 本机 API，不是 Emby 登录地址。
 - token 优先从 `ETLP_CLOUDDRIVE2_TOKEN` 读取；配置文件中的 `api_token` 只能作为回退来源，禁止提交真实 token。
 - `path_map` 使用 `本地前缀=>云端前缀`，例如 `X:\115=>/115open/115`。没有 token、映射或可用 gRPC 时，gateway 不会登记路径。
-- gateway URL 只暴露随机 nonce；本地路径和 CloudDrive2 凭据留在进程内存。解析失败必须继续走原挂载文件回退路径。
+- `get_direct_url` 默认关闭。开启后只有 CloudDrive2 返回有效 `directUrl` 时才走本地直链代理；`expiresIn`、`userAgent` 和 `additionalHeaders` 只用于当前请求，不能写入日志。
+- gateway URL 只暴露随机 nonce；本地路径、CloudDrive2 凭据和直链签名留在进程内存。直链代理失败先回退 `downloadUrlPath`，解析失败再走原挂载文件回退路径。
 - 不要把 gateway 或本地 HTTP 服务配置为公网媒体服务；其设计目标是本机播放和受控的局部接口。
 
 ## 5. 代码导航

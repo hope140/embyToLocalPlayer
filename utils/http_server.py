@@ -5,12 +5,15 @@ import re
 import socket
 import subprocess
 import threading
+import urllib.error
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler
 from http.server import HTTPServer
 from socketserver import ThreadingMixIn
 
 from utils.data_parser import parse_received_data_emby, parse_received_data_plex, list_episodes
+from utils.clouddrive2_client import CloudDrive2DownloadTarget
 from utils.clouddrive2_gateway import configure_gateway, gateway
 from utils.downloader import DownloadManager
 from utils.http_security import (ETLP_PROTOCOL_HEADER, bearer_token_valid,
@@ -81,6 +84,16 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         '/action/sparse_file',
     }
     _MEDIA_PATH_RE = re.compile(r'^/send_media_file(?:\.[A-Za-z0-9]+)?$')
+    _DIRECT_PROXY_TIMEOUT_SECONDS = 30
+    _DIRECT_REQUEST_HOP_BY_HOP = frozenset({
+        'connection', 'content-length', 'host', 'keep-alive',
+        'proxy-authenticate', 'proxy-authorization', 'te', 'trailer',
+        'transfer-encoding', 'upgrade',
+    })
+    _DIRECT_RESPONSE_HEADERS = (
+        'Content-Type', 'Content-Length', 'Content-Range',
+        'Accept-Ranges', 'Content-Disposition', 'ETag', 'Last-Modified',
+    )
 
     @staticmethod
     def _is_client_disconnect_error(exc):
@@ -512,13 +525,31 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        cd2_url = gateway.resolve_entry(entry)
-        if cd2_url:
-            self.send_response(307)
-            self.send_header('Location', cd2_url)
-            self.send_header('Cache-Control', 'no-store')
-            self.end_headers()
-            return
+        target = None
+        resolve_target = getattr(gateway, 'resolve_target', None)
+        if callable(resolve_target):
+            candidate = resolve_target(entry)
+            if isinstance(candidate, CloudDrive2DownloadTarget):
+                target = candidate
+            elif candidate is not None:
+                # Keep compatibility with test doubles and older gateway
+                # objects that only expose resolve_entry().
+                target = None
+                resolve_target = None
+        if resolve_target is None:
+            cd2_url = gateway.resolve_entry(entry)
+            if isinstance(cd2_url, str) and cd2_url:
+                target = CloudDrive2DownloadTarget(url=cd2_url)
+
+        if target:
+            if target.is_direct and self._send_cd2_direct_target(target):
+                return
+            if target.fallback_url:
+                self._send_cd2_redirect(target.fallback_url)
+                return
+            if not target.is_direct:
+                self._send_cd2_redirect(target.url)
+                return
         # CD2 is optional.  Keep the old mounted-file path as a transparent
         # fallback when the proxy is offline, unconfigured, or out of scope.
         if not getattr(entry, 'allow_local_fallback', False):
@@ -536,6 +567,108 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
 
         user_agent = self._header('User-Agent', '')
         return f"{self._client_ip()}\n{user_agent.strip().casefold()}"
+
+    def _send_cd2_redirect(self, url):
+        self.send_response(307)
+        self.send_header('Location', url)
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+
+    def _send_cd2_direct_target(self, target):
+        """Proxy one direct cloud response without exposing its URL."""
+        headers = {}
+
+        def set_header(name, value):
+            for existing_name in list(headers):
+                if existing_name.casefold() == name.casefold():
+                    del headers[existing_name]
+            headers[name] = value
+
+        for name, value in target.additional_headers or ():
+            name = str(name).strip()
+            if (not name or name.casefold() in self._DIRECT_REQUEST_HOP_BY_HOP
+                    or '\r' in name or '\n' in name):
+                continue
+            value = str(value).strip()
+            if not value or '\r' in value or '\n' in value or len(value) > 8192:
+                continue
+            set_header(name, value)
+        if target.user_agent:
+            set_header('User-Agent', target.user_agent)
+        set_header('Accept-Encoding', 'identity')
+        range_header = self._header('Range')
+        if range_header:
+            set_header('Range', range_header)
+
+        request = urllib.request.Request(target.url, headers=headers, method=self.command)
+        response = None
+        response_started = False
+        try:
+            response = urllib.request.urlopen(
+                request, timeout=self._DIRECT_PROXY_TIMEOUT_SECONDS)
+            status = response.getcode()
+            if status is None:
+                status = getattr(response, 'status', 200)
+            status = int(status)
+            # Do not let an upstream that ignored a player Range request turn
+            # a seek into a full-file response.  The CD2 URL fallback can
+            # still provide a range-capable path.
+            if range_header and status == 200:
+                logger.info('CloudDrive2 direct proxy ignored range')
+                return False
+            if status < 200 or status >= 400:
+                logger.info('CloudDrive2 direct proxy returned status', status)
+                return False
+
+            self.send_response(status)
+            response_started = True
+            response_headers = getattr(response, 'headers', None)
+            for name in self._DIRECT_RESPONSE_HEADERS:
+                value = response_headers.get(name) if response_headers is not None else None
+                if value is None and response_headers is not None:
+                    for response_name, response_value in response_headers.items():
+                        if str(response_name).casefold() == name.casefold():
+                            value = response_value
+                            break
+                if value is None:
+                    continue
+                value = str(value)
+                if '\r' in value or '\n' in value or len(value) > 8192:
+                    continue
+                self.send_header(name, value)
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+
+            if self.command != 'HEAD':
+                while True:
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except (ConnectionError, OSError):
+                        break
+            return True
+        except urllib.error.HTTPError as exc:
+            if response_started:
+                return True
+            logger.info('CloudDrive2 direct proxy failed', type(exc).__name__, getattr(exc, 'code', ''))
+            try:
+                exc.close()
+            except Exception:
+                pass
+            return False
+        except Exception as exc:
+            if response_started:
+                return True
+            logger.info('CloudDrive2 direct proxy failed', type(exc).__name__)
+            return False
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
     def _send_local_file(self, video_path):
         if not os.path.isfile(video_path):

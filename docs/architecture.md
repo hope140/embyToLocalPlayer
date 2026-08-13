@@ -33,7 +33,7 @@ flowchart LR
 | 数据解析 | 处理 Emby/Jellyfin/Plex 响应、路径、STRM、版本、字幕和播放列表数据 | `utils/data_parser.py` |
 | 播放管理 | 启动播放器、连续播放、预热、播放状态读取和最终进度更新 | `utils/player_manager.py`、`utils/players.py` |
 | Emby 会话与远程控制 | 为当前播放建立独立控制身份，进行 HTTP/WebSocket 回传和控制命令处理 | `utils/emby_session_api.py`、`utils/remote_control_client.py` |
-| CloudDrive2 | 将明确映射的本地 STRM 路径短期登记为 opaque gateway URL，失败时回退本地路径 | `utils/clouddrive2_client.py`、`utils/clouddrive2_gateway.py` |
+| CloudDrive2 | 将明确映射的本地 STRM 路径短期登记为 opaque gateway URL；可选请求并在本地代理 `directUrl`，失败时依次回退 `downloadUrlPath` 和本地路径 | `utils/clouddrive2_client.py`、`utils/clouddrive2_gateway.py`、`utils/http_server.py` |
 | 更新与配置比较 | 校验 beta ZIP sidecar、保护本地配置、安全解压示例配置并输出语义差异 | `utils/update.py`、`utils/config_diff.py` |
 
 ## 当前跨组件约束
@@ -47,7 +47,8 @@ flowchart LR
 4. 控制命令必须绑定当前播放 session、控制设备和用户上下文；状态回传中的 Item/
    MediaSource 要跟随当前播放项目，旧 session 的命令不能被新播放确认。
 5. STRM 本地预热和 CloudDrive2 解析均是 best-effort：超时或不可用时保留原有
-   路径判断和回退路径，不能阻塞播放启动。
+   路径判断和回退路径，不能阻塞播放启动。CloudDrive2 直链默认关闭；开启后直链只
+   在本地 gateway 内代理，不通过 `Location` 暴露，失败先回退 `downloadUrlPath`。
 6. 更新器只在固定 beta 包的 SHA-256 sidecar 校验通过后替换 live archive；配置
    文件不由更新包直接覆盖，ZIP 成员必须先经过安全校验。
 
@@ -57,8 +58,8 @@ flowchart LR
   和 redirect cache 清理线程，最后进入 `run_server()`。
 - 播放器、远程控制和播放列表状态主要保存在进程对象中；配置、字幕/媒体缓存、
   更新 archive 和示例配置使用现有配置路径及临时目录，不引入房间或服务端状态库。
-- CloudDrive2 gateway 只保留短期 nonce 到本地路径的进程内映射；解析失败继续尝试
-  原挂载路径，不能把 gateway 当成公网永久 URL。
+- CloudDrive2 gateway 只保留短期 nonce 到本地路径的进程内映射；直链及其请求头不落盘，
+  解析失败继续尝试 `downloadUrlPath` 和原挂载路径，不能把 gateway 当成公网永久 URL。
 
 ## 证据与维护
 
@@ -69,6 +70,8 @@ flowchart LR
 - `tests/test_remote_control_client.py`
 - `tests/test_local_path_preheat.py`
 - `tests/test_dependency_bootstrap.py`
+- `tests/test_clouddrive2_client.py`
+- `tests/test_clouddrive2_gateway.py`
 - `tests/test_update.py`
 
 新增跨组件约束时，应先补测试或可复现运行证据，再更新本文；只有需要解释长期

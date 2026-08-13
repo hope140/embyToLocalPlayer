@@ -2,7 +2,9 @@
 
 The gateway intentionally keeps the URL opaque.  A player receives only a
 random nonce; the local path and CD2 credentials remain in process memory.
-When a request arrives we resolve the CD2 URL just-in-time.  Entries created
+When a request arrives we resolve the CD2 target just-in-time.  Direct targets
+are consumed by the local HTTP gateway; redirect targets and resolution
+failures retain the existing download/local fallback chain.  Entries created
 by the configured path_map may fall back to the original mounted file when
 resolution fails; direct/internal registrations never expose that file.
 """
@@ -16,7 +18,7 @@ import time
 from typing import Callable, Optional
 from urllib.parse import quote
 
-from utils.clouddrive2_client import CloudDrive2Client
+from utils.clouddrive2_client import CloudDrive2Client, CloudDrive2DownloadTarget
 from utils.configs import configs
 
 
@@ -62,6 +64,8 @@ class CloudDrive2Gateway:
             origin = configs.raw.get('clouddrive2', 'origin', fallback='http://127.0.0.1:19798').strip()
             path_map = configs.raw.get('clouddrive2', 'path_map', fallback='').strip()
             timeout = configs.raw.getfloat('clouddrive2', 'request_timeout_seconds', fallback=2)
+            get_direct_url = configs.raw.getboolean(
+                'clouddrive2', 'get_direct_url', fallback=False)
         except (ValueError, TypeError):
             return None
         # The gateway receives a local mounted path.  Requiring an explicit
@@ -69,11 +73,12 @@ class CloudDrive2Gateway:
         # it were already a cloud path when the user forgot to configure it.
         if not enabled or not token or not path_map:
             return None
-        key = (origin, token, path_map, timeout)
+        key = (origin, token, path_map, timeout, get_direct_url)
         with self._lock:
             if key != self._client_key:
                 self._client = CloudDrive2Client(
                     origin, token, path_map=path_map, request_timeout_seconds=timeout,
+                    get_direct_url=get_direct_url,
                     logger=getattr(configs, 'logger', None))
                 self._client_key = key
             return self._client
@@ -159,8 +164,16 @@ class CloudDrive2Gateway:
             return None
 
     def resolve_entry(self, entry: GatewayEntry) -> Optional[str]:
+        target = self.resolve_target(entry)
+        if not target:
+            return None
+        # Keep this legacy string API from exposing a provider direct URL.
+        # The HTTP handler uses resolve_target() and proxies direct targets.
+        return target.fallback_url if target.is_direct else target.url
+
+    def resolve_target(self, entry: GatewayEntry) -> Optional[CloudDrive2DownloadTarget]:
         client = self._client_from_config()
-        return client.resolve_download_url(entry.local_path) if client else None
+        return client.resolve_download_target(entry.local_path) if client else None
 
     def _prune(self, now: float) -> None:
         expired = [key for key, entry in self._entries.items() if entry.expires_at <= now]

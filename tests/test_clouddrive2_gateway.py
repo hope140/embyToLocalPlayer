@@ -2,6 +2,7 @@ import io
 import os
 import tempfile
 import unittest
+import urllib.error
 from configparser import ConfigParser
 from types import SimpleNamespace
 from unittest import mock
@@ -9,6 +10,7 @@ from unittest import mock
 import utils.clouddrive2_gateway as gateway_module
 import utils.data_parser as data_parser
 import utils.http_server as http_server
+from utils.clouddrive2_client import CloudDrive2DownloadTarget
 
 
 class _FakeHandler:
@@ -17,6 +19,9 @@ class _FakeHandler:
         self.parse_range_header = http_server.UserScriptRequestHandler.parse_range_header
         self.headers = {} if range_header is None else {'Range': range_header}
         self.client_ip = '127.0.0.1'
+        self._DIRECT_PROXY_TIMEOUT_SECONDS = 30
+        self._DIRECT_REQUEST_HOP_BY_HOP = http_server.UserScriptRequestHandler._DIRECT_REQUEST_HOP_BY_HOP
+        self._DIRECT_RESPONSE_HEADERS = http_server.UserScriptRequestHandler._DIRECT_RESPONSE_HEADERS
         self.wfile = io.BytesIO()
         self.responses = []
         self.headers_sent = []
@@ -33,6 +38,12 @@ class _FakeHandler:
 
     def _is_allowed_media_extension(self, path):
         return http_server.UserScriptRequestHandler._is_allowed_media_extension(path)
+
+    def _send_cd2_redirect(self, url):
+        return http_server.UserScriptRequestHandler._send_cd2_redirect(self, url)
+
+    def _send_cd2_direct_target(self, target):
+        return http_server.UserScriptRequestHandler._send_cd2_direct_target(self, target)
 
     def send_response(self, status):
         self.responses.append(status)
@@ -55,6 +66,38 @@ class CloudDrive2GatewayTests(unittest.TestCase):
         with mock.patch.object(gateway_module.configs, 'raw', raw):
             gateway = gateway_module.CloudDrive2Gateway()
             self.assertIsNone(gateway._client_from_config())
+
+    def test_config_passes_direct_url_opt_in_to_client(self):
+        raw = ConfigParser()
+        raw.read_dict({'clouddrive2': {
+            'enable': 'yes',
+            'api_token': 'synthetic-token',
+            'origin': 'http://127.0.0.1:19798',
+            'path_map': r'C:\Media=>/library',
+            'get_direct_url': 'yes',
+        }})
+        with mock.patch.object(gateway_module.configs, 'raw', raw), \
+                mock.patch.object(gateway_module, 'CloudDrive2Client') as client_cls:
+            gateway = gateway_module.CloudDrive2Gateway()
+            self.assertIsNotNone(gateway._client_from_config())
+
+        self.assertTrue(client_cls.call_args.kwargs['get_direct_url'])
+
+    def test_legacy_resolve_entry_does_not_expose_direct_url(self):
+        gateway = gateway_module.CloudDrive2Gateway()
+        target = CloudDrive2DownloadTarget(
+            url='https://cdn.example/video.mkv?signature=synthetic',
+            is_direct=True,
+            fallback_url='https://cd2.example/static/video.mkv?token=synthetic',
+        )
+        gateway._client_from_config = mock.Mock()
+        gateway._client_from_config.return_value.resolve_download_target.return_value = target
+
+        entry = SimpleNamespace(local_path='movie.mkv')
+        self.assertEqual(
+            gateway.resolve_entry(entry),
+            'https://cd2.example/static/video.mkv?token=synthetic',
+        )
 
     def test_register_pop_and_expiry(self):
         now = [100.0]
@@ -205,6 +248,106 @@ class HttpGatewayRouteTests(unittest.TestCase):
         self.assertIn(('Cache-Control', 'no-store'), handler.headers_sent)
         fake_gateway.lookup_or_claim.assert_called_once_with(
             'opaque-nonce', '127.0.0.1\n')
+
+    def test_send_cd2_file_proxies_direct_url_and_forwards_range_metadata(self):
+        handler = _FakeHandler(range_header='bytes=2-4')
+        handler.path = '/cd2/opaque-nonce'
+        target = CloudDrive2DownloadTarget(
+            url='https://cdn.example/video.mkv?signature=synthetic',
+            is_direct=True,
+            user_agent='CloudDrive2 synthetic UA',
+            additional_headers=(
+                ('Authorization', 'Bearer synthetic'),
+                ('X-Cloud-Header', 'enabled'),
+                ('Host', 'must-not-forward'),
+            ),
+            fallback_url='https://cd2.example/static/video.mkv?token=synthetic',
+        )
+        fake_gateway = mock.Mock()
+        fake_gateway.pop_entry.return_value = SimpleNamespace(local_path='movie.mkv')
+        fake_gateway.resolve_target.return_value = target
+
+        class Response:
+            status = 206
+            headers = {
+                'Content-Type': 'video/x-matroska',
+                'Content-Length': '3',
+                'Content-Range': 'bytes 2-4/10',
+                'Accept-Ranges': 'bytes',
+            }
+
+            def __init__(self):
+                self.chunks = iter((b'234', b''))
+                self.closed = False
+
+            def getcode(self):
+                return self.status
+
+            def read(self, _size):
+                return next(self.chunks)
+
+            def close(self):
+                self.closed = True
+
+        response = Response()
+        with mock.patch.object(http_server, 'gateway', fake_gateway), \
+                mock.patch.object(http_server.urllib.request, 'urlopen', return_value=response) as urlopen:
+            http_server.UserScriptRequestHandler.send_cd2_file(handler)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, target.url)
+        self.assertEqual(request.get_header('Range'), 'bytes=2-4')
+        self.assertEqual(request.get_header('User-agent'), 'CloudDrive2 synthetic UA')
+        self.assertEqual(request.get_header('X-cloud-header'), 'enabled')
+        self.assertIsNone(request.get_header('Host'))
+        self.assertEqual(request.get_header('Accept-encoding'), 'identity')
+        self.assertEqual(handler.responses, [206])
+        self.assertEqual(handler.wfile.getvalue(), b'234')
+        self.assertNotIn(('Location', target.url), handler.headers_sent)
+        self.assertTrue(response.closed)
+
+    def test_direct_proxy_failure_redirects_to_download_url_fallback(self):
+        handler = _FakeHandler(range_header='bytes=0-')
+        handler.path = '/cd2/opaque-nonce'
+        target = CloudDrive2DownloadTarget(
+            url='https://cdn.example/video.mkv?signature=synthetic',
+            is_direct=True,
+            fallback_url='https://cd2.example/static/video.mkv?token=synthetic',
+        )
+        fake_gateway = mock.Mock()
+        fake_gateway.pop_entry.return_value = SimpleNamespace(local_path='movie.mkv')
+        fake_gateway.resolve_target.return_value = target
+        with mock.patch.object(http_server, 'gateway', fake_gateway), \
+                mock.patch.object(
+                    http_server.urllib.request, 'urlopen',
+                    side_effect=urllib.error.URLError('synthetic offline')):
+            http_server.UserScriptRequestHandler.send_cd2_file(handler)
+
+        self.assertEqual(handler.responses, [307])
+        self.assertIn(('Location', target.fallback_url), handler.headers_sent)
+        self.assertNotIn(('Location', target.url), handler.headers_sent)
+
+    def test_direct_proxy_ignored_range_falls_back_without_partial_response(self):
+        handler = _FakeHandler(range_header='bytes=0-')
+        handler.path = '/cd2/opaque-nonce'
+        target = CloudDrive2DownloadTarget(
+            url='https://cdn.example/video.mkv?signature=synthetic',
+            is_direct=True,
+            fallback_url='https://cd2.example/static/video.mkv?token=synthetic',
+        )
+        fake_gateway = mock.Mock()
+        fake_gateway.pop_entry.return_value = SimpleNamespace(local_path='movie.mkv')
+        fake_gateway.resolve_target.return_value = target
+
+        response = mock.Mock()
+        response.getcode.return_value = 200
+        with mock.patch.object(http_server, 'gateway', fake_gateway), \
+                mock.patch.object(http_server.urllib.request, 'urlopen', return_value=response):
+            http_server.UserScriptRequestHandler.send_cd2_file(handler)
+
+        self.assertEqual(handler.responses, [307])
+        self.assertIn(('Location', target.fallback_url), handler.headers_sent)
+        response.close.assert_called_once_with()
 
     def test_send_cd2_file_falls_back_to_local_file_when_resolution_fails(self):
         handler = _FakeHandler()
