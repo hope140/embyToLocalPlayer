@@ -20,7 +20,7 @@ The runtime verifies this exact SHA256 before adding the wheel to `sys.path`.
 It never installs the wheel, runs package scripts, or downloads anything at
 runtime.  A normal system/user `websocket-client` import remains preferred.
 
-The beta Windows package also carries compatible CPython 3.9 x86 wheels for
+The beta and stable Windows packages carry compatible CPython 3.9 x86 wheels for
 the CloudDrive2 and HTTP client dependencies (`grpcio`, `protobuf`, `requests`,
 `typing-extensions`, `certifi`, `charset-normalizer`, `idna`, and `urllib3`).
 `utils/dependency_bootstrap.py` extracts these wheels into a private cache on
