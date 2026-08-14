@@ -17,16 +17,78 @@ class UpdateArchiveTests(unittest.TestCase):
                 zf.writestr(name, payload)
         return archive
 
-    def test_update_url_is_pinned_to_latest_beta_release_asset(self):
+    def test_release_api_is_channel_scoped(self):
         self.assertEqual(
-            update.UPDATE_URL,
-            "https://github.com/hope140/embyToLocalPlayer/releases/latest/download/etlp-remote-control-beta.zip",
+            update.RELEASES_API_URL,
+            "https://api.github.com/repos/hope140/embyToLocalPlayer/releases?per_page=100",
         )
+        self.assertNotIn("releases/latest/download", update.RELEASES_API_URL)
         self.assertEqual(
-            update.CHECKSUM_URL,
-            "https://github.com/hope140/embyToLocalPlayer/releases/latest/download/etlp-remote-control-beta.zip.sha256",
+            update.CHANNEL_ASSETS,
+            {
+                "beta": {
+                    "package": "etlp-remote-control-beta.zip",
+                    "checksum": "etlp-remote-control-beta.zip.sha256",
+                },
+                "stable": {
+                    "package": "etlp-remote-control-stable.zip",
+                    "checksum": "etlp-remote-control-stable.zip.sha256",
+                },
+            },
         )
-        self.assertIn("releases/latest/download", update.UPDATE_URL)
+
+    def test_latest_release_selection_keeps_channels_separate(self):
+        releases = [
+            {
+                "id": 1,
+                "tag_name": "2026.08.13.3-beta",
+                "published_at": "2026-08-13T10:00:00Z",
+                "assets": [
+                    {"name": "etlp-remote-control-beta.zip"},
+                    {"name": "etlp-remote-control-beta.zip.sha256"},
+                ],
+            },
+            {
+                "id": 2,
+                "tag_name": "2026.08.14",
+                "published_at": "2026-08-14T10:00:00Z",
+                "assets": [
+                    {"name": "etlp-remote-control-stable.zip"},
+                    {"name": "etlp-remote-control-stable.zip.sha256"},
+                ],
+            },
+            {
+                "id": 3,
+                "tag_name": "2026.08.14.1-beta",
+                "published_at": "2026-08-14T11:00:00Z",
+                "assets": [
+                    {"name": "etlp-remote-control-beta.zip"},
+                    {"name": "etlp-remote-control-beta.zip.sha256"},
+                ],
+            },
+        ]
+
+        beta = update.select_latest_release(releases, "beta")
+        stable = update.select_latest_release(releases, "stable")
+
+        self.assertEqual(beta["tag"], "2026.08.14.1-beta")
+        self.assertEqual(beta["package_asset"], "etlp-remote-control-beta.zip")
+        self.assertEqual(stable["tag"], "2026.08.14")
+        self.assertEqual(stable["package_asset"], "etlp-remote-control-stable.zip")
+        self.assertNotIn("/latest/", beta["update_url"])
+        self.assertIn("/2026.08.14.1-beta/", beta["update_url"])
+        self.assertIn("/2026.08.14/", stable["update_url"])
+
+    def test_latest_release_selection_rejects_missing_assets(self):
+        with self.assertRaisesRegex(ValueError, "no published stable release"):
+            update.select_latest_release(
+                [{
+                    "tag_name": "2026.08.14",
+                    "published_at": "2026-08-14T10:00:00Z",
+                    "assets": [{"name": "etlp-remote-control-stable.zip"}],
+                }],
+                "stable",
+            )
 
     def test_github_prefix_is_flattened_and_live_config_is_protected(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -194,19 +256,33 @@ class UpdateArchiveTests(unittest.TestCase):
 
 
 class UpdateDownloadTests(unittest.TestCase):
-    def _stub_download(self, archive_payload, checksum_text):
+    def _stub_download(self, archive_payload, checksum_text, channel="beta"):
+        tag = "2026.08.14.1-beta" if channel == "beta" else "2026.08.14"
+        assets = update.CHANNEL_ASSETS[channel]
+        releases = [{
+            "id": 1,
+            "tag_name": tag,
+            "published_at": "2026-08-14T10:00:00Z",
+            "assets": [
+                {"name": assets["package"]},
+                {"name": assets["checksum"]},
+            ],
+        }]
+        release = update.select_latest_release(releases, channel)
         calls = []
 
         def fake_requests(url, **kwargs):
             calls.append((url, kwargs))
-            if url == update.CHECKSUM_URL:
+            if url == update.RELEASES_API_URL:
+                return releases
+            if url == release["checksum_url"]:
                 return checksum_text
-            if url == update.UPDATE_URL:
+            if url == release["update_url"]:
                 Path(kwargs["save_path"]).write_bytes(archive_payload)
                 return kwargs["save_path"]
             raise AssertionError(f"unexpected URL: {url}")
 
-        return calls, fake_requests
+        return calls, fake_requests, release
 
     def test_checksum_parser_accepts_single_record_and_normalises_case(self):
         digest = "A" * 64
@@ -232,7 +308,7 @@ class UpdateDownloadTests(unittest.TestCase):
         payload = b"verified update archive"
         digest = hashlib.sha256(payload).hexdigest()
         checksum_text = f"{digest}  {update.PACKAGE_ASSET}\n"
-        calls, fake_requests = self._stub_download(payload, checksum_text)
+        calls, fake_requests, release = self._stub_download(payload, checksum_text)
 
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -250,13 +326,16 @@ class UpdateDownloadTests(unittest.TestCase):
             self.assertEqual(live_archive.read_bytes(), payload)
             self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
             self.assertTrue(marker.exists())
-            self.assertEqual([url for url, _ in calls], [update.CHECKSUM_URL, update.UPDATE_URL])
-            self.assertEqual(calls[1][1]["save_path"], str(root / "embyToLocalPlayer.zip.part"))
+            self.assertEqual(
+                [url for url, _ in calls],
+                [update.RELEASES_API_URL, release["checksum_url"], release["update_url"]],
+            )
+            self.assertEqual(calls[2][1]["save_path"], str(root / "embyToLocalPlayer.zip.part"))
 
     def test_checksum_mismatch_cleans_part_without_changing_live_files(self):
         payload = b"downloaded bytes that do not match"
         expected = hashlib.sha256(b"different bytes").hexdigest()
-        calls, fake_requests = self._stub_download(
+        calls, fake_requests, release = self._stub_download(
             payload,
             f"{expected}  {update.PACKAGE_ASSET}\n",
         )
@@ -277,10 +356,13 @@ class UpdateDownloadTests(unittest.TestCase):
             self.assertEqual(live_archive.read_bytes(), b"old archive")
             self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
             self.assertTrue(marker.exists())
-            self.assertEqual([url for url, _ in calls], [update.CHECKSUM_URL, update.UPDATE_URL])
+            self.assertEqual(
+                [url for url, _ in calls],
+                [update.RELEASES_API_URL, release["checksum_url"], release["update_url"]],
+            )
 
     def test_malformed_checksum_does_not_download_or_change_live_files(self):
-        calls, fake_requests = self._stub_download(b"unused", "not a checksum\n")
+        calls, fake_requests, _ = self._stub_download(b"unused", "not a checksum\n")
 
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -295,18 +377,45 @@ class UpdateDownloadTests(unittest.TestCase):
 
             self.assertEqual(live_archive.read_bytes(), b"old archive")
             self.assertFalse(part.exists())
-            self.assertEqual([url for url, _ in calls], [update.CHECKSUM_URL])
+            self.assertEqual(
+                [url for url, _ in calls],
+                [update.RELEASES_API_URL, update.select_latest_release(
+                    [{
+                        "id": 1,
+                        "tag_name": "2026.08.14.1-beta",
+                        "published_at": "2026-08-14T10:00:00Z",
+                        "assets": [
+                            {"name": update.CHANNEL_ASSETS["beta"]["package"]},
+                            {"name": update.CHANNEL_ASSETS["beta"]["checksum"]},
+                        ],
+                    }],
+                    "beta",
+                )["checksum_url"]],
+            )
 
     def test_archive_download_exception_cleans_partial_file(self):
         payload = b"partial archive"
         checksum = hashlib.sha256(payload).hexdigest()
+        assets = update.CHANNEL_ASSETS["beta"]
+        releases = [{
+            "id": 1,
+            "tag_name": "2026.08.14.1-beta",
+            "published_at": "2026-08-14T10:00:00Z",
+            "assets": [
+                {"name": assets["package"]},
+                {"name": assets["checksum"]},
+            ],
+        }]
+        release = update.select_latest_release(releases, "beta")
         calls = []
 
         def failing_requests(url, **kwargs):
             calls.append((url, kwargs))
-            if url == update.CHECKSUM_URL:
+            if url == update.RELEASES_API_URL:
+                return releases
+            if url == release["checksum_url"]:
                 return f"{checksum}  {update.PACKAGE_ASSET}\n"
-            if url == update.UPDATE_URL:
+            if url == release["update_url"]:
                 Path(kwargs["save_path"]).write_bytes(payload)
                 raise OSError("simulated download failure")
             raise AssertionError(f"unexpected URL: {url}")
@@ -322,7 +431,26 @@ class UpdateDownloadTests(unittest.TestCase):
 
             self.assertEqual(live_archive.read_bytes(), b"old archive")
             self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
-            self.assertEqual([url for url, _ in calls], [update.CHECKSUM_URL, update.UPDATE_URL])
+            self.assertEqual(
+                [url for url, _ in calls],
+                [update.RELEASES_API_URL, release["checksum_url"], release["update_url"]],
+            )
+
+    def test_stable_download_uses_stable_assets(self):
+        payload = b"verified stable archive"
+        digest = hashlib.sha256(payload).hexdigest()
+        stable_asset = update.CHANNEL_ASSETS["stable"]["package"]
+        checksum_text = f"{digest}  {stable_asset}\n"
+        calls, fake_requests, release = self._stub_download(payload, checksum_text, channel="stable")
+
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.object(update, "requests_urllib", side_effect=fake_requests), \
+                    mock.patch.object(update, "load_release_channel", return_value="stable"):
+                update.download_verified_update(Path(temp))
+
+        self.assertEqual(release["channel"], "stable")
+        self.assertIn("etlp-remote-control-stable.zip", release["update_url"])
+        self.assertNotIn("-beta/", release["update_url"])
 
 
 if __name__ == "__main__":

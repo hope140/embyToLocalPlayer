@@ -10,7 +10,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $arguments = @{
-    Channel = 'beta'
+    Channel = 'stable'
     ReleaseVersion = $ReleaseVersion
 }
 if ($OutputDirectory) {
