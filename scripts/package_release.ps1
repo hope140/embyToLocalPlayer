@@ -107,12 +107,47 @@ $utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
 # The browser userscript is runtime input; keep JavaScript only.
 $userScriptSource = Join-Path $root 'user_script'
 $userScriptTarget = Join-Path $staging 'user_script'
+$channelMetadata = @(
+    @{
+        Name = '@updateURL'
+        Pattern = '(?m)^// @updateURL[\t ]+[^\r\n]*'
+        Value = "// @updateURL    https://raw.githubusercontent.com/hope140/embyToLocalPlayer/$Channel/user_script/embyToLocalPlayer.user.js"
+    },
+    @{
+        Name = '@downloadURL'
+        Pattern = '(?m)^// @downloadURL[\t ]+[^\r\n]*'
+        Value = "// @downloadURL  https://raw.githubusercontent.com/hope140/embyToLocalPlayer/$Channel/user_script/embyToLocalPlayer.user.js"
+    },
+    @{
+        Name = '@homepageURL'
+        Pattern = '(?m)^// @homepageURL[\t ]+[^\r\n]*'
+        Value = "// @homepageURL  https://github.com/hope140/embyToLocalPlayer/tree/$Channel"
+    },
+    @{
+        Name = '@supportURL'
+        Pattern = '(?m)^// @supportURL[\t ]+[^\r\n]*'
+        Value = "// @supportURL   https://github.com/hope140/embyToLocalPlayer/tree/$Channel#faq"
+    }
+)
 foreach ($file in Get-ChildItem -LiteralPath $userScriptSource -Recurse -File |
     Where-Object { $_.Extension -eq '.js' }) {
     $relative = $file.FullName.Substring($userScriptSource.Length).TrimStart([char[]]@('\', '/'))
     $destination = Join-Path $userScriptTarget $relative
     New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
     Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+    if ($file.Name -ne 'embyToLocalPlayer.user.js') {
+        continue
+    }
+
+    $userScriptText = [System.IO.File]::ReadAllText($destination)
+    foreach ($metadata in $channelMetadata) {
+        $metadataMatches = [regex]::Matches($userScriptText, $metadata.Pattern)
+        if ($metadataMatches.Count -ne 1) {
+            throw "Userscript metadata $($metadata.Name) must occur exactly once in $destination"
+        }
+        $userScriptText = [regex]::Replace($userScriptText, $metadata.Pattern, $metadata.Value)
+    }
+    [System.IO.File]::WriteAllText($destination, $userScriptText, $utf8NoBom)
 }
 
 # Bundled Python distributions are required by the embedded runtime. Keep
