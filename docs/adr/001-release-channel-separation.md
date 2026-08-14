@@ -33,6 +33,9 @@ Latest 指针，不能同时表达 beta 和 stable；如果两个频道共用包
 - `release_info.py` 将频道写入运行包。更新器访问 GitHub Releases API，只选择非 draft、
   同频道 tag 且同时有 ZIP 和 sidecar 的 Release，再下载明确 tag 下的资产，不使用
   `Latest` 地址。
+- 为兼容已部署的旧 beta 更新器，stable Latest Release 在过渡期额外保留旧路径所需的
+  `etlp-remote-control-beta.zip` 和 `.sha256` 兼容资产。它们必须是当前 beta 包的原样副本，
+  新更新器不得选择这两个兼容资产。
 - 油猴脚本保留相同的 `@name` 和 `@namespace`，但 update/download/homepage/support
   URL 指向当前频道；打包阶段再次规范化这些 URL，防止源码分支漂移。用户只安装一个频道。
 
@@ -45,6 +48,8 @@ Latest 指针，不能同时表达 beta 和 stable；如果两个频道共用包
 ## 已知代价
 
 - 更新器需要额外请求 GitHub Releases API，并依赖每个频道同时上传 ZIP 和 sidecar。
+- 过渡期 stable Release 会多出两个 beta 兼容资产；旧客户端完成一次自举升级后应移除，
+  之后 stable Release 恢复只保留 stable 正式资产。
 - API 列表缺少合格资产、tag 不合规或 sidecar 校验失败时更新会失败关闭，用户需要
   手动选择正确频道或恢复历史包。
 - stable 和 beta 的油猴 raw URL不同，安装说明必须明确要求只选择一个频道。
