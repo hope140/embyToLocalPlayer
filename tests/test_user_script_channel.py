@@ -39,6 +39,17 @@ class UserScriptChannelTests(unittest.TestCase):
         self.assertIn("update current release channel", launcher)
         self.assertNotIn("update to latest version", launcher)
 
+    def test_launcher_uses_safe_command_quoting_and_choice_syntax(self):
+        launcher = LAUNCHER.read_text(encoding="utf-8-sig")
+        self.assertIn('set "pythonPath=python"', launcher)
+        self.assertIn('set "pythonEmbed=%~dp0python_embed\\python.exe"', launcher)
+        self.assertIn('if exist "%pythonEmbed%"', launcher)
+        self.assertIn('for /F "usebackq tokens=*" %%A in (`"%pythonPath%" --version', launcher)
+        self.assertIn('if errorlevel 6 goto six', launcher.lower())
+        self.assertNotIn("IF ERRORLEVEL ==6", launcher)
+        self.assertIn('"%pythonPath%" "%~dp0utils\\update.py"', launcher)
+        self.assertIn('"%pythonPath%" "%~dp0embyToLocalPlayer.py"', launcher)
+
     def test_packager_normalises_all_channel_metadata_and_fails_closed(self):
         packager = PACKAGER.read_text(encoding="utf-8")
         for name in ("@updateURL", "@downloadURL", "@homepageURL", "@supportURL"):
