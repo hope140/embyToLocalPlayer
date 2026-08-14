@@ -374,6 +374,7 @@ class StrmContentParseTests(unittest.TestCase):
                 '', '   ', 'not a url', 'file:///C:/x.mkv', 'rtsp://host/x',
                 '//host/path', 'http://', 'https://',
                 'http://user:pass@host/x',
+                'http://[::1',
                 'http://' + 'a' * 9000, 'line1\nline2'):
             with self.subTest(content=content):
                 self.assertIsNone(self.parse(content))

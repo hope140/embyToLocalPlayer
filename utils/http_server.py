@@ -595,7 +595,14 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             return None
         if any(ord(char) < 32 or ord(char) == 127 for char in candidate):
             return None
-        parsed = urllib.parse.urlparse(candidate)
+        try:
+            parsed = urllib.parse.urlparse(candidate)
+        except ValueError:
+            # Malformed bracketed IPv6 authorities raise from urlparse rather
+            # than returning a rejected ParseResult.  Treat corrupt pointers
+            # like every other unusable .strm body and let the caller return
+            # 404 instead of terminating the request handler.
+            return None
         if parsed.scheme.casefold() not in ('http', 'https') or not parsed.netloc:
             return None
         if parsed.username is not None or parsed.password is not None:
