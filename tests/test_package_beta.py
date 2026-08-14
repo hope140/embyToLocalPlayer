@@ -16,6 +16,15 @@ class BetaPackageTests(unittest.TestCase):
         shell = shutil.which("pwsh") or shutil.which("powershell")
         if shell is None:
             self.skipTest("PowerShell is required to execute scripts/package_beta.ps1")
+        current_branch = subprocess.check_output(
+            ["git", "branch", "--show-current"],
+            cwd=ROOT,
+            text=True,
+        ).strip()
+        if current_branch != "beta":
+            self.skipTest(
+                f"runtime packaging is guarded to the beta branch (current: {current_branch})"
+            )
 
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)
@@ -36,6 +45,8 @@ class BetaPackageTests(unittest.TestCase):
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -79,7 +90,7 @@ class BetaPackageTests(unittest.TestCase):
                 if isinstance(node, ast.Assign) and len(node.targets) == 1:
                     target = node.targets[0]
                     if isinstance(target, ast.Name) and target.id in {
-                            "RELEASE_VERSION", "RELEASE_COMMIT"}:
+                            "RELEASE_VERSION", "RELEASE_COMMIT", "RELEASE_CHANNEL"}:
                         assignments[target.id] = ast.literal_eval(node.value)
 
             self.assertEqual(actual, expected)
@@ -89,6 +100,7 @@ class BetaPackageTests(unittest.TestCase):
                 cwd=ROOT,
                 text=True,
             ).strip())
+            self.assertEqual(assignments["RELEASE_CHANNEL"], "beta")
             self.assertNotIn("etlp_release.json", actual)
             self.assertTrue(any(name.endswith(".whl") for name in actual))
             self.assertFalse(any(name.casefold().endswith(".md") for name in actual))
@@ -116,11 +128,38 @@ class BetaPackageTests(unittest.TestCase):
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
             self.assertNotEqual(missing_version.returncode, 0)
             self.assertFalse(
                 (missing_version_output / "etlp-remote-control-beta.zip").exists())
+
+            stable_output = output / "stable-from-beta"
+            stable = subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(ROOT / "scripts" / "package_stable.ps1"),
+                    "-OutputDirectory",
+                    str(stable_output),
+                    "-ReleaseVersion",
+                    "2026.08.14",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertNotEqual(stable.returncode, 0)
+            self.assertFalse((stable_output / "etlp-remote-control-stable.zip").exists())
 
 
 if __name__ == "__main__":

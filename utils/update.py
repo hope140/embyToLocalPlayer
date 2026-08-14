@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import os.path
 import re
@@ -8,22 +9,126 @@ import sys
 import zipfile
 from configparser import ConfigParser
 from pathlib import Path
+from urllib.parse import quote
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from utils.configs import configs
 from utils.net_tools import requests_urllib
+try:
+    from utils.release_info import load_release_channel
+except (ImportError, AttributeError):
+    def load_release_channel():
+        """Keep source/older installs on the historical beta update channel."""
+        return 'beta'
 
 
-PACKAGE_ASSET = 'etlp-remote-control-beta.zip'
-UPDATE_URL = 'https://github.com/hope140/embyToLocalPlayer/releases/latest/download/etlp-remote-control-beta.zip'
-CHECKSUM_URL = 'https://github.com/hope140/embyToLocalPlayer/releases/latest/download/etlp-remote-control-beta.zip.sha256'
+REPOSITORY = 'hope140/embyToLocalPlayer'
+RELEASES_API_URL = f'https://api.github.com/repos/{REPOSITORY}/releases?per_page=100'
+CHANNEL_ASSETS = {
+    'beta': {
+        'package': 'etlp-remote-control-beta.zip',
+        'checksum': 'etlp-remote-control-beta.zip.sha256',
+    },
+    'stable': {
+        'package': 'etlp-remote-control-stable.zip',
+        'checksum': 'etlp-remote-control-stable.zip.sha256',
+    },
+}
+# Compatibility default for callers that used the old parser directly. New
+# downloads always pass the selected channel's asset explicitly.
+PACKAGE_ASSET = CHANNEL_ASSETS['beta']['package']
 CONFIG_PREFIX = 'embyToLocalPlayer_config'
 
 _CHECKSUM_RECORD = re.compile(r'(?P<digest>[0-9a-fA-F]{64}) {2}(?P<filename>\S+)')
+_RELEASE_TAG = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+/\-]{0,127}$')
 
 
-def parse_checksum(checksum_text):
-    """Parse the one-record sidecar for the fixed beta package asset."""
+def _normalise_channel(channel):
+    if channel is None:
+        channel = load_release_channel()
+    if not isinstance(channel, str) or channel not in CHANNEL_ASSETS:
+        raise ValueError(f'unsupported release channel: {channel!r}')
+    return channel
+
+
+def _release_download_url(tag, asset_name):
+    if not isinstance(tag, str) or _RELEASE_TAG.fullmatch(tag) is None:
+        raise ValueError(f'unsupported GitHub release tag: {tag!r}')
+    return f'https://github.com/{REPOSITORY}/releases/download/{quote(tag, safe="")}/{quote(asset_name, safe="")}'
+
+
+def select_latest_release(releases, channel):
+    """Select the newest published release carrying the channel assets."""
+    channel = _normalise_channel(channel)
+    if not isinstance(releases, list):
+        raise ValueError('GitHub releases response must be a JSON array')
+
+    assets = CHANNEL_ASSETS[channel]
+    candidates = []
+    for release in releases:
+        if not isinstance(release, dict) or release.get('draft') is True:
+            continue
+        tag = release.get('tag_name')
+        if not isinstance(tag, str) or _RELEASE_TAG.fullmatch(tag) is None:
+            continue
+        if channel == 'beta' and not tag.endswith('-beta'):
+            continue
+        if channel == 'stable' and (tag.endswith('-beta') or release.get('prerelease') is True):
+            continue
+
+        release_assets = release.get('assets')
+        if not isinstance(release_assets, list):
+            continue
+        asset_names = {
+            asset.get('name')
+            for asset in release_assets
+            if isinstance(asset, dict) and isinstance(asset.get('name'), str)
+        }
+        if assets['package'] not in asset_names or assets['checksum'] not in asset_names:
+            continue
+
+        published_at = release.get('published_at') or release.get('created_at') or ''
+        if not isinstance(published_at, str):
+            published_at = ''
+        release_id = release.get('id')
+        if not isinstance(release_id, int):
+            release_id = 0
+        candidates.append((published_at, release_id, tag))
+
+    if not candidates:
+        raise ValueError(f'no published {channel} release with matching assets was found')
+
+    _, _, tag = max(candidates)
+    return {
+        'channel': channel,
+        'tag': tag,
+        'package_asset': assets['package'],
+        'checksum_asset': assets['checksum'],
+        'update_url': _release_download_url(tag, assets['package']),
+        'checksum_url': _release_download_url(tag, assets['checksum']),
+    }
+
+
+def resolve_update_urls(channel=None):
+    """Resolve immutable package URLs for the installed beta/stable channel."""
+    channel = _normalise_channel(channel)
+    releases = requests_urllib(
+        RELEASES_API_URL,
+        get_json=True,
+        headers={'Accept': 'application/vnd.github+json'},
+        timeout=10,
+        retry=3,
+    )
+    if isinstance(releases, str):
+        try:
+            releases = json.loads(releases)
+        except json.JSONDecodeError as exc:
+            raise ValueError('GitHub releases response is not valid JSON') from exc
+    return select_latest_release(releases, channel)
+
+
+def parse_checksum(checksum_text, expected_asset=PACKAGE_ASSET):
+    """Parse the one-record sidecar for the selected package asset."""
     if isinstance(checksum_text, bytes):
         try:
             checksum_text = checksum_text.decode('utf-8')
@@ -41,8 +146,8 @@ def parse_checksum(checksum_text):
     if match is None:
         raise ValueError('checksum record must contain 64 hex characters, two spaces, and a filename')
     filename = match.group('filename')
-    if filename != PACKAGE_ASSET:
-        raise ValueError(f'checksum filename does not match expected asset {PACKAGE_ASSET!r}')
+    if filename != expected_asset:
+        raise ValueError(f'checksum filename does not match expected asset {expected_asset!r}')
     return match.group('digest').lower()
 
 
@@ -57,16 +162,17 @@ def calculate_sha256(path, chunk_size=1024 * 1024):
     return digest.hexdigest()
 
 
-def download_verified_update(cwd):
+def download_verified_update(cwd, channel=None):
     """Download and verify the update archive, returning its live archive path."""
     cwd = Path(cwd)
     zip_path = cwd / 'embyToLocalPlayer.zip'
     zip_part_path = Path(f'{zip_path}.part')
     try:
-        checksum_text = requests_urllib(CHECKSUM_URL, decode=True)
-        expected_digest = parse_checksum(checksum_text)
+        release = resolve_update_urls(channel)
+        checksum_text = requests_urllib(release['checksum_url'], decode=True)
+        expected_digest = parse_checksum(checksum_text, release['package_asset'])
 
-        requests_urllib(UPDATE_URL, save_path=str(zip_part_path))
+        requests_urllib(release['update_url'], save_path=str(zip_part_path))
         if not zip_part_path.is_file():
             raise FileNotFoundError('update archive download did not produce a file')
         actual_digest = calculate_sha256(zip_part_path)
@@ -83,9 +189,10 @@ def download_verified_update(cwd):
             pass
         raise
 
-# Keep the updater in lockstep with scripts/package_beta.ps1. The release asset
-# is the exact runtime archive produced by that script, while these rules also
-# protect installations if an unexpected extra member is ever added.
+# Keep the updater in lockstep with scripts/package_release.ps1. The release
+# asset is the exact runtime archive produced by the channel wrapper, while
+# these rules also protect installations if an unexpected extra member is ever
+# added.
 PACKAGE_ROOT_FILES = frozenset(
     {
         'embyToLocalPlayer.py',
