@@ -21,7 +21,7 @@ if "%PYTHON_VERSION:~0,6%" == "Python" (
     echo 3: open startup folder
     echo 4: path translate helper
     echo 5: copy script path to clipboard
-    echo 6: update to latest version
+    echo 6: update current release channel
     choice /N /C:123456 /M "press a number"%1
     IF ERRORLEVEL ==6 GOTO SIX
     IF ERRORLEVEL ==5 GOTO FIVE

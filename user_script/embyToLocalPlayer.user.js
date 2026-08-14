@@ -6,6 +6,8 @@
 // @version      2026.08.09
 // @updateURL    https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js
 // @downloadURL  https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js
+// @homepageURL  https://github.com/hope140/embyToLocalPlayer/tree/beta
+// @supportURL   https://github.com/hope140/embyToLocalPlayer/tree/beta#faq
 // @description  Emby/Jellyfin 调用外部本地播放器，并回传播放记录。适配 Plex。
 // @description:zh-CN Emby/Jellyfin 调用外部本地播放器，并回传播放记录。适配 Plex。
 // @description:en  Play in an external player. Update watch history to Emby/Jellyfin server. Support Plex.
