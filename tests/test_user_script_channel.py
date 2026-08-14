@@ -10,7 +10,7 @@ PACKAGER = ROOT / "scripts" / "package_release.ps1"
 
 
 class UserScriptChannelTests(unittest.TestCase):
-    def test_beta_source_metadata_is_explicit_and_complete(self):
+    def test_stable_source_metadata_is_explicit_and_complete(self):
         source = SCRIPT.read_text(encoding="utf-8")
         metadata = {}
         for name in ("updateURL", "downloadURL", "homepageURL", "supportURL"):
@@ -20,19 +20,20 @@ class UserScriptChannelTests(unittest.TestCase):
 
         self.assertEqual(
             metadata["updateURL"],
-            "https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js",
+            "https://raw.githubusercontent.com/hope140/embyToLocalPlayer/stable/user_script/embyToLocalPlayer.user.js",
         )
         self.assertEqual(metadata["downloadURL"], metadata["updateURL"])
         self.assertEqual(
             metadata["homepageURL"],
-            "https://github.com/hope140/embyToLocalPlayer/tree/beta",
+            "https://github.com/hope140/embyToLocalPlayer/tree/stable",
         )
         self.assertEqual(
             metadata["supportURL"],
-            "https://github.com/hope140/embyToLocalPlayer/tree/beta#faq",
+            "https://github.com/hope140/embyToLocalPlayer/tree/stable#faq",
         )
         self.assertNotIn("releases/latest", source)
         self.assertNotIn("/main/", source)
+        self.assertNotIn("/beta/", source)
 
     def test_launcher_updates_the_current_channel(self):
         launcher = LAUNCHER.read_text(encoding="utf-8-sig")
