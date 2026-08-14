@@ -75,6 +75,9 @@ HTTP handler 必须先把 Emby/Plex 请求解析成完整播放数据，再把�
 - 更新器先查询 GitHub Releases API，再严格解析只对应当前频道固定包名的 checksum，
   然后下载到 `.part` 文件；哈希不匹配或下载异常时删除临时文件、保留旧包，验证成功
   后才原子替换。不能用 GitHub 的单一 Latest 下载入口让 beta/stable 互相串包。
+- 旧版 beta 更新器仍固定请求单一 Latest 下的 beta 文件名；在旧客户端退场前，stable
+  Latest 可暂时保留 beta ZIP 与 `.sha256` 的兼容副本，但必须核对其 SHA256 与 beta
+  Release 完全一致。新更新器不得依赖这条兼容路径。
 - ZIP 解压要先验证全部成员，拒绝 zip-slip、绝对路径、符号链接和越界目标；实时配置不能被更新包直接覆盖，示例配置应单独输出。
 - 配置比较按 `ConfigParser` 的 section/key/value 语义进行，忽略注释、空行、键顺序和选项键大小写；section 名称仍按 `ConfigParser` 的匹配语义处理。如果要比较当前配置，应先选定可信的示例或上游基线，不能把“两个文件相同”误判为没有本地改动。
 - beta/stable 更新包采用同一份最小运行清单：根目录只保留入口、配置、许可证、

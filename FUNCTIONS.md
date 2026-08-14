@@ -27,6 +27,9 @@
 - `main` 只同步上游，不打包、不创建频道 Release，也不作为用户安装入口。
 - 更新器读取 `utils/release_info.py` 中的频道值，通过 GitHub Releases API 选择同频道且
   同时包含 ZIP 与 `.sha256` 的已发布 tag；旧版或源码安装没有合法频道值时兼容为 beta。
+- 旧版 beta 更新器仍请求 `releases/latest/download/etlp-remote-control-beta.zip`；为完成一次性
+  自举升级，stable Latest Release 暂时保留同名 beta ZIP 与 `.sha256` 兼容资产。新更新器
+  不使用这两个跨 Release 兼容资产。
 - 油猴脚本保留同一脚本身份，但 update/download/homepage/support URL 随频道指向对应
   分支。安装时只保留一个频道，切换频道前先卸载或覆盖旧脚本。
 

@@ -59,6 +59,10 @@
 - 验证：`scripts/package_release.ps1`、两个频道 wrapper、`utils/update.py`、
   `tests/test_update.py`、`tests/test_release_info.py` 和用户脚本频道测试；另有干净
   临时工作区的 beta/stable ZIP smoke test。
+- 旧版兼容：旧 beta 更新器固定请求 `releases/latest/download/etlp-remote-control-beta.zip`，
+  无法自行获得新的频道更新器。stable Latest Release 暂时保留 beta ZIP 和 `.sha256` 的
+  兼容副本，用于一次性自举；兼容资产必须与当前 beta Release 的 SHA256 完全一致，旧客户端
+  升级后即可转入按频道 API 的新路径。
 
 ## 7. 配置比较必须使用可信基线
 

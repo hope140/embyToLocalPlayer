@@ -12,6 +12,9 @@
 
 beta 和 stable 保留相同的 Tampermonkey 脚本身份，安装时只选择一个频道，不要同时安装两份。更新器读取安装包内的频道元数据，只查找对应频道的 Release 资产，不使用跨频道的 `Latest` 下载地址。
 
+为兼容尚未升级的旧 beta 安装，当前 stable 的 Latest Release 暂时额外保留旧版更新器请求的
+`etlp-remote-control-beta.zip` 和对应 `.sha256` 兼容资产。这两个文件内容仍是 beta 包；新更新器不会跨频道使用它们。
+
 ## 开源许可与致谢
 
 本项目遵循 [Apache License, Version 2.0](LICENSE)。本仓库基于并跟踪上游 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)，在保留原有许可和归属信息的前提下进行独立维护与扩展。感谢上游作者 **kjtsune** 及所有贡献者的开源工作。

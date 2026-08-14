@@ -9,6 +9,8 @@
   `etlp-remote-control-beta.zip`，并同时生成 `.sha256` sidecar。
 - 更新器按安装包内的频道查询 GitHub Releases API，只下载同频道且同时存在 ZIP 与
   sidecar 的 Release 资产；旧版或源码安装继续按 beta 兼容。
+- 为兼容旧版 beta 更新器，stable Latest Release 暂时额外保留旧路径所需的 beta ZIP 和
+  `.sha256` 兼容资产；新更新器仍按频道 API 选择资产。
 - 油猴脚本保留同一脚本身份，update/download/homepage/support URL按频道指向对应
   分支；同一安装不应同时启用 beta 和 stable 两套脚本。
 - 历史 beta tag 保留用于回滚，历史说明不因频道整理而改写。
