@@ -1,7 +1,7 @@
 # 跨项目可复用经验（ETLP）
 
 本文是从本机未跟踪的 `文档/` 目录读取另一项目 Codex 文档后，结合当前 ETLP
-代码和测试整理出的摘要。它只沉淀能帮助 ETLP 维护的规则，不改变当前 beta
+代码和测试整理出的摘要。它只沉淀能帮助 ETLP 维护的规则，不改变当前 beta/stable
 分支的功能范围、发布方式或配置语义。
 
 原始资料主要包括另一项目的 `AGENTS.md`、`docs/architecture.md`、
@@ -70,25 +70,32 @@ HTTP handler 必须先把 Emby/Plex 请求解析成完整播放数据，再把�
 
 ### 2.6 打包、更新和配置保护必须按成品验证
 
-- beta 打包先清理旧 staging，再生成可运行 ZIP 和单独的 `.sha256` sidecar；发布包不得带入 `__pycache__`、`.pyc/.pyo` 或运行时生成的 wheel cache。
-- 更新器必须先严格解析只对应固定包名的 checksum，再下载到 `.part` 文件；哈希不匹配或下载异常时删除临时文件、保留旧包，验证成功后才原子替换。
+- beta/stable 打包先清理旧 staging，再生成对应频道的可运行 ZIP 和单独的 `.sha256`
+  sidecar；发布包不得带入 `__pycache__`、`.pyc/.pyo` 或运行时生成的 wheel cache。
+- 更新器先查询 GitHub Releases API，再严格解析只对应当前频道固定包名的 checksum，
+  然后下载到 `.part` 文件；哈希不匹配或下载异常时删除临时文件、保留旧包，验证成功
+  后才原子替换。不能用 GitHub 的单一 Latest 下载入口让 beta/stable 互相串包。
 - ZIP 解压要先验证全部成员，拒绝 zip-slip、绝对路径、符号链接和越界目标；实时配置不能被更新包直接覆盖，示例配置应单独输出。
 - 配置比较按 `ConfigParser` 的 section/key/value 语义进行，忽略注释、空行、键顺序和选项键大小写；section 名称仍按 `ConfigParser` 的匹配语义处理。如果要比较当前配置，应先选定可信的示例或上游基线，不能把“两个文件相同”误判为没有本地改动。
-- beta 更新包采用最小运行清单：根目录只保留入口、配置、许可证、`requirements.txt` 和 Windows 启动脚本；`utils` 只保留 Python 模块，`user_script` 只保留 JavaScript，`third_party` 只保留 bundled wheels。`scripts/package_beta.ps1`、`utils/update.py`、实际 ZIP 和测试必须保持同一份契约；`tests/test_package_beta.py` 覆盖成品 ZIP，`tests/test_update.py` 覆盖更新解包过滤。
+- beta/stable 更新包采用同一份最小运行清单：根目录只保留入口、配置、许可证、
+  `requirements.txt` 和 Windows 启动脚本；`utils` 只保留 Python 模块，`user_script` 只
+  保留 JavaScript，`third_party` 只保留 bundled wheels。`scripts/package_release.ps1`、
+  两个频道 wrapper、`utils/update.py`、实际 ZIP 和测试必须保持同一份契约；用户脚本的
+  update/download/homepage/support URL按频道规范化，不能和另一个频道混用。
 
-当前证据：`scripts/package_beta.ps1`、`utils/update.py`、
+当前证据：`scripts/package_release.ps1`、两个频道 wrapper、`utils/update.py`、
 `utils/config_diff.py`、`tests/test_update.py`、`tests/test_package_beta.py`。
 
 ### 2.7 验证要区分层级
 
-静态检查和单元测试只能证明对应代码路径；实际 beta 成品还要检查 staging、ZIP
+静态检查和单元测试只能证明对应代码路径；实际 beta/stable 成品还要检查 staging、ZIP
 布局、sidecar 和干净环境启动。涉及播放、字幕、CloudDrive2、Emby 控制台或
 mpv/IINA 外观/行为时，真实客户端验收仍是独立层级，不能用“测试通过”替代。
 
 ## 3. 只保留为参考、暂不并入 ETLP 的内容
 
 - Watch Together 的房间、参与者、Barrier/Watching 状态机、房间 gate 和插件嵌入页主题变量不属于 ETLP 当前能力，不能移植为本项目承诺。
-- 另一项目的四段程序集版本号、RSA manifest、trust root/bootstrap 和正式插件自动更新流程不适用于当前 ETLP beta。ETLP 当前证据是 beta ZIP + SHA-256 sidecar；若将来引入签名更新，应单独设计信任引导、密钥轮换和失败策略，私钥不得进入仓库或文档。
+- 另一项目的四段程序集版本号、RSA manifest、trust root/bootstrap 和正式插件自动更新流程不适用于当前 ETLP。ETLP 当前证据是按频道生成的 ZIP + SHA-256 sidecar；若将来引入签名更新，应单独设计信任引导、密钥轮换和失败策略，私钥不得进入仓库或文档。
 - 另一项目的服务器地址、部署/回滚步骤、签名密钥位置、代理 TOML 和本机路径只属于其 `LOCAL_OPERATIONS.md` 或 `.codex/`，不复制、不提交。
 - Emby 服务端短暂 `PlaybackStopped`、旧 session 与当前播放并存等现象值得在 ETLP 的真实客户端链路中单独复现；在没有当前 ETLP 日志和回归测试前，不直接套用另一项目的 2 秒确认窗口或停止副作用规则。
 
@@ -106,5 +113,5 @@ mpv/IINA 外观/行为时，真实客户端验收仍是独立层级，不能用�
 | HTTP 安全、路由和解析 | `utils/http_server.py`、`utils/http_security.py`、`tests/test_http_server_security.py` |
 | Emby session 与远程控制 | `utils/emby_session_api.py`、`utils/remote_control_client.py`、`tests/test_remote_control_client.py` |
 | 依赖加载和 STRM 预热 | `utils/dependency_bootstrap.py`、`utils/tools.py`、`tests/test_dependency_bootstrap.py`、`tests/test_local_path_preheat.py` |
-| 打包、更新和配置比较 | `scripts/package_beta.ps1`、`utils/update.py`、`utils/config_diff.py`、`tests/test_update.py` |
+| 打包、更新和配置比较 | `scripts/package_release.ps1`、`scripts/package_beta.ps1`、`scripts/package_stable.ps1`、`utils/update.py`、`utils/config_diff.py`、`tests/test_update.py` |
 | 协作、隔离和审核 | `AGENTS.md`、`docs/pr-stack-workflow.md` |

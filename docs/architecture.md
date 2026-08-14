@@ -1,6 +1,6 @@
 # 当前架构
 
-本文只描述当前 ETLP `beta` 分支代码已实现的结构和边界。功能细节、支持矩阵和
+本文只描述当前 ETLP checkout 分支代码已实现的结构和边界。功能细节、支持矩阵和
 配置说明见 [`FUNCTIONS.md`](../FUNCTIONS.md) 与 [`README.md`](../README.md)；稳定的
 跨模块取舍见 [`adr/README.md`](adr/README.md)。架构变化完成验证后，应先更新本文，
 再判断是否需要新增或更新 ADR。
@@ -34,7 +34,7 @@ flowchart LR
 | 播放管理 | 启动播放器、连续播放、预热、播放状态读取和最终进度更新 | `utils/player_manager.py`、`utils/players.py` |
 | Emby 会话与远程控制 | 为当前播放建立独立控制身份，进行 HTTP/WebSocket 回传和控制命令处理 | `utils/emby_session_api.py`、`utils/remote_control_client.py` |
 | CloudDrive2 | 将明确映射的本地 STRM 路径短期登记为 opaque gateway URL，失败时回退本地路径 | `utils/clouddrive2_client.py`、`utils/clouddrive2_gateway.py` |
-| 更新与配置比较 | 校验 beta ZIP sidecar、保护本地配置、安全解压示例配置并输出语义差异 | `utils/update.py`、`utils/config_diff.py` |
+| 更新与配置比较 | 按当前频道选择对应 ZIP 与 sidecar，保护本地配置、安全解压示例配置并输出语义差异 | `utils/update.py`、`utils/config_diff.py` |
 
 ## 当前跨组件约束
 
@@ -48,8 +48,10 @@ flowchart LR
    MediaSource 要跟随当前播放项目，旧 session 的命令不能被新播放确认。
 5. STRM 本地预热和 CloudDrive2 解析均是 best-effort：超时或不可用时保留原有
    路径判断和回退路径，不能阻塞播放启动。
-6. 更新器只在固定 beta 包的 SHA-256 sidecar 校验通过后替换 live archive；配置
-   文件不由更新包直接覆盖，ZIP 成员必须先经过安全校验。
+6. `stable` 是默认分支，`beta` 是测试分支，`main` 只同步上游。打包脚本要求当前
+   分支与频道一致；更新器按安装包内的频道从 GitHub Releases API 选择同时包含对应
+   ZIP 与 SHA-256 sidecar 的已发布 tag，不使用跨频道的 `Latest` 资产。配置文件不由
+   更新包直接覆盖，ZIP 成员必须先经过安全校验。
 
 ## 生命周期与数据存放
 

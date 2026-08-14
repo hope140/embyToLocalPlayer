@@ -1,6 +1,16 @@
-# etlp - embyToLocalPlayer beta
+# etlp - embyToLocalPlayer
 
-> **当前定位**：这是 [hope140/embyToLocalPlayer](https://github.com/hope140/embyToLocalPlayer) 的 `beta` 分支，面向本地播放器、路径转换、STRM 和播放进度回传的独立实验版本。它基于并跟踪上游 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)，但不是上游默认能力的完整镜像；本文只描述本分支当前代码和配置实际提供的能力。
+> **当前定位**：这是 [hope140/embyToLocalPlayer](https://github.com/hope140/embyToLocalPlayer) 的独立维护版本，面向本地播放器、路径转换、STRM 和播放进度回传。它基于并跟踪上游 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)，但不是上游默认能力的完整镜像；本文只描述仓库当前代码和配置实际提供的能力。
+
+## 分支与发布频道
+
+| 分支 | 角色 | 打包与 Release | 油猴脚本入口 |
+| --- | --- | --- | --- |
+| `stable`（默认） | 稳定版 | `scripts/package_stable.ps1`；资产为 `etlp-remote-control-stable.zip` 和对应 `.sha256` | [stable 用户脚本](https://raw.githubusercontent.com/hope140/embyToLocalPlayer/stable/user_script/embyToLocalPlayer.user.js) |
+| `beta` | 测试版 | `scripts/package_beta.ps1`；tag 以 `-beta` 结尾；资产为 `etlp-remote-control-beta.zip` 和对应 `.sha256` | [beta 用户脚本](https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js) |
+| `main` | 上游同步 | 只用于同步上游，不从此分支打包或发布 | 不作为安装入口 |
+
+beta 和 stable 保留相同的 Tampermonkey 脚本身份，安装时只选择一个频道，不要同时安装两份。更新器读取安装包内的频道元数据，只查找对应频道的 Release 资产，不使用跨频道的 `Latest` 下载地址。
 
 ## 开源许可与致谢
 
@@ -10,7 +20,7 @@
 
 ## 与上游及其他分支的差异
 
-| 范围 | 本 `beta` 分支 | 说明 |
+| 范围 | 当前代码 | 说明 |
 | --- | --- | --- |
 | CloudDrive2 STRM | 支持可选的本地 CloudDrive2 gRPC 解析，并通过 ETLP 本地短期 gateway URL 播放 | 需要本机可访问的 CloudDrive2 API、有效 token 和明确的 `path_map`；这是本分支的实验扩展，不应当当作上游默认能力。 |
 | Emby 控制台远程控制 | 内置当前机器播放器的独立控制通道，面向 mpv/IINA | `[remote_control] enable = yes` 默认开启；控制当前播放器的暂停、继续、seek、停止和消息显示，不建立房间、不让多台设备互相跟随。 |
@@ -31,8 +41,8 @@
 ### 1. 安装浏览器脚本
 
 1. 安装 Tampermonkey 或 Violentmonkey。
-2. 安装 [embyToLocalPlayer 用户脚本](https://greasyfork.org/zh-CN/scripts/448648-embytolocalplayer)，刷新 Emby/Jellyfin 页面。
-3. 从 [hope140 的 beta Releases](https://github.com/hope140/embyToLocalPlayer/releases) 下载对应压缩包并解压到英文路径。发布包包含 `embyToLocalPlayer_config.ini`、运行时依赖和 Windows 启动脚本。
+2. 按需安装一个频道的 [stable 用户脚本](https://raw.githubusercontent.com/hope140/embyToLocalPlayer/stable/user_script/embyToLocalPlayer.user.js) 或 [beta 用户脚本](https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js)，刷新 Emby/Jellyfin 页面。两者不要同时安装。
+3. 从 [hope140 Releases](https://github.com/hope140/embyToLocalPlayer/releases) 选择对应频道的 Release，下载 `etlp-remote-control-stable.zip` 或 `etlp-remote-control-beta.zip` 及其 `.sha256`，解压到英文路径。发布包包含 `embyToLocalPlayer_config.ini`、运行时依赖和 Windows 启动脚本。
 
 ### 2. Windows
 
@@ -42,7 +52,7 @@
 - `2`：写入 Windows 启动文件夹并后台启动。
 - `3`：打开启动文件夹。
 - `4`：打开路径转换辅助工具。
-- `6`：运行 beta 更新程序。
+- `6`：运行当前安装包频道的更新程序；源码分支和包内频道元数据必须一致。
 
 源码检出时，启动脚本位于 `utils/others/embyToLocalPlayer_debug.bat`；也可以直接运行：
 
@@ -115,9 +125,9 @@ enable = yes
 
 更多配置、模块导航、支持矩阵和边界约束见 [FUNCTIONS.md](FUNCTIONS.md)。
 
-## 不在本分支范围内
+## 不在当前应用范围内
 
-以下内容不属于本 `beta` 的交付承诺：
+以下内容不属于当前应用的交付承诺：
 
 - 同步观看房间、参与者管理、跨设备跟随播放；该能力请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。
 - 豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 联动等旁线集成；

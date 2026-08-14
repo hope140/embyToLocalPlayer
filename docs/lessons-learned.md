@@ -46,15 +46,19 @@
 
 ## 6. 更新必须先验证，成功后再替换
 
-- 结论：beta 更新器只接受固定资产名的单条 SHA-256 sidecar；下载写入 `.part`，
-  哈希或下载失败时清理临时文件并保留旧 archive，验证成功后才原子替换。ZIP 先
-  全量检查路径、符号链接和目标边界；live 配置不直接被更新包覆盖。
+- 结论：更新器按安装包频道选择对应的固定 ZIP 和单条 SHA-256 sidecar；先访问
+  GitHub Releases API，再下载到 `.part`。哈希或下载失败时清理临时文件并保留旧
+  archive，验证成功后才原子替换。ZIP 先全量检查路径、符号链接和目标边界；live
+  配置不直接被更新包覆盖。
 - 成品清单：根目录只保留入口、配置、许可证、`requirements.txt` 和 Windows 启动脚本；
   `utils` 只保留 Python 模块，`user_script` 只保留 JavaScript，`third_party` 只保留
-  bundled wheels；Markdown、`.proto` 源文件、替代启动入口和缓存不进入 beta ZIP。
-  打包脚本、更新器和实际 ZIP 测试必须同步维护这份清单。
-- 验证：`scripts/package_beta.ps1`、`utils/update.py`、`tests/test_update.py` 和
-  `tests/test_package_beta.py`。
+  bundled wheels；Markdown、`.proto` 源文件、替代启动入口和缓存不进入 beta 或 stable
+  ZIP。打包脚本、更新器和实际 ZIP 测试必须同步维护这份清单。
+- 分支门禁：`package_beta.ps1` 只能从 `beta` 运行，`package_stable.ps1` 只能从
+  `stable` 运行；`main` 只同步上游，不打包或发布。
+- 验证：`scripts/package_release.ps1`、两个频道 wrapper、`utils/update.py`、
+  `tests/test_update.py`、`tests/test_release_info.py` 和用户脚本频道测试；另有干净
+  临时工作区的 beta/stable ZIP smoke test。
 
 ## 7. 配置比较必须使用可信基线
 
@@ -66,7 +70,7 @@
 
 ## 8. 自动化验证不等于真实客户端验收
 
-- 结论：静态检查、单元测试、实际 beta ZIP smoke test 和 Emby/mpv/IINA 客户端验收
+- 结论：静态检查、单元测试、实际 beta/stable ZIP smoke test 和 Emby/mpv/IINA 客户端验收
   是不同证据层级。涉及播放、字幕、CloudDrive2、控制台操作或客户端显示时，不能
   用前一层结果替代后一层。
 - 验证：当前测试覆盖各模块边界；README/FUNCTIONS.md 定义了实际播放器和服务端

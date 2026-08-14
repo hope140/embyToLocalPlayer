@@ -1,5 +1,18 @@
 # 更新日志
 
+## 2026.08.14-release-channels
+
+### 分支与发布频道整理
+
+- `stable` 作为默认稳定分支，`beta` 作为测试分支，`main` 只用于同步上游。
+- 新增统一的频道打包入口：只能从对应分支生成 `etlp-remote-control-stable.zip` 或
+  `etlp-remote-control-beta.zip`，并同时生成 `.sha256` sidecar。
+- 更新器按安装包内的频道查询 GitHub Releases API，只下载同频道且同时存在 ZIP 与
+  sidecar 的 Release 资产；旧版或源码安装继续按 beta 兼容。
+- 油猴脚本保留同一脚本身份，update/download/homepage/support URL按频道指向对应
+  分支；同一安装不应同时启用 beta 和 stable 两套脚本。
+- 历史 beta tag 保留用于回滚，历史说明不因频道整理而改写。
+
 ## 2026.08.06-clouddrive2-beta
 
 > 当前 beta 分支包含 CloudDrive2 STRM 支持、本地网关播放、远程轮询稳定性

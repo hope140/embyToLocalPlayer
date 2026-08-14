@@ -1,6 +1,8 @@
 # embyToLocalPlayer 功能与维护参考
 
-本文以当前 `beta` 分支的代码、`embyToLocalPlayer_config.ini` 和 `user_script/embyToLocalPlayer.user.js` 为准，服务维护、排错和小范围改动。安装步骤看 [README.md](README.md)；不要把上游 README 或其他分支的历史功能当作本分支承诺。
+本文以当前 checkout 分支的代码、`embyToLocalPlayer_config.ini` 和
+`user_script/embyToLocalPlayer.user.js` 为准，服务维护、排错和小范围改动。安装步骤看
+[README.md](README.md)；不要把上游 README 或其他分支的历史功能当作当前频道承诺。
 
 ## 开源许可与致谢
 
@@ -8,13 +10,25 @@
 
 ## 1. 分支边界
 
-| 项目 | 当前 `beta` 的结论 |
+| 项目 | 当前频道的结论 |
 | --- | --- |
-| 上游关系 | 仓库为 [hope140/embyToLocalPlayer](https://github.com/hope140/embyToLocalPlayer) 的 `beta`，基于并跟踪 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)，但按本分支代码独立维护。 |
+| 上游关系 | `main` 只同步 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)；`beta` 和 `stable` 在本仓库独立维护。 |
 | CloudDrive2 | `[clouddrive2]` 启用后，使用本地 CloudDrive2 gRPC API、`path_map` 和 ETLP 短期本地 gateway 解析 STRM；失败回退原挂载文件。 |
 | 独立远程控制 | `[remote_control]` 为当前 mpv/IINA 建立独立 Emby 会话控制通道，支持暂停/继续、seek、停止和消息显示；只作用于当前机器。 |
 | 实时反馈 | `[dev] playing_feedback_*` 面向 mpv/IINA 回传播放位置和暂停状态；最终回传仍由 `[emby] update_progress` 控制。 |
 | 明确排除 | 本项目不实现同步观看房间；该能力请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。同时不对豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 联动等旁线能力提供支持承诺。 |
+
+### 1.1 频道规则
+
+- `stable` 是默认分支和稳定发布频道。只能从 `stable` 运行
+  `scripts/package_stable.ps1`，包名为 `etlp-remote-control-stable.zip`。
+- `beta` 是测试频道。只能从 `beta` 运行 `scripts/package_beta.ps1`，版本 tag 以
+  `-beta` 结尾，包名为 `etlp-remote-control-beta.zip`。
+- `main` 只同步上游，不打包、不创建频道 Release，也不作为用户安装入口。
+- 更新器读取 `utils/release_info.py` 中的频道值，通过 GitHub Releases API 选择同频道且
+  同时包含 ZIP 与 `.sha256` 的已发布 tag；旧版或源码安装没有合法频道值时兼容为 beta。
+- 油猴脚本保留同一脚本身份，但 update/download/homepage/support URL 随频道指向对应
+  分支。安装时只保留一个频道，切换频道前先卸载或覆盖旧脚本。
 
 ## 2. 运行链路
 
@@ -115,7 +129,7 @@ flowchart LR
 - 修改播放流程至少回归：网络模式、读取硬盘模式、单集、播放列表、`.strm`、CloudDrive2 失败回退和播放器退出后的最终进度。
 - 修改实时反馈时要分别验证实时反馈、暂停/恢复、会话识别和退出后的最终回传，不能用其中一种结果替代另一种。
 - 新增播放器不能只验证“能启动”，还要记录其开始时间、字幕、连续播放、最终进度和实时反馈支持情况。
-- 同步观看房间不属于当前 `beta` 的实现范围；需要房间、参与者管理和跨设备跟随播放时，请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 等旁线文案也不属于当前 `beta` 验收依据；若代码重新引入相关能力，应另行设计范围和测试。
+- 同步观看房间不属于当前应用的实现范围；需要房间、参与者管理和跨设备跟随播放时，请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 等旁线文案也不属于当前频道验收依据；若代码重新引入相关能力，应另行设计范围和测试。
 
 ## 7. 维护文档与 Knowledge Review
 
