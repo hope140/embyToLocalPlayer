@@ -30,6 +30,16 @@ pwsh -File .\scripts\release_prepare.ps1 -Version <版本>
 `publish/` 目录生成对应 ZIP、SHA-256 sidecar、`release-plan.json` 和中文
 `release-notes.md` 草稿。它只准备本地发布材料，不会 push、创建 tag 或创建 GitHub Release。
 
+确认材料后先运行发布预览：
+
+```powershell
+pwsh -File .\scripts\release_publish.ps1 -PlanPath .\publish\release-plan.json
+```
+
+预览会重新校验 ZIP、sidecar、包内频道元数据、当前分支和 commit；只有在 tag 已存在、
+并且明确获得远端发布授权后，才使用 `-Execute` 执行 GitHub Release 创建。该入口不会
+自动创建 tag 或 push 分支，也不会覆盖同名 Release。
+
 ## 开源许可与致谢
 
 本项目遵循 [Apache License, Version 2.0](LICENSE)。本仓库基于并跟踪上游 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)，在保留原有许可和归属信息的前提下进行独立维护与扩展。感谢上游作者 **kjtsune** 及所有贡献者的开源工作。
