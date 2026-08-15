@@ -1,4 +1,5 @@
 import hashlib
+import json
 import subprocess
 import tempfile
 import unittest
@@ -78,6 +79,26 @@ class UpdateArchiveTests(unittest.TestCase):
         self.assertNotIn("/latest/", beta["update_url"])
         self.assertIn("/2026.08.14.1-beta/", beta["update_url"])
         self.assertIn("/2026.08.14/", stable["update_url"])
+
+    def test_latest_release_selection_treats_manifest_as_optional(self):
+        assets = update.CHANNEL_ASSETS["beta"]
+        release = {
+            "id": 1,
+            "tag_name": "2026.08.14.1-beta",
+            "published_at": "2026-08-14T10:00:00Z",
+            "assets": [
+                {"name": assets["package"]},
+                {"name": assets["checksum"]},
+            ],
+        }
+
+        without_manifest = update.select_latest_release([release], "beta")
+        self.assertNotIn("manifest_url", without_manifest)
+
+        release["assets"].append({"name": update.MANIFEST_ASSET})
+        with_manifest = update.select_latest_release([release], "beta")
+        self.assertEqual(with_manifest["manifest_asset"], update.MANIFEST_ASSET)
+        self.assertIn(f"/{update.MANIFEST_ASSET}", with_manifest["manifest_url"])
 
     def test_latest_release_selection_rejects_missing_assets(self):
         with self.assertRaisesRegex(ValueError, "no published stable release"):
@@ -332,6 +353,128 @@ class UpdateDownloadTests(unittest.TestCase):
             )
             self.assertEqual(calls[2][1]["save_path"], str(root / "embyToLocalPlayer.zip.part"))
 
+    def test_verified_download_validates_optional_manifest(self):
+        payload = b"verified manifest archive"
+        digest = hashlib.sha256(payload).hexdigest()
+        assets = update.CHANNEL_ASSETS["beta"]
+        tag = "2026.08.14.1-beta"
+        releases = [{
+            "id": 1,
+            "tag_name": tag,
+            "published_at": "2026-08-14T10:00:00Z",
+            "assets": [
+                {"name": assets["package"]},
+                {"name": assets["checksum"]},
+                {"name": update.MANIFEST_ASSET},
+            ],
+        }]
+        release = update.select_latest_release(releases, "beta")
+        manifest = {
+            "schema": 1,
+            "channel": "beta",
+            "version": tag,
+            "branch": "beta",
+            "commit": "a" * 40,
+            "packageAsset": assets["package"],
+            "checksumAsset": assets["checksum"],
+            "packageSha256": digest,
+            "packageSize": len(payload),
+        }
+        calls = []
+
+        def fake_requests(url, **kwargs):
+            calls.append((url, kwargs))
+            if url == update.RELEASES_API_URL:
+                return releases
+            if url == release["checksum_url"]:
+                return f"{digest}  {assets['package']}\n"
+            if url == release["manifest_url"]:
+                return json.dumps(manifest)
+            if url == release["update_url"]:
+                Path(kwargs["save_path"]).write_bytes(payload)
+                return kwargs["save_path"]
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            live_archive = root / "embyToLocalPlayer.zip"
+            live_archive.write_bytes(b"old archive")
+
+            with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+                result = update.download_verified_update(root)
+
+            self.assertEqual(Path(result).read_bytes(), payload)
+            self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
+
+        self.assertEqual(
+            [url for url, _ in calls],
+            [
+                update.RELEASES_API_URL,
+                release["checksum_url"],
+                release["manifest_url"],
+                release["update_url"],
+            ],
+        )
+
+    def test_invalid_manifest_keeps_live_archive_and_cleans_part(self):
+        payload = b"must not replace archive"
+        digest = hashlib.sha256(payload).hexdigest()
+        assets = update.CHANNEL_ASSETS["beta"]
+        tag = "2026.08.14.1-beta"
+        releases = [{
+            "id": 1,
+            "tag_name": tag,
+            "published_at": "2026-08-14T10:00:00Z",
+            "assets": [
+                {"name": assets["package"]},
+                {"name": assets["checksum"]},
+                {"name": update.MANIFEST_ASSET},
+            ],
+        }]
+        release = update.select_latest_release(releases, "beta")
+        calls = []
+
+        def fake_requests(url, **kwargs):
+            calls.append((url, kwargs))
+            if url == update.RELEASES_API_URL:
+                return releases
+            if url == release["checksum_url"]:
+                return f"{digest}  {assets['package']}\n"
+            if url == release["manifest_url"]:
+                return json.dumps({
+                    "schema": 1,
+                    "channel": "beta",
+                    "version": "wrong-tag",
+                    "branch": "beta",
+                    "packageAsset": assets["package"],
+                    "checksumAsset": assets["checksum"],
+                    "packageSha256": digest,
+                    "packageSize": len(payload),
+                })
+            if url == release["update_url"]:
+                Path(kwargs["save_path"]).write_bytes(payload)
+                return kwargs["save_path"]
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            live_archive = root / "embyToLocalPlayer.zip"
+            live_archive.write_bytes(b"old archive")
+            part = root / "embyToLocalPlayer.zip.part"
+            part.write_bytes(b"stale partial archive")
+
+            with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+                with self.assertRaisesRegex(ValueError, "version"):
+                    update.download_verified_update(root)
+
+            self.assertEqual(live_archive.read_bytes(), b"old archive")
+            self.assertFalse(part.exists())
+
+        self.assertEqual(
+            [url for url, _ in calls],
+            [update.RELEASES_API_URL, release["checksum_url"], release["manifest_url"]],
+        )
+
     def test_checksum_mismatch_cleans_part_without_changing_live_files(self):
         payload = b"downloaded bytes that do not match"
         expected = hashlib.sha256(b"different bytes").hexdigest()
@@ -492,6 +635,62 @@ class UpdateDownloadTests(unittest.TestCase):
 
             self.assertEqual(Path(result).read_bytes(), payload)
             self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
+
+        self.assertEqual([url for url, _ in calls], expected_urls)
+
+    def test_cdn_template_rewrites_optional_manifest_url(self):
+        payload = b"verified CDN manifest archive"
+        digest = hashlib.sha256(payload).hexdigest()
+        cdn_template = "https://cdn.example/{url}"
+        assets = update.CHANNEL_ASSETS["beta"]
+        releases = [{
+            "id": 1,
+            "tag_name": "2026.08.14.1-beta",
+            "published_at": "2026-08-14T10:00:00Z",
+            "assets": [
+                {"name": assets["package"]},
+                {"name": assets["checksum"]},
+                {"name": update.MANIFEST_ASSET},
+            ],
+        }]
+        release = update.select_latest_release(releases, "beta")
+        expected_urls = [
+            cdn_template.replace("{url}", update.RELEASES_API_URL),
+            cdn_template.replace("{url}", release["checksum_url"]),
+            cdn_template.replace("{url}", release["manifest_url"]),
+            cdn_template.replace("{url}", release["update_url"]),
+        ]
+        manifest = {
+            "schema": 1,
+            "channel": "beta",
+            "version": release["tag"],
+            "branch": "beta",
+            "packageAsset": assets["package"],
+            "checksumAsset": assets["checksum"],
+            "packageSha256": digest,
+            "packageSize": len(payload),
+        }
+        calls = []
+
+        def fake_requests(url, **kwargs):
+            calls.append((url, kwargs))
+            if url == expected_urls[0]:
+                return releases
+            if url == expected_urls[1]:
+                return f"{digest}  {assets['package']}\n"
+            if url == expected_urls[2]:
+                return json.dumps(manifest)
+            if url == expected_urls[3]:
+                Path(kwargs["save_path"]).write_bytes(payload)
+                return kwargs["save_path"]
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+                result = update.download_verified_update(root, update_cdn_url=cdn_template)
+
+            self.assertEqual(Path(result).read_bytes(), payload)
 
         self.assertEqual([url for url, _ in calls], expected_urls)
 

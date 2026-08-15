@@ -34,6 +34,9 @@ CHANNEL_ASSETS = {
         'checksum': 'etlp-remote-control-stable.zip.sha256',
     },
 }
+# New releases may publish this optional metadata asset alongside the package
+# and checksum. Historical releases do not have it and remain valid.
+MANIFEST_ASSET = 'release-plan.json'
 # Compatibility default for callers that used the old parser directly. New
 # downloads always pass the selected channel's asset explicitly.
 PACKAGE_ASSET = CHANNEL_ASSETS['beta']['package']
@@ -128,13 +131,13 @@ def select_latest_release(releases, channel):
         release_id = release.get('id')
         if not isinstance(release_id, int):
             release_id = 0
-        candidates.append((published_at, release_id, tag))
+        candidates.append((published_at, release_id, tag, asset_names))
 
     if not candidates:
         raise ValueError(f'no published {channel} release with matching assets was found')
 
-    _, _, tag = max(candidates)
-    return {
+    _, _, tag, asset_names = max(candidates, key=lambda candidate: candidate[:3])
+    selected = {
         'channel': channel,
         'tag': tag,
         'package_asset': assets['package'],
@@ -142,6 +145,14 @@ def select_latest_release(releases, channel):
         'update_url': _release_download_url(tag, assets['package']),
         'checksum_url': _release_download_url(tag, assets['checksum']),
     }
+    if MANIFEST_ASSET in asset_names:
+        selected.update(
+            {
+                'manifest_asset': MANIFEST_ASSET,
+                'manifest_url': _release_download_url(tag, MANIFEST_ASSET),
+            }
+        )
+    return selected
 
 
 def resolve_update_urls(channel=None, update_cdn_url=None):
@@ -163,11 +174,14 @@ def resolve_update_urls(channel=None, update_cdn_url=None):
     release = select_latest_release(releases, channel)
     if update_cdn_url is None:
         return release
-    return {
+    resolved = {
         **release,
         'update_url': _apply_update_cdn_url(release['update_url'], update_cdn_url),
         'checksum_url': _apply_update_cdn_url(release['checksum_url'], update_cdn_url),
     }
+    if 'manifest_url' in release:
+        resolved['manifest_url'] = _apply_update_cdn_url(release['manifest_url'], update_cdn_url)
+    return resolved
 
 
 def parse_checksum(checksum_text, expected_asset=PACKAGE_ASSET):
@@ -205,6 +219,61 @@ def calculate_sha256(path, chunk_size=1024 * 1024):
     return digest.hexdigest()
 
 
+def _validate_release_manifest(
+    manifest_text,
+    *,
+    channel,
+    tag,
+    package_asset,
+    checksum_asset,
+    expected_digest,
+):
+    """Validate optional release metadata and return its parsed fields."""
+    if isinstance(manifest_text, bytes):
+        try:
+            manifest_text = manifest_text.decode('utf-8')
+        except UnicodeDecodeError as exc:
+            raise ValueError('release manifest is not valid UTF-8 text') from exc
+    if not isinstance(manifest_text, str):
+        raise ValueError('release manifest response must be text')
+
+    try:
+        manifest = json.loads(manifest_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError('release manifest is not valid JSON') from exc
+    if not isinstance(manifest, dict):
+        raise ValueError('release manifest must be a JSON object')
+
+    if type(manifest.get('schema')) is not int or manifest['schema'] != 1:
+        raise ValueError('release manifest schema must be 1')
+    if manifest.get('channel') != channel:
+        raise ValueError('release manifest channel does not match selected channel')
+    if manifest.get('version') != tag:
+        raise ValueError('release manifest version does not match release tag')
+    if manifest.get('branch') != channel:
+        raise ValueError('release manifest branch does not match selected channel')
+    if manifest.get('packageAsset') != package_asset:
+        raise ValueError('release manifest packageAsset does not match selected asset')
+    if manifest.get('checksumAsset') != checksum_asset:
+        raise ValueError('release manifest checksumAsset does not match selected asset')
+
+    manifest_digest = manifest.get('packageSha256')
+    if not isinstance(manifest_digest, str) or re.fullmatch(r'[0-9a-fA-F]{64}', manifest_digest) is None:
+        raise ValueError('release manifest packageSha256 must contain 64 hexadecimal characters')
+    manifest_digest = manifest_digest.lower()
+    if manifest_digest != expected_digest:
+        raise ValueError('release manifest packageSha256 does not match checksum sidecar')
+
+    package_size = manifest.get('packageSize')
+    if isinstance(package_size, bool) or not isinstance(package_size, int) or package_size < 0:
+        raise ValueError('release manifest packageSize must be a non-negative integer')
+
+    return {
+        'package_sha256': manifest_digest,
+        'package_size': package_size,
+    }
+
+
 def download_verified_update(cwd, channel=None, update_cdn_url=None):
     """Download and verify the update archive, returning its live archive path."""
     cwd = Path(cwd)
@@ -214,10 +283,28 @@ def download_verified_update(cwd, channel=None, update_cdn_url=None):
         release = resolve_update_urls(channel, update_cdn_url=update_cdn_url)
         checksum_text = requests_urllib(release['checksum_url'], decode=True)
         expected_digest = parse_checksum(checksum_text, release['package_asset'])
+        manifest = None
+        if release.get('manifest_url'):
+            manifest_text = requests_urllib(release['manifest_url'], decode=True)
+            manifest = _validate_release_manifest(
+                manifest_text,
+                channel=release['channel'],
+                tag=release['tag'],
+                package_asset=release['package_asset'],
+                checksum_asset=release['checksum_asset'],
+                expected_digest=expected_digest,
+            )
 
         requests_urllib(release['update_url'], save_path=str(zip_part_path))
         if not zip_part_path.is_file():
             raise FileNotFoundError('update archive download did not produce a file')
+        if manifest is not None:
+            actual_size = zip_part_path.stat().st_size
+            if actual_size != manifest['package_size']:
+                raise ValueError(
+                    'update archive size mismatch: '
+                    f"expected {manifest['package_size']}, got {actual_size}"
+                )
         actual_digest = calculate_sha256(zip_part_path)
         if actual_digest != expected_digest:
             raise ValueError(

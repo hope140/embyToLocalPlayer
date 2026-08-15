@@ -38,6 +38,9 @@
   `ghproxy`、`ghfast` 等不稳定第三方域名，日志只记录 CDN 是否启用，不打印完整配置值。
   jsDelivr 适合仓库文件或油猴脚本分发，不能直接承载本项目生成的 Release ZIP；不要将其
   假设为 Release 资产的默认代理。
+- 新 Release 若包含 `release-plan.json`，更新器会在下载 ZIP 前校验清单的频道、tag、分支、
+  资产名、SHA-256 和 schema；下载后还会校验 ZIP 大小。历史 Release 没有该清单时，继续
+  使用原有的 Releases API、checksum sidecar、ZIP 三次请求和 SHA-256 兼容路径。
 - 旧版 beta 更新器仍请求 `releases/latest/download/etlp-remote-control-beta.zip`；为完成一次性
   自举升级，stable Latest Release 暂时保留同名 beta ZIP 与 `.sha256` 兼容资产。新更新器
   不使用这两个跨 Release 兼容资产。
