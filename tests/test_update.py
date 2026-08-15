@@ -475,6 +475,68 @@ class UpdateDownloadTests(unittest.TestCase):
             [update.RELEASES_API_URL, release["checksum_url"], release["manifest_url"]],
         )
 
+    def test_manifest_size_mismatch_keeps_live_archive_and_cleans_part(self):
+        payload = b"archive with an unexpected size"
+        digest = hashlib.sha256(payload).hexdigest()
+        assets = update.CHANNEL_ASSETS["beta"]
+        tag = "2026.08.14.1-beta"
+        releases = [{
+            "id": 1,
+            "tag_name": tag,
+            "published_at": "2026-08-14T10:00:00Z",
+            "assets": [
+                {"name": assets["package"]},
+                {"name": assets["checksum"]},
+                {"name": update.MANIFEST_ASSET},
+            ],
+        }]
+        release = update.select_latest_release(releases, "beta")
+        calls = []
+
+        def fake_requests(url, **kwargs):
+            calls.append((url, kwargs))
+            if url == update.RELEASES_API_URL:
+                return releases
+            if url == release["checksum_url"]:
+                return f"{digest}  {assets['package']}\n"
+            if url == release["manifest_url"]:
+                return json.dumps({
+                    "schema": 1,
+                    "channel": "beta",
+                    "version": tag,
+                    "branch": "beta",
+                    "packageAsset": assets["package"],
+                    "checksumAsset": assets["checksum"],
+                    "packageSha256": digest,
+                    "packageSize": len(payload) + 1,
+                })
+            if url == release["update_url"]:
+                Path(kwargs["save_path"]).write_bytes(payload)
+                return kwargs["save_path"]
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            live_archive = root / "embyToLocalPlayer.zip"
+            live_archive.write_bytes(b"old archive")
+
+            with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+                with self.assertRaisesRegex(ValueError, "size mismatch"):
+                    update.download_verified_update(root)
+
+            self.assertEqual(live_archive.read_bytes(), b"old archive")
+            self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
+
+        self.assertEqual(
+            [url for url, _ in calls],
+            [
+                update.RELEASES_API_URL,
+                release["checksum_url"],
+                release["manifest_url"],
+                release["update_url"],
+            ],
+        )
+
     def test_checksum_mismatch_cleans_part_without_changing_live_files(self):
         payload = b"downloaded bytes that do not match"
         expected = hashlib.sha256(b"different bytes").hexdigest()
