@@ -130,6 +130,7 @@ origin = http://127.0.0.1:19798
 api_token =
 path_map = X:\115=>/115open/115
 request_timeout_seconds = 2
+refresh_parent_levels = 3
 ```
 
 使用前必须满足：
@@ -138,6 +139,8 @@ request_timeout_seconds = 2
 2. 提供 CloudDrive2 API token。优先设置环境变量 `ETLP_CLOUDDRIVE2_TOKEN`，否则填写 `api_token`；不要把真实 token 提交到仓库。
 3. 为 Windows 盘符或 UNC 路径配置明确的 `path_map`，格式为 `本地前缀=>云端前缀`。它必须和 `[src]/[dst]` 产出的本地挂载路径一致。
 4. ETLP 会把可解析的本地 `.strm` 路径登记到本地短期 `/cd2/<nonce>` gateway，再按需解析 CloudDrive2 URL；解析失败会回退原挂载盘文件，不应把 gateway 当成公网媒体服务。
+
+`refresh_parent_levels` 控制文件未找到时从直接父目录向上探测的最大祖先层数，默认值为 `3`。直接父目录算第 1 层，因此可覆盖常见的“分类→剧名→Season→文件”目录；可配置范围为 `1`–`8`，非法值回退为 `3`。层数越大，冷目录缺失时可能产生更多刷新请求。
 
 没有 token、`path_map` 或可用 gRPC 依赖时，CloudDrive2 gateway 不会接管播放；这不等同于 CloudDrive2 已经配置成功。
 
