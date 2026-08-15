@@ -56,6 +56,28 @@ class CloudDrive2GatewayTests(unittest.TestCase):
             gateway = gateway_module.CloudDrive2Gateway()
             self.assertIsNone(gateway._client_from_config())
 
+    def test_configured_refresh_parent_levels_and_invalid_default(self):
+        for configured, expected in (('4', 4), ('not-a-number', 3), (None, 3)):
+            with self.subTest(configured=configured):
+                raw = ConfigParser()
+                raw.read_dict({'clouddrive2': {
+                    'enable': 'yes',
+                    'api_token': 'secret',
+                    'origin': 'http://127.0.0.1:19798',
+                    'path_map': r'C:\Media=/115open/115',
+                }})
+                if configured is not None:
+                    raw.set('clouddrive2', 'refresh_parent_levels', configured)
+                with mock.patch.object(gateway_module.configs, 'raw', raw), \
+                        mock.patch.object(gateway_module, 'CloudDrive2Client') as client_type:
+                    gateway = gateway_module.CloudDrive2Gateway()
+                    self.assertIsNotNone(gateway._client_from_config())
+
+                self.assertEqual(
+                    client_type.call_args.kwargs['refresh_parent_levels'],
+                    expected,
+                )
+
     def test_register_pop_and_expiry(self):
         now = [100.0]
         tokens = iter(('first nonce', 'second nonce'))
@@ -534,6 +556,74 @@ class DataParserGatewayTests(unittest.TestCase):
         self.assertFalse(result['use_strm_local_path'])
         self.assertFalse(result['use_strm_cd2_url'])
         self.assertIsNone(result['strm_cd2_local_path'])
+        register.assert_not_called()
+
+    def test_list_episodes_uses_item_mount_mode_for_strm_fallback(self):
+        data = {
+            'server': 'emby',
+            'scheme': 'http',
+            'netloc': 'emby.example',
+            'api_key': 'token',
+            'user_id': 'user',
+            'mount_disk_mode': True,
+            'headers': {},
+            'playlist_info': [{'Id': 'ep-1'}],
+            'main_ep_info': {'SeasonId': 'season-1', 'SeriesId': 'series-1'},
+            'server_version': '4.8.0.40',
+            'basename': 'Movie.strm',
+            'is_strm': True,
+            'is_http_source': True,
+            'strm_direct': False,
+            'is_http_direct_strm': False,
+            'strm_local_by_file_path': True,
+            'item_id': 'item-1',
+            'media_source_id': 'source-1',
+            'file_path': r'C:\Media\Movie.strm',
+            'media_title': 'Movie',
+            'episodes_info': [],
+            'sub_inner_idx': 0,
+            'device_id': 'device',
+            'play_session_id': 'session',
+        }
+        episode = {
+            'Id': 'ep-1',
+            'Type': 'Episode',
+            'ProviderIds': {},
+            'SeriesId': 'series-1',
+            'Path': r'C:\Media\Movie.strm',
+            'ParentIndexNumber': 1,
+            'IndexNumber': 1,
+            'Name': 'Movie',
+            'RunTimeTicks': 10 ** 7,
+            'MediaSources': [{
+                'Id': 'source-ep-1',
+                'Path': 'https://media.example/Movie.mkv',
+                'Container': 'strm',
+                'MediaStreams': [],
+                'RunTimeTicks': 10 ** 7,
+                'Size': 10,
+            }],
+        }
+
+        with mock.patch.object(data_parser, 'requests_urllib',
+                               return_value={'Items': [episode]}), \
+                mock.patch.object(data_parser, 'match_version_range', return_value=True), \
+                mock.patch.object(data_parser, 'strm_local_media_path',
+                                  return_value=r'C:\Media\Movie.strm'), \
+                mock.patch.object(data_parser, 'translate_path_by_ini',
+                                  side_effect=lambda value: value), \
+                mock.patch.object(data_parser, 'maybe_register_strm_cd2_url') as register, \
+                mock.patch.object(data_parser.configs, 'check_str_match',
+                                  return_value=False), \
+                mock.patch.object(data_parser.configs, 'media_title_translate',
+                                  return_value={}):
+            result = data_parser.list_episodes(data)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['media_path'], result[0]['stream_url'])
+        self.assertFalse(result[0]['mount_disk_mode'])
+        self.assertFalse(result[0]['use_strm_local_path'])
+        self.assertFalse(result[0]['use_strm_cd2_url'])
         register.assert_not_called()
 
 

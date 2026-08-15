@@ -161,6 +161,24 @@ class CloudDrive2ClientTests(unittest.TestCase):
             _stub_factory=lambda *_: stub, _proto_loader=loader,
             request_timeout_seconds=0.2, **kw)
 
+    def test_refresh_parent_levels_defaults_and_clamps_safely(self):
+        self.assertEqual(self.make_refresh_client(RefreshStub()).refresh_parent_levels, 3)
+        self.assertEqual(
+            self.make_refresh_client(RefreshStub(), refresh_parent_levels='invalid')
+            .refresh_parent_levels,
+            3,
+        )
+        self.assertEqual(
+            self.make_refresh_client(RefreshStub(), refresh_parent_levels=0)
+            .refresh_parent_levels,
+            1,
+        )
+        self.assertEqual(
+            self.make_refresh_client(RefreshStub(), refresh_parent_levels=99)
+            .refresh_parent_levels,
+            8,
+        )
+
     def test_missing_file_consumes_parent_stream_to_eof_then_rechecks(self):
         logger = CaptureLogger()
         stub = RefreshStub(
@@ -250,6 +268,37 @@ class CloudDrive2ClientTests(unittest.TestCase):
         self.assertIn('cd2 recheck state=found', messages)
         self.assertIn('cd2 download_url status=success', messages)
         self.assertNotIn(category, messages)
+
+    def test_configured_four_levels_refresh_from_farthest_ancestor(self):
+        logger = CaptureLogger()
+        ancestor = '/archive/tv'
+        category = ancestor + '/欧美剧'
+        show = category + '/奇迹人'
+        season = show + '/Season 01'
+        target = season + '/episode.mkv'
+        stub = RefreshStub(
+            known_directories={ancestor},
+            refresh_results={
+                ancestor: {'directories': {category}},
+                category: {'directories': {show}},
+                show: {'directories': {season}},
+                season: {'files': {target}},
+            },
+        )
+
+        self.assertEqual(
+            self.make_refresh_client(
+                stub, logger=logger, refresh_parent_levels=4
+            ).resolve_cloud_path(target),
+            'https://cd2.example:8443/api/static/video.mkv',
+        )
+        self.assertEqual(
+            [call[1] for call in stub.calls if call[0] == 'refresh'],
+            [ancestor, category, show, season],
+        )
+        messages = '\n'.join(logger.messages)
+        self.assertIn('cd2 refresh stage=ancestor4 status=started', messages)
+        self.assertIn('cd2 recheck state=found', messages)
 
     def test_unknown_upper_parent_stops_without_refresh(self):
         stub = RefreshStub()

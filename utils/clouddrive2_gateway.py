@@ -21,6 +21,7 @@ from utils.configs import configs
 
 
 _FALLBACK_URL_MAX_LENGTH = 8192
+_DEFAULT_REFRESH_PARENT_LEVELS = 3
 
 
 def _normalise_fallback_url(value: object) -> Optional[str]:
@@ -98,6 +99,13 @@ class CloudDrive2Gateway:
             origin = configs.raw.get('clouddrive2', 'origin', fallback='http://127.0.0.1:19798').strip()
             path_map = configs.raw.get('clouddrive2', 'path_map', fallback='').strip()
             timeout = configs.raw.getfloat('clouddrive2', 'request_timeout_seconds', fallback=2)
+            refresh_parent_levels = configs.raw.get(
+                'clouddrive2', 'refresh_parent_levels',
+                fallback=str(_DEFAULT_REFRESH_PARENT_LEVELS))
+            try:
+                refresh_parent_levels = int(refresh_parent_levels)
+            except (TypeError, ValueError, OverflowError):
+                refresh_parent_levels = _DEFAULT_REFRESH_PARENT_LEVELS
         except (ValueError, TypeError):
             return None
         # The gateway receives a local mounted path.  Requiring an explicit
@@ -105,12 +113,13 @@ class CloudDrive2Gateway:
         # it were already a cloud path when the user forgot to configure it.
         if not enabled or not token or not path_map:
             return None
-        key = (origin, token, path_map, timeout)
+        key = (origin, token, path_map, timeout, refresh_parent_levels)
         with self._lock:
             if key != self._client_key:
                 self._client = CloudDrive2Client(
                     origin, token, path_map=path_map, request_timeout_seconds=timeout,
-                    logger=getattr(configs, 'logger', None))
+                    logger=getattr(configs, 'logger', None),
+                    refresh_parent_levels=refresh_parent_levels)
                 self._client_key = key
             return self._client
 

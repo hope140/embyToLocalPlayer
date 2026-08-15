@@ -24,7 +24,9 @@ _TOKEN_PREFIX = re.compile(r"^Bearer\s+", re.I)
 # The supported media layout is category -> show -> season -> file.  A cold
 # lookup may therefore need these three directory refreshes, but it must not
 # turn into an unbounded ancestor walk or a whole-drive refresh.
-_REFRESH_MAX_CALLS = 3
+_DEFAULT_REFRESH_PARENT_LEVELS = 3
+_MIN_REFRESH_PARENT_LEVELS = 1
+_MAX_REFRESH_PARENT_LEVELS = 8
 _REFRESH_COOLDOWN_SECONDS = 5.0
 _default_logger = None
 _default_logger_ready = False
@@ -100,6 +102,36 @@ def _prefix_boundary(path: str, prefix: str) -> bool:
     folded_path, folded_prefix = path.casefold(), prefix.casefold().rstrip("/")
     return folded_path == folded_prefix or folded_path.startswith(folded_prefix + "/")
 
+
+def _normalise_refresh_parent_levels(value: Any) -> int:
+    try:
+        levels = int(value)
+    except (TypeError, ValueError, OverflowError):
+        levels = _DEFAULT_REFRESH_PARENT_LEVELS
+    return max(_MIN_REFRESH_PARENT_LEVELS,
+               min(_MAX_REFRESH_PARENT_LEVELS, levels))
+
+
+def _refresh_stage(depth: int) -> str:
+    if depth == 1:
+        return "direct"
+    if depth == 2:
+        return "upper"
+    if depth == 3:
+        return "category"
+    return f"ancestor{depth}"
+
+
+def _refresh_stages(depth: int) -> list[str]:
+    if depth == 1:
+        return ["direct"]
+    if depth == 2:
+        return ["upper", "direct"]
+    if depth == 3:
+        return ["category", "show", "season"]
+    return [f"ancestor{level}" for level in range(depth, 3, -1)] \
+        + ["category", "show", "season"]
+
 def _parse_path_map(path_map: Any) -> list[tuple[str, str]]:
     if not path_map:
         return []
@@ -152,6 +184,7 @@ class CloudDrive2Config:
 class CloudDrive2Client:
     def __init__(self, origin: str, api_token: str, path_map: Any = None,
                  request_timeout_seconds: float = 2, logger: Any = None, *,
+                 refresh_parent_levels: Any = _DEFAULT_REFRESH_PARENT_LEVELS,
                  _stub_factory: Callable[..., Any] | None = None,
                  _channel_factory: Callable[..., Any] | None = None,
                  _proto_loader: Callable[[], tuple[Any, Any, Any]] | None = None,
@@ -168,6 +201,8 @@ class CloudDrive2Client:
             self.request_timeout_seconds = max(0.05, float(request_timeout_seconds))
         except (TypeError, ValueError):
             self.request_timeout_seconds = 2.0
+        self.refresh_parent_levels = _normalise_refresh_parent_levels(
+            refresh_parent_levels)
         self._path_map = _parse_path_map(path_map)
         self._logger = logger if logger is not None else _get_default_logger()
         self._stub_factory = _stub_factory
@@ -331,7 +366,10 @@ class CloudDrive2Client:
 
     def _refresh_missing_path(self, stub: Any, pb2: Any, cloud_path: str) -> bool:
         """Refresh the bounded directory chain after a missing-file lookup."""
-        total_timeout = max(self.request_timeout_seconds, 0.05) * _REFRESH_MAX_CALLS
+        total_timeout = (
+            max(self.request_timeout_seconds, 0.05)
+            * self.refresh_parent_levels
+        )
         deadline = self._clock() + total_timeout
         if not self._refresh_guard.acquire(
                 timeout=self._remaining_timeout(deadline)):
@@ -348,86 +386,48 @@ class CloudDrive2Client:
             if not direct_parent:
                 self._log_refresh_status("direct", "failed", "no_parent")
                 return False
-            remaining = self._remaining_timeout(deadline)
-            if remaining <= 0:
-                self._log_refresh_status("direct", "failed", "timeout")
-                return False
-            parent_info, parent_state = self._find_file(
-                stub, pb2, direct_parent, timeout=remaining)
-            if parent_state == "error":
-                self._log_refresh_status("direct", "failed", "parent_lookup_error")
-                return False
-            elif parent_state == "found" and _is_directory(parent_info):
-                return self._refresh_directory(
-                    stub, pb2, direct_parent, deadline, calls, stage="direct")
-            elif parent_state == "found":
-                self._log_refresh_status("direct", "failed", "parent_not_directory")
-            else:
-                self._log_refresh_status("direct", "failed", "parent_missing")
 
-            # The direct parent is absent.  Probe the show directory before
-            # considering the known category level.  Existing behavior for a
-            # present show directory remains the two-call upper -> direct
-            # fast path.
-            upper_parent = _parent_path(direct_parent)
-            if not upper_parent or upper_parent == direct_parent:
-                self._log_refresh_status("upper", "failed", "no_parent")
-                return False
-            remaining = self._remaining_timeout(deadline)
-            if remaining <= 0:
-                self._log_refresh_status("upper", "failed", "timeout")
-                return False
-            upper_info, upper_state = self._find_file(
-                stub, pb2, upper_parent, timeout=remaining)
-            if upper_state == "error":
-                self._log_refresh_status("upper", "failed", "parent_lookup_error")
-                return False
-            if upper_state == "found" and not _is_directory(upper_info):
-                self._log_refresh_status("upper", "failed", "parent_not_directory")
-                return False
-            if upper_state == "found":
-                result = self._refresh_directory(
-                    stub, pb2, upper_parent, deadline, calls, stage="upper")
-                calls += int(result)
-                if not result:
+            # Probe only the configured number of directory levels.  The
+            # first available ancestor becomes the bounded refresh-chain root;
+            # refreshes then run from it down to the direct parent.
+            ancestors = [direct_parent]
+            found_depth = None
+            for depth in range(1, self.refresh_parent_levels + 1):
+                directory = ancestors[-1]
+                remaining = self._remaining_timeout(deadline)
+                stage = _refresh_stage(depth)
+                if remaining <= 0:
+                    self._log_refresh_status(stage, "failed", "timeout")
                     return False
-                return bool(self._refresh_directory(
-                    stub, pb2, direct_parent, deadline, calls, stage="direct"))
+                info, state = self._find_file(
+                    stub, pb2, directory, timeout=remaining)
+                if state == "error":
+                    self._log_refresh_status(stage, "failed", "parent_lookup_error")
+                    return False
+                if state == "found":
+                    if not _is_directory(info):
+                        self._log_refresh_status(
+                            stage, "failed", "parent_not_directory")
+                        return False
+                    found_depth = depth
+                    break
+                self._log_refresh_status(stage, "failed", "parent_missing")
+                if depth == self.refresh_parent_levels:
+                    return False
+                next_parent = _parent_path(directory)
+                if not next_parent or next_parent == directory:
+                    self._log_refresh_status(
+                        _refresh_stage(depth + 1),
+                        "failed", "no_parent")
+                    return False
+                ancestors.append(next_parent)
 
-            self._log_refresh_status("upper", "failed", "parent_missing")
-
-            # The target's Season and show directories are both absent.  The
-            # user's mapped layout has one more business directory above them:
-            # category -> show -> season.  Only probe that fixed category
-            # ancestor; never recurse toward the drive root.
-            category_parent = _parent_path(upper_parent)
-            if not category_parent or category_parent == upper_parent:
-                self._log_refresh_status("category", "failed", "no_parent")
+            if found_depth is None:
                 return False
-            remaining = self._remaining_timeout(deadline)
-            if remaining <= 0:
-                self._log_refresh_status("category", "failed", "timeout")
-                return False
-            category_info, category_state = self._find_file(
-                stub, pb2, category_parent, timeout=remaining)
-            if category_state == "error":
-                self._log_refresh_status("category", "failed", "parent_lookup_error")
-                return False
-            if category_state != "found":
-                self._log_refresh_status(
-                    "category", "failed", f"parent_{category_state}")
-                return False
-            if not _is_directory(category_info):
-                self._log_refresh_status("category", "failed", "parent_not_directory")
-                return False
-
-            # Refresh from the known category down to the missing Season.  A
-            # successful parent refresh may make the next directory visible,
-            # but the calls remain fixed and bounded even when it does not.
-            for stage, directory in (
-                    ("category", category_parent),
-                    ("show", upper_parent),
-                    ("season", direct_parent)):
+            stages = _refresh_stages(found_depth)
+            for index, directory in enumerate(
+                    reversed(ancestors[:found_depth])):
+                stage = stages[index]
                 result = self._refresh_directory(
                     stub, pb2, directory, deadline, calls, stage=stage)
                 calls += int(result)
@@ -446,7 +446,7 @@ class CloudDrive2Client:
     def _refresh_directory(self, stub: Any, pb2: Any, directory: str,
                            deadline: float, calls: int,
                            *, stage: str = "direct") -> bool:
-        if calls >= _REFRESH_MAX_CALLS:
+        if calls >= self.refresh_parent_levels:
             self._log_refresh_status(stage, "failed", "limit")
             return False
         now = self._clock()
