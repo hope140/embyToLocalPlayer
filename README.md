@@ -12,6 +12,8 @@
 
 beta 和 stable 保留相同的 Tampermonkey 脚本身份，安装时只选择一个频道，不要同时安装两份。更新器读取安装包内的频道元数据，只查找对应频道的 Release 资产，不使用跨频道的 `Latest` 下载地址。
 
+GitHub 页面上，stable Release 作为 `Latest` 展示，beta Release 标记为 `Prerelease`；这只影响网页展示，不改变更新器按频道查询资产的规则。
+
 为兼容尚未升级的旧 beta 安装，当前 stable 的 Latest Release 暂时额外保留旧版更新器请求的
 `etlp-remote-control-beta.zip` 和对应 `.sha256` 兼容资产。这两个文件内容仍是 beta 包；新更新器不会跨频道使用它们。
 

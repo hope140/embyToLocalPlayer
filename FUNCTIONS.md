@@ -25,6 +25,8 @@
 - `beta` 是测试频道。只能从 `beta` 运行 `scripts/package_beta.ps1`，版本 tag 以
   `-beta` 结尾，包名为 `etlp-remote-control-beta.zip`。
 - `main` 只同步上游，不打包、不创建频道 Release，也不作为用户安装入口。
+- GitHub 展示规则固定为：stable Release 是 `Latest`，beta Release 是 `Prerelease`；
+  更新器仍通过 Releases API 按频道选择资产，不依赖单一 `Latest` 下载入口。
 - 更新器读取 `utils/release_info.py` 中的频道值，通过 GitHub Releases API 选择同频道且
   同时包含 ZIP 与 `.sha256` 的已发布 tag；旧版或源码安装没有合法频道值时兼容为 beta。
 - `[dev] update_cdn_url` 可选，留空时直连 GitHub；填写时必须是包含且仅包含一个 `{url}`

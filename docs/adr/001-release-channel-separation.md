@@ -30,6 +30,8 @@ Latest 指针，不能同时表达 beta 和 stable；如果两个频道共用包
   结尾，stable 版本不以 `-beta` 结尾。两个 wrapper 分别固定传入 beta/stable。
 - 频道使用不同资产名：`etlp-remote-control-beta.zip` 和
   `etlp-remote-control-stable.zip`，各自带同名 `.sha256` sidecar。
+- GitHub 展示规则固定为：stable Release 标记为仓库 `Latest`，beta Release 标记为
+  `Prerelease`；更新器仍按频道查询 Releases API，不把 GitHub 的 `Latest` 当作频道选择依据。
 - `release_info.py` 将频道写入运行包。更新器访问 GitHub Releases API，只选择非 draft、
   同频道 tag 且同时有 ZIP 和 sidecar 的 Release，再下载明确 tag 下的资产，不使用
   `Latest` 地址。
