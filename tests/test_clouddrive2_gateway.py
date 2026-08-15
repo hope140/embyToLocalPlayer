@@ -1,6 +1,7 @@
 import io
 import os
 import tempfile
+import threading
 import unittest
 from configparser import ConfigParser
 from types import SimpleNamespace
@@ -206,6 +207,105 @@ class CloudDrive2GatewayTests(unittest.TestCase):
         gateway.register('two.mkv')
         self.assertIsNone(gateway.pop_entry('one'))
         self.assertEqual(gateway.pop_entry('two').local_path, 'two.mkv')
+
+    def test_resolve_route_reuses_success_for_same_nonce_until_expiry(self):
+        now = [100.0]
+        gateway = gateway_module.CloudDrive2Gateway(
+            clock=lambda: now[0], token_urlsafe=lambda _: 'nonce')
+        gateway.configure('http://127.0.0.1:58000')
+        gateway.register(r'C:\Media\movie.mkv')
+        resolver = mock.Mock(return_value=gateway_module.GatewayRouteDecision(
+            'cd2', 'https://cd2.example/video.mkv', 'cd2'))
+
+        first, first_hit = gateway.resolve_route('nonce', resolver)
+        second, second_hit = gateway.resolve_route('nonce', resolver)
+        self.assertEqual(first.kind, 'cd2')
+        self.assertFalse(first_hit)
+        self.assertEqual(second.target, 'https://cd2.example/video.mkv')
+        self.assertTrue(second_hit)
+        resolver.assert_called_once_with()
+
+        now[0] += gateway_module._ROUTE_CACHE_SUCCESS_TTL_SECONDS + 0.1
+        third, third_hit = gateway.resolve_route('nonce', resolver)
+        self.assertEqual(third.kind, 'cd2')
+        self.assertFalse(third_hit)
+        self.assertEqual(resolver.call_count, 2)
+
+    def test_resolve_route_retries_short_negative_decision(self):
+        now = [100.0]
+        gateway = gateway_module.CloudDrive2Gateway(
+            clock=lambda: now[0], token_urlsafe=lambda _: 'nonce')
+        gateway.configure('http://127.0.0.1:58000')
+        gateway.register(r'C:\Media\cold.mkv')
+        resolver = mock.Mock(return_value=gateway_module.GatewayRouteDecision(
+            'missing', source='media'))
+
+        first, _ = gateway.resolve_route('nonce', resolver)
+        second, second_hit = gateway.resolve_route('nonce', resolver)
+        self.assertEqual(first.kind, 'missing')
+        self.assertTrue(second_hit)
+        self.assertEqual(second.kind, 'missing')
+        resolver.assert_called_once_with()
+
+        now[0] += gateway_module._ROUTE_CACHE_FAILURE_TTL_SECONDS + 0.1
+        gateway.resolve_route('nonce', resolver)
+        self.assertEqual(resolver.call_count, 2)
+
+    def test_resolve_route_invalidates_cached_local_when_file_disappears(self):
+        gateway = gateway_module.CloudDrive2Gateway(token_urlsafe=lambda _: 'nonce')
+        gateway.configure('http://127.0.0.1:58000')
+        gateway.register(r'C:\Media\movie.mkv')
+        local_exists = [True]
+        resolver = mock.Mock(side_effect=(
+            gateway_module.GatewayRouteDecision('local', source='local'),
+            gateway_module.GatewayRouteDecision('missing', source='media'),
+        ))
+        valid = lambda decision: local_exists[0] if decision.kind == 'local' else not local_exists[0]
+
+        first, _ = gateway.resolve_route('nonce', resolver, cache_valid=valid)
+        self.assertEqual(first.kind, 'local')
+        local_exists[0] = False
+        second, second_hit = gateway.resolve_route('nonce', resolver, cache_valid=valid)
+        self.assertEqual(second.kind, 'missing')
+        self.assertFalse(second_hit)
+        self.assertEqual(resolver.call_count, 2)
+
+    def test_resolve_route_concurrent_same_nonce_has_one_resolver(self):
+        gateway = gateway_module.CloudDrive2Gateway(token_urlsafe=lambda _: 'nonce')
+        gateway.configure('http://127.0.0.1:58000')
+        gateway.register(r'C:\Media\movie.mkv')
+        started = threading.Event()
+        release = threading.Event()
+
+        def resolve(_):
+            started.set()
+            self.assertTrue(release.wait(2.0))
+            return gateway_module.GatewayRouteDecision(
+                'cd2', 'https://cd2.example/video.mkv', 'cd2')
+
+        resolver = mock.Mock(side_effect=lambda: resolve(None))
+        barrier = threading.Barrier(4)
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                barrier.wait(2.0)
+                results.append(gateway.resolve_route('nonce', resolver)[0])
+            except BaseException as exc:  # surface worker failures below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(started.wait(2.0))
+        release.set()
+        for thread in threads:
+            thread.join(2.0)
+
+        self.assertFalse(errors)
+        self.assertEqual([result.kind for result in results], ['cd2'] * 4)
+        resolver.assert_called_once_with()
 
 
 class HttpRangeTests(unittest.TestCase):
@@ -466,6 +566,108 @@ class HttpGatewayRouteTests(unittest.TestCase):
 
         self.assertEqual(handler.responses, [404])
         handler._send_local_file.assert_not_called()
+
+    def test_real_gateway_caches_nonlocal_route_and_diagnostics(self):
+        gateway = gateway_module.CloudDrive2Gateway(
+            token_urlsafe=lambda _: 'cached-fallback', ttl_seconds=60)
+        gateway.configure('http://127.0.0.1:58000')
+        fallback_url = 'https://emby.example/videos/item-1/original.mkv?token=secret'
+        gateway.register('movie.mkv', allow_local_fallback=True,
+                         fallback_url=fallback_url)
+        gateway.resolve_entry = mock.Mock(return_value=None)
+        first = _FakeHandler()
+        first.path = '/cd2/cached-fallback'
+        second = _FakeHandler()
+        second.path = '/cd2/cached-fallback'
+
+        with mock.patch.object(http_server, 'gateway', gateway), \
+                mock.patch.object(http_server.os.path, 'isfile', return_value=False), \
+                mock.patch.object(http_server.logger, 'info') as log:
+            http_server.UserScriptRequestHandler.send_cd2_file(first)
+            first_messages = [str(call.args[0]) for call in log.call_args_list]
+            log.reset_mock()
+            http_server.UserScriptRequestHandler.send_cd2_file(second)
+            second_messages = [str(call.args[0]) for call in log.call_args_list]
+
+        self.assertEqual(first.responses, [307])
+        self.assertEqual(second.responses, [307])
+        self.assertIn(('Location', fallback_url), first.headers_sent)
+        self.assertIn(('Location', fallback_url), second.headers_sent)
+        gateway.resolve_entry.assert_called_once()
+        self.assertIn('cd2 nonlocal fallback status=success', first_messages)
+        self.assertEqual([], [message for message in second_messages
+                              if message.startswith('cd2 ')])
+
+    def test_real_gateway_invalidates_local_route_when_file_disappears(self):
+        gateway = gateway_module.CloudDrive2Gateway(
+            token_urlsafe=lambda _: 'local-then-missing', ttl_seconds=60)
+        gateway.configure('http://127.0.0.1:58000')
+        fallback_url = 'https://emby.example/videos/item-1/original.mkv'
+        gateway.register('movie.mkv', allow_local_fallback=True,
+                         fallback_url=fallback_url)
+        gateway.resolve_entry = mock.Mock(return_value=None)
+        exists = [True]
+        first = _FakeHandler()
+        first.path = '/cd2/local-then-missing'
+        first._send_local_file = mock.Mock()
+        second = _FakeHandler()
+        second.path = '/cd2/local-then-missing'
+
+        with mock.patch.object(http_server, 'gateway', gateway), \
+                mock.patch.object(http_server.os.path, 'isfile',
+                                   side_effect=lambda _: exists[0]):
+            http_server.UserScriptRequestHandler.send_cd2_file(first)
+            exists[0] = False
+            http_server.UserScriptRequestHandler.send_cd2_file(second)
+
+        first._send_local_file.assert_called_once_with('movie.mkv')
+        self.assertEqual(second.responses, [307])
+        self.assertIn(('Location', fallback_url), second.headers_sent)
+        self.assertEqual(gateway.resolve_entry.call_count, 2)
+
+    def test_real_gateway_binding_rejection_skips_cached_route(self):
+        gateway = gateway_module.CloudDrive2Gateway(
+            token_urlsafe=lambda _: 'bound-route', ttl_seconds=60)
+        gateway.configure('http://127.0.0.1:58000')
+        gateway.register('movie.mkv')
+        gateway.resolve_entry = mock.Mock(
+            return_value='https://cd2.example/video.mkv')
+        first = _FakeHandler()
+        first.path = '/cd2/bound-route'
+        second = _FakeHandler()
+        second.path = '/cd2/bound-route'
+        second.client_ip = '127.0.0.2'
+
+        with mock.patch.object(http_server, 'gateway', gateway):
+            http_server.UserScriptRequestHandler.send_cd2_file(first)
+            http_server.UserScriptRequestHandler.send_cd2_file(second)
+
+        self.assertEqual(first.responses, [307])
+        self.assertEqual(second.responses, [404])
+        gateway.resolve_entry.assert_called_once()
+
+    def test_real_gateway_expiry_rejection_skips_cached_route(self):
+        now = [100.0]
+        gateway = gateway_module.CloudDrive2Gateway(
+            clock=lambda: now[0], token_urlsafe=lambda _: 'expired-route',
+            ttl_seconds=60)
+        gateway.configure('http://127.0.0.1:58000')
+        gateway.register('movie.mkv')
+        gateway.resolve_entry = mock.Mock(
+            return_value='https://cd2.example/video.mkv')
+        first = _FakeHandler()
+        first.path = '/cd2/expired-route'
+        second = _FakeHandler()
+        second.path = '/cd2/expired-route'
+
+        with mock.patch.object(http_server, 'gateway', gateway):
+            http_server.UserScriptRequestHandler.send_cd2_file(first)
+            now[0] += 60.0
+            http_server.UserScriptRequestHandler.send_cd2_file(second)
+
+        self.assertEqual(first.responses, [307])
+        self.assertEqual(second.responses, [404])
+        gateway.resolve_entry.assert_called_once()
 
 
 class StrmContentParseTests(unittest.TestCase):
