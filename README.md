@@ -15,6 +15,19 @@ beta 和 stable 保留相同的 Tampermonkey 脚本身份，安装时只选择�
 为兼容尚未升级的旧 beta 安装，当前 stable 的 Latest Release 暂时额外保留旧版更新器请求的
 `etlp-remote-control-beta.zip` 和对应 `.sha256` 兼容资产。这两个文件内容仍是 beta 包；新更新器不会跨频道使用它们。
 
+### 维护者本地准备 Release
+
+在 `beta` 或 `stable` 分支的干净工作区中运行：
+
+```powershell
+pwsh -File .\scripts\release_prepare.ps1 -Version <版本>
+```
+
+将 `<版本>` 替换为实际版本号；beta 版本以 `-beta` 结尾，stable 版本不带该后缀。
+脚本会根据当前分支自动确定频道，并校验版本后缀、分支和工作区状态；成功后在默认的
+`publish/` 目录生成对应 ZIP、SHA-256 sidecar、`release-plan.json` 和中文
+`release-notes.md` 草稿。它只准备本地发布材料，不会 push、创建 tag 或创建 GitHub Release。
+
 ## 开源许可与致谢
 
 本项目遵循 [Apache License, Version 2.0](LICENSE)。本仓库基于并跟踪上游 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)，在保留原有许可和归属信息的前提下进行独立维护与扩展。感谢上游作者 **kjtsune** 及所有贡献者的开源工作。
