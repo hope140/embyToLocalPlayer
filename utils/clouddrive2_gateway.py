@@ -14,10 +14,43 @@ import secrets
 import threading
 import time
 from typing import Callable, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from utils.clouddrive2_client import CloudDrive2Client
 from utils.configs import configs
+
+
+_FALLBACK_URL_MAX_LENGTH = 8192
+
+
+def _normalise_fallback_url(value: object) -> Optional[str]:
+    """Accept only a bounded absolute HTTP(S) playback URL.
+
+    The URL is retained only in the in-memory gateway entry.  It is supplied
+    by the parser for the current playback request, never read from a path or
+    logged by the gateway.
+    """
+    if not isinstance(value, str):
+        return None
+    url = value.strip()
+    if not url or len(url) > _FALLBACK_URL_MAX_LENGTH:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in url):
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme.casefold() not in {'http', 'https'} or not parsed.netloc:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        if parsed.port is not None:
+            int(parsed.port)
+    except (TypeError, ValueError):
+        return None
+    return url
 
 
 @dataclass(frozen=True)
@@ -32,6 +65,9 @@ class GatewayEntry:
     # for internal/tests-only URL registration and must never become an
     # arbitrary local-file server.
     allow_local_fallback: bool = False
+    # The original non-local stream URL for this playback request.  It is an
+    # in-memory fallback only and is intentionally absent from diagnostics.
+    fallback_url: Optional[str] = None
 
 
 class CloudDrive2Gateway:
@@ -78,9 +114,11 @@ class CloudDrive2Gateway:
                 self._client_key = key
             return self._client
 
-    def register(self, local_path: str, *, allow_local_fallback: bool = False) -> Optional[str]:
+    def register(self, local_path: str, *, allow_local_fallback: bool = False,
+                 fallback_url: Optional[str] = None) -> Optional[str]:
         if not self._base_url or not local_path:
             return None
+        fallback_url = _normalise_fallback_url(fallback_url)
         now = self._clock()
         with self._lock:
             self._prune(now)
@@ -93,11 +131,13 @@ class CloudDrive2Gateway:
                     self._entries[nonce] = GatewayEntry(
                         str(local_path), now + self.ttl_seconds,
                         allow_local_fallback=bool(allow_local_fallback),
+                        fallback_url=fallback_url,
                     )
                     return f'{self._base_url}/cd2/{quote(nonce, safe="")}'
         return None
 
-    def maybe_register(self, local_path: str) -> Optional[str]:
+    def maybe_register(self, local_path: str,
+                       fallback_url: Optional[str] = None) -> Optional[str]:
         """Return an opaque gateway URL when CD2 is configured and resolvable."""
         if not self._base_url or not local_path:
             return None
@@ -116,7 +156,8 @@ class CloudDrive2Gateway:
         # fast path, while the actual request still has a local fallback.
         if not client.map_local_path_to_cloud_path(local_path):
             return None
-        return self.register(local_path, allow_local_fallback=True)
+        return self.register(
+            local_path, allow_local_fallback=True, fallback_url=fallback_url)
 
     def pop_entry(self, nonce: str) -> Optional[GatewayEntry]:
         """Look up a legacy entry name without consuming the URL.
@@ -150,6 +191,7 @@ class CloudDrive2Gateway:
                     entry = GatewayEntry(
                         entry.local_path, entry.expires_at,
                         allow_local_fallback=entry.allow_local_fallback,
+                        fallback_url=entry.fallback_url,
                         first_client_key=client_key,
                     )
                     self._entries[nonce] = entry
@@ -175,8 +217,9 @@ def configure_gateway(base_url: str) -> None:
     gateway.configure(base_url)
 
 
-def maybe_register_strm_cd2_url(local_path: str) -> Optional[str]:
-    return gateway.maybe_register(local_path)
+def maybe_register_strm_cd2_url(
+        local_path: str, fallback_url: Optional[str] = None) -> Optional[str]:
+    return gateway.maybe_register(local_path, fallback_url=fallback_url)
 
 
 __all__ = [

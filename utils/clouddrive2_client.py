@@ -21,7 +21,10 @@ except Exception:
 
 _PLACEHOLDER_RE = re.compile(r"\{(SCHEME|HOST|PREVIEW)\}")
 _TOKEN_PREFIX = re.compile(r"^Bearer\s+", re.I)
-_REFRESH_MAX_CALLS = 2
+# The supported media layout is category -> show -> season -> file.  A cold
+# lookup may therefore need these three directory refreshes, but it must not
+# turn into an unbounded ancestor walk or a whole-drive refresh.
+_REFRESH_MAX_CALLS = 3
 _REFRESH_COOLDOWN_SECONDS = 5.0
 _default_logger = None
 _default_logger_ready = False
@@ -327,7 +330,7 @@ class CloudDrive2Client:
             return None
 
     def _refresh_missing_path(self, stub: Any, pb2: Any, cloud_path: str) -> bool:
-        """Refresh at most the direct parent and its parent after a miss."""
+        """Refresh the bounded directory chain after a missing-file lookup."""
         total_timeout = max(self.request_timeout_seconds, 0.05) * _REFRESH_MAX_CALLS
         deadline = self._clock() + total_timeout
         if not self._refresh_guard.acquire(
@@ -362,8 +365,10 @@ class CloudDrive2Client:
             else:
                 self._log_refresh_status("direct", "failed", "parent_missing")
 
-            # The direct parent is absent.  One level up is the hard limit;
-            # never walk to a higher ancestor or refresh the whole drive.
+            # The direct parent is absent.  Probe the show directory before
+            # considering the known category level.  Existing behavior for a
+            # present show directory remains the two-call upper -> direct
+            # fast path.
             upper_parent = _parent_path(direct_parent)
             if not upper_parent or upper_parent == direct_parent:
                 self._log_refresh_status("upper", "failed", "no_parent")
@@ -374,19 +379,61 @@ class CloudDrive2Client:
                 return False
             upper_info, upper_state = self._find_file(
                 stub, pb2, upper_parent, timeout=remaining)
-            if upper_state != "found":
-                self._log_refresh_status("upper", "failed", f"parent_{upper_state}")
+            if upper_state == "error":
+                self._log_refresh_status("upper", "failed", "parent_lookup_error")
                 return False
-            if not _is_directory(upper_info):
+            if upper_state == "found" and not _is_directory(upper_info):
                 self._log_refresh_status("upper", "failed", "parent_not_directory")
                 return False
-            result = self._refresh_directory(
-                stub, pb2, upper_parent, deadline, calls, stage="upper")
-            calls += int(result)
-            if not result:
+            if upper_state == "found":
+                result = self._refresh_directory(
+                    stub, pb2, upper_parent, deadline, calls, stage="upper")
+                calls += int(result)
+                if not result:
+                    return False
+                return bool(self._refresh_directory(
+                    stub, pb2, direct_parent, deadline, calls, stage="direct"))
+
+            self._log_refresh_status("upper", "failed", "parent_missing")
+
+            # The target's Season and show directories are both absent.  The
+            # user's mapped layout has one more business directory above them:
+            # category -> show -> season.  Only probe that fixed category
+            # ancestor; never recurse toward the drive root.
+            category_parent = _parent_path(upper_parent)
+            if not category_parent or category_parent == upper_parent:
+                self._log_refresh_status("category", "failed", "no_parent")
                 return False
-            return bool(self._refresh_directory(
-                stub, pb2, direct_parent, deadline, calls, stage="direct"))
+            remaining = self._remaining_timeout(deadline)
+            if remaining <= 0:
+                self._log_refresh_status("category", "failed", "timeout")
+                return False
+            category_info, category_state = self._find_file(
+                stub, pb2, category_parent, timeout=remaining)
+            if category_state == "error":
+                self._log_refresh_status("category", "failed", "parent_lookup_error")
+                return False
+            if category_state != "found":
+                self._log_refresh_status(
+                    "category", "failed", f"parent_{category_state}")
+                return False
+            if not _is_directory(category_info):
+                self._log_refresh_status("category", "failed", "parent_not_directory")
+                return False
+
+            # Refresh from the known category down to the missing Season.  A
+            # successful parent refresh may make the next directory visible,
+            # but the calls remain fixed and bounded even when it does not.
+            for stage, directory in (
+                    ("category", category_parent),
+                    ("show", upper_parent),
+                    ("season", direct_parent)):
+                result = self._refresh_directory(
+                    stub, pb2, directory, deadline, calls, stage=stage)
+                calls += int(result)
+                if not result:
+                    return False
+            return True
         except Exception as exc:
             self._log_refresh_status("coordination", "failed", type(exc).__name__)
             return False

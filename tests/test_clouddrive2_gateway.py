@@ -101,11 +101,13 @@ class CloudDrive2GatewayTests(unittest.TestCase):
         mapped.map_local_path_to_cloud_path.return_value = '/Movies/movie.mkv'
         gateway._client_from_config = mock.Mock(return_value=mapped)
 
+        fallback_url = 'https://emby.example/videos/item-1/original.mkv?token=secret'
         self.assertEqual(
-            gateway.maybe_register(r'C:\Media\movie.mkv'),
+            gateway.maybe_register(r'C:\Media\movie.mkv', fallback_url=fallback_url),
             'http://localhost:1/cd2/nonce',
         )
         self.assertTrue(gateway._entries['nonce'].allow_local_fallback)
+        self.assertEqual(gateway._entries['nonce'].fallback_url, fallback_url)
         mapped.map_local_path_to_cloud_path.assert_called_once_with(
             r'C:\Media\movie.mkv')
 
@@ -223,6 +225,30 @@ class HttpGatewayRouteTests(unittest.TestCase):
         self.assertEqual(handler.responses, [])
         messages = '\n'.join(str(call.args[0]) for call in log.call_args_list)
         self.assertIn('cd2 local media exists=yes', messages)
+
+    def test_send_cd2_file_prefers_nonlocal_fallback_when_media_missing(self):
+        handler = _FakeHandler()
+        handler.path = '/cd2/opaque-nonce'
+        handler._send_local_file = mock.Mock()
+        fallback_url = 'https://emby.example/videos/item-1/original.mkv?token=secret'
+        fake_gateway = mock.Mock()
+        fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
+            local_path='movie.mkv', allow_local_fallback=True,
+            fallback_url=fallback_url)
+        fake_gateway.resolve_entry.return_value = None
+        with mock.patch.object(http_server, 'gateway', fake_gateway), \
+                mock.patch.object(http_server.logger, 'info') as log, \
+                mock.patch.object(http_server.UserScriptRequestHandler,
+                                  '_send_cd2_strm_fallback') as pointer:
+            http_server.UserScriptRequestHandler.send_cd2_file(handler)
+
+        self.assertEqual(handler.responses, [307])
+        self.assertIn(('Location', fallback_url), handler.headers_sent)
+        handler._send_local_file.assert_not_called()
+        pointer.assert_not_called()
+        messages = '\n'.join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn('cd2 nonlocal fallback status=success', messages)
+        self.assertNotIn(fallback_url, messages)
 
     def test_send_cd2_file_sibling_strm_fallback_when_media_missing(self):
         with tempfile.NamedTemporaryFile('w', suffix='.strm', delete=False,
@@ -459,7 +485,56 @@ class DataParserGatewayTests(unittest.TestCase):
         self.assertIn('Movie.mkv', result['media_title'])
         self.assertNotIn('nonce', result['media_title'])
         self.assertNotIn('.strm', result['media_title'])
-        register.assert_called_once_with(r'C:\Media\Movie.mkv')
+        register.assert_called_once_with(
+            r'C:\Media\Movie.mkv', fallback_url=result['stream_url'])
+
+    def test_emby_parser_does_not_register_undetermined_strm_path(self):
+        received_data = {
+            'extraData': {
+                'mainEpInfo': {'Path': r'C:\Media\Movie.strm', 'Type': 'Movie'},
+            },
+            'ApiClient': {
+                '_serverAddress': 'http://emby.example',
+                '_serverVersion': '4.8.0.40',
+            },
+            'playbackUrl': (
+                'http://emby.example/emby/Items/item-1/stream.mkv?'
+                'X-Emby-Token=token&X-Emby-Device-Id=device&'
+                'StartTimeTicks=0&UserId=user'
+            ),
+            'request': {'headers': {}},
+            'playbackData': {
+                'PlaySessionId': 'session',
+                'MediaSources': [{
+                    'Id': 'source',
+                    'Path': 'https://media.example/Movie.mkv',
+                    'Container': 'strm',
+                    'MediaStreams': [],
+                    'RunTimeTicks': 10 ** 7,
+                    'Size': 10,
+                }],
+            },
+            'mountDiskEnable': 'true',
+        }
+
+        with mock.patch.object(data_parser, 'show_version_info'), \
+                mock.patch.object(data_parser, 'main_ep_to_title', return_value='Movie'), \
+                mock.patch.object(data_parser, 'main_ep_intro_time', return_value={}), \
+                mock.patch.object(data_parser, 'logger_setup'), \
+                mock.patch.object(data_parser, 'match_version_range', return_value=True), \
+                mock.patch.object(data_parser, 'force_disk_mode_by_path', return_value=False), \
+                mock.patch.object(data_parser, 'translate_path_by_ini', side_effect=lambda value: value), \
+                mock.patch.object(data_parser, 'strm_local_media_path',
+                                  return_value=r'C:\Media\Movie.strm'), \
+                mock.patch.object(data_parser, 'maybe_register_strm_cd2_url') as register:
+            result = data_parser.parse_received_data_emby(received_data)
+
+        self.assertEqual(result['media_path'], result['stream_url'])
+        self.assertFalse(result['mount_disk_mode'])
+        self.assertFalse(result['use_strm_local_path'])
+        self.assertFalse(result['use_strm_cd2_url'])
+        self.assertIsNone(result['strm_cd2_local_path'])
+        register.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -220,6 +220,37 @@ class CloudDrive2ClientTests(unittest.TestCase):
         self.assertIn('cd2 refresh stage=direct status=started', messages)
         self.assertIn('cd2 refresh stage=direct status=success', messages)
 
+    def test_missing_season_and_show_refreshes_category_downward(self):
+        logger = CaptureLogger()
+        category = '/115open/115/欧美剧'
+        show = category + '/奇迹人 (2026) [tmdb=198178]'
+        season = show + '/Season 01'
+        target = season + '/奇迹人.2026.S01E01.2160p.WEB-DL.HDR10.H265.mkv'
+        stub = RefreshStub(
+            known_directories={category},
+            refresh_results={
+                category: {'directories': {show}},
+                show: {'directories': {season}},
+                season: {'files': {target}},
+            },
+        )
+
+        self.assertEqual(
+            self.make_refresh_client(stub, logger=logger).resolve_cloud_path(target),
+            'https://cd2.example:8443/api/static/video.mkv',
+        )
+        self.assertEqual(
+            [call[1] for call in stub.calls if call[0] == 'refresh'],
+            [category, show, season],
+        )
+        messages = '\n'.join(logger.messages)
+        self.assertIn('cd2 refresh stage=category status=started', messages)
+        self.assertIn('cd2 refresh stage=show status=started', messages)
+        self.assertIn('cd2 refresh stage=season status=started', messages)
+        self.assertIn('cd2 recheck state=found', messages)
+        self.assertIn('cd2 download_url status=success', messages)
+        self.assertNotIn(category, messages)
+
     def test_unknown_upper_parent_stops_without_refresh(self):
         stub = RefreshStub()
         self.assertIsNone(
