@@ -34,6 +34,40 @@ class UserScriptChannelTests(unittest.TestCase):
         self.assertNotIn("releases/latest", source)
         self.assertNotIn("/main/", source)
 
+    def test_playback_paths_force_refresh_cached_metadata(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "async function apiClientGetWithCache(itemId, cacheList, funName, forceRefresh = false)",
+            source,
+        )
+        self.assertIn("if (!forceRefresh) {", source)
+        self.assertIn("cache[itemId] = resInfo;", source)
+
+        playback_match = re.search(
+            r"async function dealWithPlaybackInfo\(.*?(?=\n    async function deailWithItemInfo)",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(playback_match)
+        playback_body = playback_match.group(0)
+        self.assertGreaterEqual(playback_body.count("getPlaybackWithCace(itemId, true)"), 2)
+        self.assertGreaterEqual(playback_body.count("getItemInfoWithCace(itemId, true)"), 2)
+
+        item_match = re.search(
+            r"async function deailWithItemInfo\(.*?(?=\n    document\.addEventListener)",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(item_match)
+        item_body = item_match.group(0)
+        self.assertIn("getItemInfoWithCace(itemId, true)", item_body)
+        self.assertIn("getPlaybackWithCace(itemId, true)", item_body)
+
+        self.assertIn(
+            "resumeIds.map(id => getFun(id))",
+            source,
+        )
+
     def test_launcher_updates_the_current_channel(self):
         launcher = LAUNCHER.read_text(encoding="utf-8-sig")
         self.assertIn("update current release channel", launcher)

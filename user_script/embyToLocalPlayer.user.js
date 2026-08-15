@@ -477,17 +477,19 @@
         fistTime = false;
     }
 
-    async function apiClientGetWithCache(itemId, cacheList, funName) {
+    async function apiClientGetWithCache(itemId, cacheList, funName, forceRefresh = false) {
         if (!itemId) {
             logger.info(`Skip ${funName} ${itemId}`);
         }
-        for (const cache of cacheList) {
-            if (itemId in cache) {
-                logger.info(`HIT ${funName} itemId=${itemId}`)
-                return cache[itemId];
+        if (!forceRefresh) {
+            for (const cache of cacheList) {
+                if (itemId in cache) {
+                    logger.info(`HIT ${funName} itemId=${itemId}`)
+                    return cache[itemId];
+                }
             }
         }
-        logger.info(`MISS ${funName} itemId=${itemId}`)
+        logger.info(`${forceRefresh ? 'REFRESH' : 'MISS'} ${funName} itemId=${itemId}`)
         let resInfo;
         switch (funName) {
             case 'getPlaybackInfo':
@@ -521,12 +523,12 @@
         return resInfo;
     }
 
-    async function getPlaybackWithCace(itemId) {
-        return apiClientGetWithCache(itemId, [resumePlaybackCache, allPlaybackCache], 'getPlaybackInfo');
+    async function getPlaybackWithCace(itemId, forceRefresh = false) {
+        return apiClientGetWithCache(itemId, [resumePlaybackCache, allPlaybackCache], 'getPlaybackInfo', forceRefresh);
     }
 
-    async function getItemInfoWithCace(itemId) {
-        return apiClientGetWithCache(itemId, [resumeItemDataCache, allItemDataCache], 'getItem');
+    async function getItemInfoWithCace(itemId, forceRefresh = false) {
+        return apiClientGetWithCache(itemId, [resumeItemDataCache, allItemDataCache], 'getItem', forceRefresh);
     }
 
     async function getEpisodesWithCace(seasonId) {
@@ -539,8 +541,8 @@
         episodesInfoCache = episodesInfoCache[0] ? episodesInfoCache[1].clone() : null;
         let itemId = rawId;
         let [playbackData, mainEpInfo, episodesInfoData] = await Promise.all([
-            getPlaybackWithCace(itemId), // originFetch(raw_url, request), 可能会 NoCompatibleStream
-            getItemInfoWithCace(itemId),
+            getPlaybackWithCace(itemId, true), // originFetch(raw_url, request), 可能会 NoCompatibleStream
+            getItemInfoWithCace(itemId, true),
             episodesInfoCache?.json(),
         ]);
         console.timeEnd('dealWithPlaybackInfo');
@@ -551,8 +553,8 @@
         if (itemId != correctId) {
             itemId = correctId;
             [playbackData, mainEpInfo] = await Promise.all([
-                getPlaybackWithCace(itemId),
-                getItemInfoWithCace(itemId),
+                getPlaybackWithCace(itemId, true),
+                getItemInfoWithCace(itemId, true),
             ]);
             let startPos = mainEpInfo.UserData.PlaybackPositionTicks;
             url = url.replace('StartTimeTicks=0', `StartTimeTicks=${startPos}`);
@@ -589,8 +591,8 @@
         let seasonId = item.SeasonId;
 
         let [mainEpInfo, playbackData, episodesInfoData] = await Promise.all([
-            getItemInfoWithCace(itemId),
-            getPlaybackWithCace(itemId),
+            getItemInfoWithCace(itemId, true),
+            getPlaybackWithCace(itemId, true),
             (seasonId) ? getEpisodesWithCace(seasonId) : null,
         ]);
 
