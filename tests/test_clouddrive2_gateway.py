@@ -215,11 +215,14 @@ class HttpGatewayRouteTests(unittest.TestCase):
             local_path='movie.mkv', allow_local_fallback=True)
         fake_gateway.resolve_entry.return_value = None
         with mock.patch.object(http_server, 'gateway', fake_gateway), \
+                mock.patch.object(http_server.logger, 'info') as log, \
                 mock.patch.object(http_server.os.path, 'isfile', return_value=True):
             http_server.UserScriptRequestHandler.send_cd2_file(handler)
 
         handler._send_local_file.assert_called_once_with('movie.mkv')
         self.assertEqual(handler.responses, [])
+        messages = '\n'.join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn('cd2 local media exists=yes', messages)
 
     def test_send_cd2_file_sibling_strm_fallback_when_media_missing(self):
         with tempfile.NamedTemporaryFile('w', suffix='.strm', delete=False,
@@ -235,7 +238,8 @@ class HttpGatewayRouteTests(unittest.TestCase):
             fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
                 local_path=media_path, allow_local_fallback=True)
             fake_gateway.resolve_entry.return_value = None
-            with mock.patch.object(http_server, 'gateway', fake_gateway):
+            with mock.patch.object(http_server, 'gateway', fake_gateway), \
+                    mock.patch.object(http_server.logger, 'info') as log:
                 http_server.UserScriptRequestHandler.send_cd2_file(handler)
         finally:
             os.unlink(strm_path)
@@ -244,6 +248,10 @@ class HttpGatewayRouteTests(unittest.TestCase):
         self.assertIn(('Location', 'https://cdn.example.com/real-media?id=9'),
                       handler.headers_sent)
         handler._send_local_file.assert_not_called()
+        messages = '\n'.join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn('cd2 gateway entry kind=media', messages)
+        self.assertIn('cd2 local media exists=no', messages)
+        self.assertIn('cd2 pointer fallback source=sibling status=success', messages)
 
     def test_send_cd2_file_does_not_fallback_for_direct_register_entry(self):
         handler = _FakeHandler()
@@ -286,7 +294,8 @@ class HttpGatewayRouteTests(unittest.TestCase):
             fake_gateway.lookup_or_claim.return_value = SimpleNamespace(
                 local_path=strm_path, allow_local_fallback=True)
             fake_gateway.resolve_entry.return_value = 'https://cd2.example/video.mkv'
-            with mock.patch.object(http_server, 'gateway', fake_gateway):
+            with mock.patch.object(http_server, 'gateway', fake_gateway), \
+                    mock.patch.object(http_server.logger, 'info') as log:
                 http_server.UserScriptRequestHandler.send_cd2_file(handler)
         finally:
             os.unlink(strm_path)
@@ -298,6 +307,10 @@ class HttpGatewayRouteTests(unittest.TestCase):
         # A .strm pointer is never resolved through CD2: its cloud counterpart
         # would be the same pointer text, not the media.
         fake_gateway.resolve_entry.assert_not_called()
+        messages = '\n'.join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn('cd2 gateway entry kind=strm', messages)
+        self.assertIn('cd2 pointer fallback source=direct status=success', messages)
+        self.assertNotIn('https://', messages)
 
     def test_send_cd2_file_strm_fallback_404_when_content_not_usable(self):
         for content in ('not a url\n', '', '   \n', 'file:///C:/Windows/win.ini\n',

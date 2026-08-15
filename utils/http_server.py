@@ -517,6 +517,12 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
+        entry_kind = 'strm' if entry.local_path.lower().endswith('.strm') else 'media'
+        entry_extension = os.path.splitext(entry.local_path)[1].lower().lstrip('.') or 'none'
+        if (entry_extension != 'strm'
+                and entry_extension not in UserScriptRequestHandler.MEDIA_EXTENSIONS):
+            entry_extension = 'other'
+        logger.info(f'cd2 gateway entry kind={entry_kind} ext={entry_extension}')
         # A derived local path that is still a .strm pointer cannot be played
         # as media, and its CD2 cloud counterpart (if any) is the same pointer
         # text rather than the media.  Read the pointer and redirect to the
@@ -524,28 +530,37 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         # .strm files; skip CD2 resolution for this case entirely.
         if entry.local_path.lower().endswith('.strm'):
             if not getattr(entry, 'allow_local_fallback', False):
+                logger.info('cd2 pointer fallback source=direct status=blocked')
                 self.send_response(404)
                 self.end_headers()
                 return
-            if UserScriptRequestHandler._send_cd2_strm_fallback(self, entry.local_path):
+            if UserScriptRequestHandler._send_cd2_strm_fallback(
+                    self, entry.local_path, source='direct'):
                 return
             self.send_response(404)
             self.end_headers()
             return
         cd2_url = gateway.resolve_entry(entry)
         if cd2_url:
+            logger.info('cd2 gateway resolve kind=media status=success')
             self.send_response(307)
             self.send_header('Location', cd2_url)
             self.send_header('Cache-Control', 'no-store')
             self.end_headers()
             return
+        logger.info('cd2 gateway resolve kind=media status=failed')
         # CD2 is optional.  Keep the old mounted-file path as a transparent
         # fallback when the proxy is offline, unconfigured, or out of scope.
         if not getattr(entry, 'allow_local_fallback', False):
+            logger.info('cd2 gateway fallback status=blocked')
             self.send_response(404)
             self.end_headers()
             return
-        if self._is_allowed_media_extension(entry.local_path) and os.path.isfile(entry.local_path):
+        media_allowed = self._is_allowed_media_extension(entry.local_path)
+        local_media_exists = media_allowed and os.path.isfile(entry.local_path)
+        logger.info(
+            f'cd2 local media exists={"yes" if local_media_exists else "no"}')
+        if local_media_exists:
             self._send_local_file(entry.local_path)
             return
         # The derived media file is missing or not a media path (e.g. a cold
@@ -553,7 +568,8 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         # sibling .strm pointer is usually available even then; redirect to
         # the real URL stored inside it.
         strm_path = os.path.splitext(entry.local_path)[0] + '.strm'
-        if UserScriptRequestHandler._send_cd2_strm_fallback(self, strm_path):
+        if UserScriptRequestHandler._send_cd2_strm_fallback(
+                self, strm_path, source='sibling'):
             return
         self.send_response(404)
         self.end_headers()
@@ -610,7 +626,7 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         return candidate
 
     @staticmethod
-    def _send_cd2_strm_fallback(handler, local_path):
+    def _send_cd2_strm_fallback(handler, local_path, *, source='direct'):
         """Best-effort .strm playback when CD2 resolution is unavailable.
 
         Redirects the player to the URL stored inside the .strm pointer
@@ -618,12 +634,13 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         Returns ``False`` when the file is unreadable or its content is not
         a usable URL, leaving the caller to answer 404.
         """
+        source = source if source in ('direct', 'sibling') else 'unknown'
         content = UserScriptRequestHandler._read_strm_content(local_path)
         url = UserScriptRequestHandler._parse_strm_url(content) if content is not None else None
         if not url:
-            logger.info('cd2 strm fallback failed, no usable url in', os.path.basename(local_path))
+            logger.info(f'cd2 pointer fallback source={source} status=failed')
             return False
-        logger.info('cd2 strm fallback redirect, host', urllib.parse.urlparse(url).netloc)
+        logger.info(f'cd2 pointer fallback source={source} status=success')
         handler.send_response(307)
         handler.send_header('Location', url)
         handler.send_header('Cache-Control', 'no-store')

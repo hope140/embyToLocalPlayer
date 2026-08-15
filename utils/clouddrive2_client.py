@@ -23,6 +23,22 @@ _PLACEHOLDER_RE = re.compile(r"\{(SCHEME|HOST|PREVIEW)\}")
 _TOKEN_PREFIX = re.compile(r"^Bearer\s+", re.I)
 _REFRESH_MAX_CALLS = 2
 _REFRESH_COOLDOWN_SECONDS = 5.0
+_default_logger = None
+_default_logger_ready = False
+
+
+def _get_default_logger() -> Any:
+    """Use the project's normal INFO logger when no caller supplied one."""
+    global _default_logger, _default_logger_ready
+    if not _default_logger_ready:
+        _default_logger_ready = True
+        try:
+            from utils.configs import MyLogger
+            _default_logger = MyLogger()
+        except Exception:
+            _default_logger = None
+    return _default_logger
+
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
@@ -150,7 +166,7 @@ class CloudDrive2Client:
         except (TypeError, ValueError):
             self.request_timeout_seconds = 2.0
         self._path_map = _parse_path_map(path_map)
-        self._logger = logger
+        self._logger = logger if logger is not None else _get_default_logger()
         self._stub_factory = _stub_factory
         self._channel_factory = _channel_factory
         self._proto_loader = _proto_loader or _load_proto_modules
@@ -184,11 +200,21 @@ class CloudDrive2Client:
         if self._logger is None:
             return
         try:
-            method = getattr(self._logger, "debug", None) or getattr(self._logger, "info", None)
-            if method:
+            # CD2 lookup/refresh diagnostics are needed at the normal runtime
+            # log level.  Keep a debug-only logger usable for small test/fake
+            # loggers, but prefer ``info`` when both methods exist.
+            method = getattr(self._logger, "info", None) or getattr(self._logger, "debug", None)
+            if callable(method):
                 method(message)
         except Exception:
             pass
+
+    def _log_refresh_status(self, stage: str, status: str,
+                            reason: str | None = None) -> None:
+        message = f"cd2 refresh stage={stage} status={status}"
+        if reason:
+            message += f" reason={reason}"
+        self._log(message)
 
     def _get_stub(self) -> tuple[Any, Any] | None:
         if self._stub is not None:
@@ -232,9 +258,11 @@ class CloudDrive2Client:
             return None
         loaded = self._get_stub()
         if loaded is None:
+            self._log("cd2 lookup state=error reason=client_unavailable")
             return None
         stub, pb2 = loaded
         file_info, state = self._find_file(stub, pb2, cloud_path)
+        self._log(f"cd2 lookup state={state}")
         if state == "error":
             return None
         if state == "missing":
@@ -243,7 +271,10 @@ class CloudDrive2Client:
             # short cooldown, so they do not create a refresh storm.
             self._refresh_missing_path(stub, pb2, cloud_path)
             file_info, state = self._find_file(stub, pb2, cloud_path)
+            self._log(f"cd2 recheck state={state}")
         if state != "found" or _is_directory(file_info):
+            if state == "found":
+                self._log("cd2 download_url status=invalid reason=directory")
             return None
         return self._download_url_for_file(stub, pb2, cloud_path, file_info)
 
@@ -271,8 +302,10 @@ class CloudDrive2Client:
         size = _field(file_info, "size", None)
         try:
             if size is None or int(size) < 0:
+                self._log("cd2 download_url status=invalid reason=file_size")
                 return None
         except (TypeError, ValueError, OverflowError):
+            self._log("cd2 download_url status=invalid reason=file_size")
             return None
         try:
             url_info = stub.GetDownloadUrlPath(
@@ -280,11 +313,17 @@ class CloudDrive2Client:
                          preview=False, lazy_read=False, get_direct_url=False),
                 metadata=self._metadata, timeout=self.request_timeout_seconds)
             if _field(url_info, "directUrl") or _field(url_info, "externalUrl"):
+                self._log("cd2 download_url status=invalid reason=external_url")
                 return None
             url_path = _field(url_info, "downloadUrlPath") or _field(url_info, "placeholder")
-            return self._validate_url(url_path)
+            url = self._validate_url(url_path)
+            if not url:
+                self._log("cd2 download_url status=invalid reason=unsupported_url")
+                return None
+            self._log("cd2 download_url status=success")
+            return url
         except Exception as exc:
-            self._log(f"CloudDrive2 URL resolution failed ({type(exc).__name__})")
+            self._log(f"cd2 download_url status=error reason={type(exc).__name__}")
             return None
 
     def _refresh_missing_path(self, stub: Any, pb2: Any, cloud_path: str) -> bool:
@@ -293,48 +332,63 @@ class CloudDrive2Client:
         deadline = self._clock() + total_timeout
         if not self._refresh_guard.acquire(
                 timeout=self._remaining_timeout(deadline)):
+            self._log_refresh_status("coordination", "failed", "lock_timeout")
             return False
         calls = 0
         target_cooldown_started = False
         try:
             if self._refresh_cooldowns.get(cloud_path, 0.0) > self._clock():
+                self._log_refresh_status("target", "cooldown")
                 return False
             target_cooldown_started = True
             direct_parent = _parent_path(cloud_path)
             if not direct_parent:
+                self._log_refresh_status("direct", "failed", "no_parent")
                 return False
             remaining = self._remaining_timeout(deadline)
             if remaining <= 0:
+                self._log_refresh_status("direct", "failed", "timeout")
                 return False
             parent_info, parent_state = self._find_file(
                 stub, pb2, direct_parent, timeout=remaining)
             if parent_state == "error":
+                self._log_refresh_status("direct", "failed", "parent_lookup_error")
                 return False
-            if parent_state == "found" and _is_directory(parent_info):
+            elif parent_state == "found" and _is_directory(parent_info):
                 return self._refresh_directory(
-                    stub, pb2, direct_parent, deadline, calls)
+                    stub, pb2, direct_parent, deadline, calls, stage="direct")
+            elif parent_state == "found":
+                self._log_refresh_status("direct", "failed", "parent_not_directory")
+            else:
+                self._log_refresh_status("direct", "failed", "parent_missing")
 
             # The direct parent is absent.  One level up is the hard limit;
             # never walk to a higher ancestor or refresh the whole drive.
             upper_parent = _parent_path(direct_parent)
             if not upper_parent or upper_parent == direct_parent:
+                self._log_refresh_status("upper", "failed", "no_parent")
                 return False
             remaining = self._remaining_timeout(deadline)
             if remaining <= 0:
+                self._log_refresh_status("upper", "failed", "timeout")
                 return False
             upper_info, upper_state = self._find_file(
                 stub, pb2, upper_parent, timeout=remaining)
-            if upper_state != "found" or not _is_directory(upper_info):
+            if upper_state != "found":
+                self._log_refresh_status("upper", "failed", f"parent_{upper_state}")
+                return False
+            if not _is_directory(upper_info):
+                self._log_refresh_status("upper", "failed", "parent_not_directory")
                 return False
             result = self._refresh_directory(
-                stub, pb2, upper_parent, deadline, calls)
+                stub, pb2, upper_parent, deadline, calls, stage="upper")
             calls += int(result)
             if not result:
                 return False
             return bool(self._refresh_directory(
-                stub, pb2, direct_parent, deadline, calls))
+                stub, pb2, direct_parent, deadline, calls, stage="direct"))
         except Exception as exc:
-            self._log(f"CloudDrive2 refresh coordination failed ({type(exc).__name__})")
+            self._log_refresh_status("coordination", "failed", type(exc).__name__)
             return False
         finally:
             if target_cooldown_started:
@@ -343,15 +397,20 @@ class CloudDrive2Client:
             self._refresh_guard.release()
 
     def _refresh_directory(self, stub: Any, pb2: Any, directory: str,
-                           deadline: float, calls: int) -> bool:
+                           deadline: float, calls: int,
+                           *, stage: str = "direct") -> bool:
         if calls >= _REFRESH_MAX_CALLS:
+            self._log_refresh_status(stage, "failed", "limit")
             return False
         now = self._clock()
         if self._refresh_cooldowns.get(directory, 0.0) > now:
+            self._log_refresh_status(stage, "cooldown")
             return False
         remaining = self._bounded_timeout(self._remaining_timeout(deadline))
         if remaining <= 0:
+            self._log_refresh_status(stage, "failed", "timeout")
             return False
+        self._log_refresh_status(stage, "started")
         try:
             response = stub.GetSubFiles(
                 _message(pb2, "ListSubFileRequest", path=directory,
@@ -365,14 +424,17 @@ class CloudDrive2Client:
                     try:
                         next(iterator)
                     except StopIteration:
+                        self._log_refresh_status(stage, "success")
                         return True
                 cancel = getattr(response, "cancel", None)
                 if callable(cancel):
                     cancel()
+                self._log_refresh_status(stage, "failed", "timeout")
                 return False
+            self._log_refresh_status(stage, "success")
             return True
         except Exception as exc:
-            self._log(f"CloudDrive2 directory refresh failed ({type(exc).__name__})")
+            self._log_refresh_status(stage, "failed", type(exc).__name__)
             return False
         finally:
             self._refresh_cooldowns[directory] = (
