@@ -50,8 +50,10 @@ flowchart LR
    路径判断和回退路径，不能阻塞播放启动。
 6. `stable` 是默认分支，`beta` 是测试分支，`main` 只同步上游。打包脚本要求当前
    分支与频道一致；更新器按安装包内的频道从 GitHub Releases API 选择同时包含对应
-   ZIP 与 SHA-256 sidecar 的已发布 tag，不使用跨频道的 `Latest` 资产。配置文件不由
-   更新包直接覆盖，ZIP 成员必须先经过安全校验。
+   ZIP 与 SHA-256 sidecar 的已发布 tag，不使用跨频道的 `Latest` 资产。新 Release 若
+   额外提供 `release-plan.json`，更新器在下载并替换前校验其 schema、频道、tag、分支、
+   资产名、SHA-256 和包大小；没有该清单的历史 Release 继续使用 sidecar-only 兼容路径。
+   配置文件不由更新包直接覆盖，ZIP 成员必须先经过安全校验。
 
 ## 生命周期与数据存放
 
