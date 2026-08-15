@@ -452,6 +452,63 @@ class UpdateDownloadTests(unittest.TestCase):
         self.assertIn("etlp-remote-control-stable.zip", release["update_url"])
         self.assertNotIn("-beta/", release["update_url"])
 
+    def test_cdn_template_rewrites_api_checksum_and_archive_urls(self):
+        payload = b"verified CDN archive"
+        digest = hashlib.sha256(payload).hexdigest()
+        cdn_template = "https://cdn.example/{url}"
+        assets = update.CHANNEL_ASSETS["beta"]
+        releases = [{
+            "id": 1,
+            "tag_name": "2026.08.14.1-beta",
+            "published_at": "2026-08-14T10:00:00Z",
+            "assets": [
+                {"name": assets["package"]},
+                {"name": assets["checksum"]},
+            ],
+        }]
+        release = update.select_latest_release(releases, "beta")
+        expected_urls = [
+            cdn_template.replace("{url}", update.RELEASES_API_URL),
+            cdn_template.replace("{url}", release["checksum_url"]),
+            cdn_template.replace("{url}", release["update_url"]),
+        ]
+        calls = []
+
+        def fake_requests(url, **kwargs):
+            calls.append((url, kwargs))
+            if url == expected_urls[0]:
+                return releases
+            if url == expected_urls[1]:
+                return f"{digest}  {release['package_asset']}\n"
+            if url == expected_urls[2]:
+                Path(kwargs["save_path"]).write_bytes(payload)
+                return kwargs["save_path"]
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+                result = update.download_verified_update(root, update_cdn_url=cdn_template)
+
+            self.assertEqual(Path(result).read_bytes(), payload)
+            self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
+
+        self.assertEqual([url for url, _ in calls], expected_urls)
+
+    def test_cdn_template_rejects_invalid_values_before_network(self):
+        invalid_templates = (
+            "https://cdn.example/no-placeholder",
+            "https://cdn.example/{url}/{url}",
+            "http://cdn.example/{url}",
+            "https:///{url}",
+        )
+        for cdn_template in invalid_templates:
+            with self.subTest(cdn_template=cdn_template):
+                with mock.patch.object(update, "requests_urllib") as requests:
+                    with self.assertRaisesRegex(ValueError, "update_cdn_url"):
+                        update.resolve_update_urls("beta", update_cdn_url=cdn_template)
+                requests.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

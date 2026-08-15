@@ -27,6 +27,12 @@
 - `main` 只同步上游，不打包、不创建频道 Release，也不作为用户安装入口。
 - 更新器读取 `utils/release_info.py` 中的频道值，通过 GitHub Releases API 选择同频道且
   同时包含 ZIP 与 `.sha256` 的已发布 tag；旧版或源码安装没有合法频道值时兼容为 beta。
+- `[dev] update_cdn_url` 可选，留空时直连 GitHub；填写时必须是包含且仅包含一个 `{url}`
+  的 HTTPS URL 模板，例如 `https://your-cdn.example/{url}`。启用后 Releases API、checksum
+  sidecar 和 ZIP 请求都套用该模板，非法模板会明确失败。这是用户自选代理，默认不内置
+  `ghproxy`、`ghfast` 等不稳定第三方域名，日志只记录 CDN 是否启用，不打印完整配置值。
+  jsDelivr 适合仓库文件或油猴脚本分发，不能直接承载本项目生成的 Release ZIP；不要将其
+  假设为 Release 资产的默认代理。
 - 旧版 beta 更新器仍请求 `releases/latest/download/etlp-remote-control-beta.zip`；为完成一次性
   自举升级，stable Latest Release 暂时保留同名 beta ZIP 与 `.sha256` 兼容资产。新更新器
   不使用这两个跨 Release 兼容资产。
@@ -95,7 +101,7 @@ flowchart LR
 | `[src]` / `[dst]` | 同名前缀键 | 把服务端显示路径映射为本地或挂载路径；按配置顺序匹配。 |
 | `[clouddrive2]` | `enable`、`origin`、`api_token`、`path_map`、`request_timeout_seconds` | CloudDrive2 gRPC 和 STRM gateway。Windows/UNC 路径必须有明确 `path_map`。 |
 | `[playlist]` | `enable_host`、`version_filter`、`item_limit`、`http_sub_auto_next_ep` | 连续播放范围、版本匹配、条数限制和简易自动下一集。 |
-| `[dev]` | `listen_on_localhost`、`http_server_token`、`strm_*`、`playing_feedback_*`、`force_disk_mode_path` | 本地 HTTP 安全、STRM、本地预热、实时反馈、代理、日志和高级播放策略。 |
+| `[dev]` | `listen_on_localhost`、`http_server_token`、`update_cdn_url`、`strm_*`、`playing_feedback_*`、`force_disk_mode_path` | 本地 HTTP 安全、更新器 CDN、STRM、本地预热、实时反馈、代理、日志和高级播放策略。 |
 | `[remote_control]` | `enable` | 当前 mpv/IINA 的 Emby 控制 WebSocket；默认 `yes`。 |
 
 浏览器脚本的 `webPlayerEnable`、`mountDiskEnable`、继续观看排序/隐藏等状态保存在油猴本地存储，不属于 INI；修改网页端行为时要同时检查脚本和 Python 入口收到的字段。

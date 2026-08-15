@@ -9,7 +9,7 @@ import sys
 import zipfile
 from configparser import ConfigParser
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from utils.configs import configs
@@ -41,6 +41,7 @@ CONFIG_PREFIX = 'embyToLocalPlayer_config'
 
 _CHECKSUM_RECORD = re.compile(r'(?P<digest>[0-9a-fA-F]{64}) {2}(?P<filename>\S+)')
 _RELEASE_TAG = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+/\-]{0,127}$')
+_UPDATE_CDN_PLACEHOLDER = '{url}'
 
 
 def _normalise_channel(channel):
@@ -55,6 +56,40 @@ def _release_download_url(tag, asset_name):
     if not isinstance(tag, str) or _RELEASE_TAG.fullmatch(tag) is None:
         raise ValueError(f'unsupported GitHub release tag: {tag!r}')
     return f'https://github.com/{REPOSITORY}/releases/download/{quote(tag, safe="")}/{quote(asset_name, safe="")}'
+
+
+def _validate_update_cdn_url(update_cdn_url):
+    """Validate an optional HTTPS URL template used for updater requests."""
+    if update_cdn_url is None:
+        return None
+    if not isinstance(update_cdn_url, str):
+        raise ValueError('update_cdn_url must be a string')
+    if update_cdn_url == '':
+        return None
+
+    placeholder_count = update_cdn_url.count(_UPDATE_CDN_PLACEHOLDER)
+    if placeholder_count != 1:
+        raise ValueError('update_cdn_url must contain exactly one {url} placeholder')
+    if any(character.isspace() for character in update_cdn_url):
+        raise ValueError('update_cdn_url must be a valid HTTPS URL template')
+
+    try:
+        parsed = urlsplit(update_cdn_url)
+    except ValueError as exc:
+        raise ValueError('update_cdn_url must be a valid HTTPS URL template') from exc
+    if parsed.scheme.casefold() != 'https' or not parsed.netloc:
+        raise ValueError('update_cdn_url must be an absolute HTTPS URL template')
+    if _UPDATE_CDN_PLACEHOLDER in parsed.netloc:
+        raise ValueError('update_cdn_url placeholder must be outside the URL authority')
+    return update_cdn_url
+
+
+def _apply_update_cdn_url(url, update_cdn_url=None):
+    """Return ``url`` directly or apply the validated CDN URL template."""
+    update_cdn_url = _validate_update_cdn_url(update_cdn_url)
+    if update_cdn_url is None:
+        return url
+    return update_cdn_url.replace(_UPDATE_CDN_PLACEHOLDER, url)
 
 
 def select_latest_release(releases, channel):
@@ -109,11 +144,12 @@ def select_latest_release(releases, channel):
     }
 
 
-def resolve_update_urls(channel=None):
-    """Resolve immutable package URLs for the installed beta/stable channel."""
+def resolve_update_urls(channel=None, update_cdn_url=None):
+    """Resolve package URLs for the installed channel, optionally via a CDN."""
     channel = _normalise_channel(channel)
+    update_cdn_url = _validate_update_cdn_url(update_cdn_url)
     releases = requests_urllib(
-        RELEASES_API_URL,
+        _apply_update_cdn_url(RELEASES_API_URL, update_cdn_url),
         get_json=True,
         headers={'Accept': 'application/vnd.github+json'},
         timeout=10,
@@ -124,7 +160,14 @@ def resolve_update_urls(channel=None):
             releases = json.loads(releases)
         except json.JSONDecodeError as exc:
             raise ValueError('GitHub releases response is not valid JSON') from exc
-    return select_latest_release(releases, channel)
+    release = select_latest_release(releases, channel)
+    if update_cdn_url is None:
+        return release
+    return {
+        **release,
+        'update_url': _apply_update_cdn_url(release['update_url'], update_cdn_url),
+        'checksum_url': _apply_update_cdn_url(release['checksum_url'], update_cdn_url),
+    }
 
 
 def parse_checksum(checksum_text, expected_asset=PACKAGE_ASSET):
@@ -162,13 +205,13 @@ def calculate_sha256(path, chunk_size=1024 * 1024):
     return digest.hexdigest()
 
 
-def download_verified_update(cwd, channel=None):
+def download_verified_update(cwd, channel=None, update_cdn_url=None):
     """Download and verify the update archive, returning its live archive path."""
     cwd = Path(cwd)
     zip_path = cwd / 'embyToLocalPlayer.zip'
     zip_part_path = Path(f'{zip_path}.part')
     try:
-        release = resolve_update_urls(channel)
+        release = resolve_update_urls(channel, update_cdn_url=update_cdn_url)
         checksum_text = requests_urllib(release['checksum_url'], decode=True)
         expected_digest = parse_checksum(checksum_text, release['package_asset'])
 
@@ -405,8 +448,10 @@ def main():
     print('#' * 50)
 
     print(f'{configs.script_proxy=}')
+    update_cdn_url = configs.raw.get('dev', 'update_cdn_url', fallback='')
+    print(f'update CDN enabled={bool(update_cdn_url)}')
     print('downloading checksum and archive...')
-    zip_path = download_verified_update(cwd)
+    zip_path = download_verified_update(cwd, update_cdn_url=update_cdn_url)
 
     print('unpacking...')
     prefix = extract_update_archive(zip_path, cwd, ini_example)
