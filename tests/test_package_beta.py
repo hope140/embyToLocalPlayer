@@ -11,6 +11,20 @@ from zipfile import ZipFile
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _write_embedded_runtime_fixture(parent: Path) -> Path:
+    runtime = parent / "python_embed-source"
+    (runtime / "Lib" / "site-packages").mkdir(parents=True)
+    (runtime / "python.exe").write_bytes(b"embedded-python-fixture")
+    (runtime / "python39.dll").write_bytes(b"embedded-python-dll-fixture")
+    (runtime / "python39._pth").write_text(
+        "python39.zip\n.\nLib\nLib/site-packages\n", encoding="ascii"
+    )
+    (runtime / "Lib" / "site-packages" / "fixture_marker.py").write_text(
+        "FIXTURE = True\n", encoding="ascii"
+    )
+    return runtime
+
+
 class BetaPackageTests(unittest.TestCase):
     def test_package_script_contains_only_runtime_manifest(self):
         shell = shutil.which("pwsh") or shutil.which("powershell")
@@ -28,6 +42,7 @@ class BetaPackageTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)
+            runtime = _write_embedded_runtime_fixture(output)
             result = subprocess.run(
                 [
                     shell,
@@ -39,6 +54,8 @@ class BetaPackageTests(unittest.TestCase):
                     str(ROOT / "scripts" / "package_beta.ps1"),
                     "-OutputDirectory",
                     str(output),
+                    "-PythonEmbedDirectory",
+                    str(runtime),
                     "-ReleaseVersion",
                     "2026.08.12.2-beta",
                 ],
@@ -62,6 +79,10 @@ class BetaPackageTests(unittest.TestCase):
                 "embyToLocalPlayer_debug.bat",
                 "LICENSE",
                 "requirements.txt",
+                "python_embed/python.exe",
+                "python_embed/python39.dll",
+                "python_embed/python39._pth",
+                "python_embed/Lib/site-packages/fixture_marker.py",
             }
 
             utils_root = ROOT / "utils"
@@ -103,6 +124,7 @@ class BetaPackageTests(unittest.TestCase):
             self.assertEqual(assignments["RELEASE_CHANNEL"], "beta")
             self.assertNotIn("etlp_release.json", actual)
             self.assertTrue(any(name.endswith(".whl") for name in actual))
+            self.assertTrue(any(name.startswith("python_embed/") for name in actual))
             self.assertFalse(any(name.casefold().endswith(".md") for name in actual))
             self.assertFalse(any(name.endswith(".proto") for name in actual))
 
@@ -160,6 +182,36 @@ class BetaPackageTests(unittest.TestCase):
             )
             self.assertNotEqual(stable.returncode, 0)
             self.assertFalse((stable_output / "etlp-remote-control-stable.zip").exists())
+
+            missing_runtime_output = output / "missing-runtime"
+            missing_runtime = subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(ROOT / "scripts" / "package_beta.ps1"),
+                    "-OutputDirectory",
+                    str(missing_runtime_output),
+                    "-PythonEmbedDirectory",
+                    str(output / "does-not-exist"),
+                    "-ReleaseVersion",
+                    "2026.08.12.3-beta",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertNotEqual(missing_runtime.returncode, 0)
+            self.assertIn("Python embedded runtime", missing_runtime.stdout + missing_runtime.stderr)
+            self.assertFalse(
+                (missing_runtime_output / "etlp-remote-control-beta.zip").exists()
+            )
 
 
 if __name__ == "__main__":

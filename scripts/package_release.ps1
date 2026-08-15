@@ -4,6 +4,7 @@ param(
     [ValidateSet('beta', 'stable')]
     [string]$Channel,
     [string]$OutputDirectory,
+    [string]$PythonEmbedDirectory,
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._+\-]{0,63}$')]
     [string]$ReleaseVersion
@@ -33,6 +34,21 @@ if ($Channel -eq 'stable' -and $ReleaseVersion -match '-beta$') {
     throw "Stable ReleaseVersion must not end with -beta"
 }
 
+if ([string]::IsNullOrWhiteSpace($PythonEmbedDirectory)) {
+    $PythonEmbedDirectory = Join-Path $root 'python_embed'
+}
+$PythonEmbedDirectory = [System.IO.Path]::GetFullPath($PythonEmbedDirectory)
+if (-not (Test-Path -LiteralPath $PythonEmbedDirectory -PathType Container)) {
+    throw "Python embedded runtime directory was not found: $PythonEmbedDirectory. Pass -PythonEmbedDirectory <path> to a Python 3.9 x86 embedded runtime directory."
+}
+$requiredPythonRuntimeFiles = @('python.exe', 'python39.dll', 'python39._pth')
+foreach ($runtimeFile in $requiredPythonRuntimeFiles) {
+    $runtimePath = Join-Path $PythonEmbedDirectory $runtimeFile
+    if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
+        throw "Python embedded runtime is incomplete: missing $runtimeFile under $PythonEmbedDirectory"
+    }
+}
+
 $packageName = "etlp-remote-control-$Channel"
 $staging = Join-Path $OutputDirectory $packageName
 $archivePath = Join-Path $OutputDirectory "$packageName.zip"
@@ -60,6 +76,15 @@ $rootFiles = @(
 )
 foreach ($file in $rootFiles) {
     Copy-Item -LiteralPath (Join-Path $root $file) -Destination (Join-Path $staging $file) -Force
+}
+
+# Ship the complete Windows embedded Python runtime at the package root. The
+# source directory is intentionally external/ignored so a maintainer can
+# provide the local runtime without committing binary files to this repository.
+$pythonEmbedTarget = Join-Path $staging 'python_embed'
+New-Item -ItemType Directory -Path $pythonEmbedTarget -Force | Out-Null
+foreach ($entry in Get-ChildItem -LiteralPath $PythonEmbedDirectory -Force) {
+    Copy-Item -LiteralPath $entry.FullName -Destination (Join-Path $pythonEmbedTarget $entry.Name) -Recurse -Force
 }
 
 # Keep only Python runtime modules from utils. The source tree also contains
@@ -202,6 +227,7 @@ $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
 Write-Output "==> channel: $Channel"
 Write-Output "==> branch: $branch"
 Write-Output "==> commit: $commit"
+Write-Output "==> Python embedded runtime: $PythonEmbedDirectory"
 Write-Output "==> package folder: $staging"
 Write-Output "==> archive: $archivePath"
 Write-Output "==> checksum: $checksumPath"

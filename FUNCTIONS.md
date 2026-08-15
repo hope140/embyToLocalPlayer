@@ -24,6 +24,10 @@
   `scripts/package_stable.ps1`，包名为 `etlp-remote-control-stable.zip`。
 - `beta` 是测试频道。只能从 `beta` 运行 `scripts/package_beta.ps1`，版本 tag 以
   `-beta` 结尾，包名为 `etlp-remote-control-beta.zip`。
+- Windows 频道包必须包含 `python_embed/python.exe`、`python_embed/python39.dll`、
+  `python_embed/python39._pth` 和 `third_party/*.whl`。发布包自带 Python 3.9 x86
+  embedded runtime 与依赖，运行时只从包内本地准备依赖，不联网下载；维护者可通过
+  `-PythonEmbedDirectory <目录>` 指定未提交到仓库的本机运行时目录。
 - `main` 只同步上游，不打包、不创建频道 Release，也不作为用户安装入口。
 - GitHub 展示规则固定为：stable Release 是 `Latest`，beta Release 是 `Prerelease`；
   更新器仍通过 Releases API 按频道选择资产，不依赖单一 `Latest` 下载入口。

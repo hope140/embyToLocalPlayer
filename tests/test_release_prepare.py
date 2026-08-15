@@ -15,6 +15,17 @@ def _powershell():
     return shutil.which("pwsh") or shutil.which("powershell")
 
 
+def _write_embedded_runtime_fixture(parent: Path) -> Path:
+    runtime = parent / "python_embed-source"
+    (runtime / "Lib" / "site-packages").mkdir(parents=True)
+    (runtime / "python.exe").write_bytes(b"embedded-python-fixture")
+    (runtime / "python39.dll").write_bytes(b"embedded-python-dll-fixture")
+    (runtime / "python39._pth").write_text(
+        "python39.zip\n.\nLib\nLib/site-packages\n", encoding="ascii"
+    )
+    return runtime
+
+
 class ReleasePrepareTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -90,11 +101,14 @@ class ReleasePrepareTests(unittest.TestCase):
             self.skipTest("bundled Python wheels are unavailable")
 
         with tempfile.TemporaryDirectory() as temp:
+            runtime = _write_embedded_runtime_fixture(Path(temp))
             result = self._run(
                 "-Version",
                 "2099.01.01.1-beta",
                 "-OutputDirectory",
                 temp,
+                "-PythonEmbedDirectory",
+                str(runtime),
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             output = Path(temp)
@@ -117,7 +131,12 @@ class ReleasePrepareTests(unittest.TestCase):
             self.assertEqual(plan["checksumAsset"], checksum.name)
             self.assertEqual(plan["packageSha256"], digest)
             self.assertEqual(plan["packageSize"], archive.stat().st_size)
-            self.assertIn("# ETLP Release 发布说明草稿", notes_path.read_text(encoding="utf-8"))
+            notes = notes_path.read_text(encoding="utf-8")
+            self.assertIn("# ETLP beta 2099.01.01.1-beta", notes)
+            self.assertIn("Python 3.9 x86 embedded runtime", notes)
+            self.assertIn("不会在运行时联网下载依赖", notes)
+            self.assertNotIn("发布说明草稿", notes)
+            self.assertNotIn("请在此处补充", notes)
 
 
 if __name__ == "__main__":

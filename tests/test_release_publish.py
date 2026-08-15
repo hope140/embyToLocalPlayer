@@ -13,6 +13,17 @@ def powershell():
     return shutil.which("pwsh") or shutil.which("powershell")
 
 
+def _write_embedded_runtime_fixture(parent: Path) -> Path:
+    runtime = parent / "python_embed-source"
+    (runtime / "Lib" / "site-packages").mkdir(parents=True)
+    (runtime / "python.exe").write_bytes(b"embedded-python-fixture")
+    (runtime / "python39.dll").write_bytes(b"embedded-python-dll-fixture")
+    (runtime / "python39._pth").write_text(
+        "python39.zip\n.\nLib\nLib/site-packages\n", encoding="ascii"
+    )
+    return runtime
+
+
 class ReleasePublishTests(unittest.TestCase):
     def run_script(self, *arguments):
         shell = powershell()
@@ -60,6 +71,7 @@ class ReleasePublishTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)
+            runtime = _write_embedded_runtime_fixture(output)
             prepare = subprocess.run(
                 [
                     shell,
@@ -73,6 +85,8 @@ class ReleasePublishTests(unittest.TestCase):
                     "2099.01.01.2-beta",
                     "-OutputDirectory",
                     str(output),
+                    "-PythonEmbedDirectory",
+                    str(runtime),
                 ],
                 cwd=ROOT,
                 capture_output=True,

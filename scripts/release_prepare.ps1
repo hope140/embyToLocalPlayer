@@ -6,7 +6,8 @@ param(
     [string]$ReleaseVersion,
     [ValidateSet('beta', 'stable')]
     [string]$Channel,
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [string]$PythonEmbedDirectory
 )
 
 Set-StrictMode -Version Latest
@@ -77,6 +78,51 @@ function Read-ZipEntryText {
     }
     finally {
         $archive.Dispose()
+    }
+}
+
+function Get-ZipEntryNames {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ArchivePath
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $names = @()
+        foreach ($entry in $archive.Entries) {
+            if (-not [string]::IsNullOrWhiteSpace($entry.FullName)) {
+                $names += $entry.FullName.Replace('\', '/').TrimStart('/')
+            }
+        }
+        return $names
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
+
+function Assert-PackageRuntime {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ArchivePath
+    )
+
+    $entryNames = @(Get-ZipEntryNames -ArchivePath $ArchivePath)
+    $lowerNames = @($entryNames | ForEach-Object { ([string]$_).ToLowerInvariant() })
+    foreach ($requiredEntry in @(
+        'python_embed/python.exe',
+        'python_embed/python39.dll',
+        'python_embed/python39._pth'
+    )) {
+        if ($lowerNames -notcontains $requiredEntry) {
+            throw "发布包缺少 Python embedded 运行时文件：$requiredEntry"
+        }
+    }
+    $wheelCount = @($lowerNames | Where-Object { $_ -match '^third_party/[^/]+\.whl$' }).Count
+    if ($wheelCount -lt 1) {
+        throw '发布包缺少 third_party/*.whl 依赖文件。'
     }
 }
 
@@ -158,7 +204,14 @@ try {
     Write-Output "==> commit: $commit"
     Write-Output "==> output: $OutputDirectory"
 
-    & $wrapper -OutputDirectory $OutputDirectory -ReleaseVersion $ReleaseVersion
+    $packageArguments = @{
+        OutputDirectory = $OutputDirectory
+        ReleaseVersion = $ReleaseVersion
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PythonEmbedDirectory)) {
+        $packageArguments.PythonEmbedDirectory = $PythonEmbedDirectory
+    }
+    & $wrapper @packageArguments
     $wrapperExitCode = $LASTEXITCODE
     if ($wrapperExitCode -ne 0) {
         throw "频道打包失败，退出码：$wrapperExitCode"
@@ -188,6 +241,7 @@ try {
     }
     Assert-PackageMetadata -ArchivePath $archivePath -ExpectedChannel $Channel `
         -ExpectedVersion $ReleaseVersion -ExpectedCommitShort $commitShort
+    Assert-PackageRuntime -ArchivePath $archivePath
 
     $plan = [ordered]@{
         schema = 1
@@ -220,32 +274,47 @@ try {
     [System.IO.File]::WriteAllText($planPath, $planJson + [Environment]::NewLine, $utf8NoBom)
 
     $sizeMiB = ([double]$archiveInfo.Length / 1MB).ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
+    if ($Channel -eq 'beta') {
+        $channelPosition = 'beta 是测试频道，用于先行验证新版本；遇到问题时请保留旧包并反馈日志。'
+    }
+    else {
+        $channelPosition = 'stable 是默认稳定频道；beta 用于先行验证，稳定用户应优先选择 stable。'
+    }
     $notes = @(
-        '# ETLP Release 发布说明草稿',
+        "# ETLP $Channel $ReleaseVersion",
         '',
-        '> 此文件由 `scripts/release_prepare.ps1` 在本地生成，仅供审核；脚本不会 push、创建 tag 或发布 GitHub Release。',
-        '',
-        '## 发布信息',
+        '## 版本信息',
         '',
         "- 频道：$Channel",
         "- 版本：$ReleaseVersion",
         "- 分支：$branch",
         ('- Commit：`{0}`' -f $commit),
-        ('- 正式包：`{0}`（{1} MiB）' -f $packageAsset, $sizeMiB),
+        ('- ZIP：`{0}`（{1} MiB，{2} bytes）' -f $packageAsset, $sizeMiB, $archiveInfo.Length),
         ('- SHA-256：`{0}`' -f $archiveHash),
-        ('- 校验文件：`{0}`' -f $checksumAsset),
+        ('- SHA-256 文件：`{0}`' -f $checksumAsset),
         '',
-        '## 发布前检查',
+        '## 包内内容',
         '',
-        '- [ ] 确认 Release tag 指向上面的 commit。',
-        "- [ ] $Channel 频道的 Release 类型和版本后缀符合仓库约定。",
-        '- [ ] 上传 ZIP 与同名 `.sha256` sidecar，并回读远端文件核对 SHA-256。',
-        '- [ ] 确认没有把 beta 资产混入 stable 正式 Release。',
-        '- [ ] 完成实际客户端安装/更新验收后，再单独执行远端发布步骤。',
+        '- ZIP 自带 Windows Python 3.9 x86 embedded runtime，用户不需要另行安装 Python。',
+        '- `third_party/*.whl` 随包提供项目依赖；首次启动只从包内 wheel 在本地准备依赖，不会在运行时联网下载依赖。',
+        '- 根目录提供 `embyToLocalPlayer_debug.bat`，可启动服务或执行频道更新。',
         '',
-        '## 变更摘要',
+        '## 安装与更新',
         '',
-        '- 请在此处补充本次面向用户的中文变更说明。'
+        "1. 下载 `$packageAsset` 和 `$checksumAsset`，使用 SHA-256 校验文件确认 ZIP 完整。",
+        '2. 将 ZIP 解压到新的英文路径；更新已有安装时替换程序文件，并保留自己的配置备份。',
+        '3. 运行根目录 `embyToLocalPlayer_debug.bat`，选择 `1` 在当前窗口启动；选择 `6` 检查并安装当前频道更新。',
+        '4. 更新器会先验证 SHA-256 和包内发布清单，验证成功后才替换旧包。',
+        '',
+        '## 频道定位',
+        '',
+        "- $channelPosition",
+        '',
+        '## 已知限制',
+        '',
+        '- 自带运行时面向 Windows 32 位 Python 3.9；本 ZIP 不作为 macOS/Linux 安装包。',
+        '- 更新功能需要访问 GitHub Release；播放功能仍依赖 Emby/Jellyfin、播放器和本机路径映射配置。',
+        '- beta 版本优先用于测试，可能包含尚未在所有播放器和服务器组合中验证的改动。'
     )
     [System.IO.File]::WriteAllText($notesPath, ($notes -join [Environment]::NewLine) + [Environment]::NewLine, $utf8NoBom)
 

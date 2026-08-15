@@ -65,6 +65,51 @@ function Read-ZipEntryText {
     }
 }
 
+function Get-ZipEntryNames {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ArchivePath
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $names = @()
+        foreach ($entry in $archive.Entries) {
+            if (-not [string]::IsNullOrWhiteSpace($entry.FullName)) {
+                $names += $entry.FullName.Replace('\', '/').TrimStart('/')
+            }
+        }
+        return $names
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
+
+function Assert-PackageRuntime {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ArchivePath
+    )
+
+    $entryNames = @(Get-ZipEntryNames -ArchivePath $ArchivePath)
+    $lowerNames = @($entryNames | ForEach-Object { ([string]$_).ToLowerInvariant() })
+    foreach ($requiredEntry in @(
+        'python_embed/python.exe',
+        'python_embed/python39.dll',
+        'python_embed/python39._pth'
+    )) {
+        if ($lowerNames -notcontains $requiredEntry) {
+            Fail "发布包缺少 Python embedded 运行时文件：$requiredEntry"
+        }
+    }
+    $wheelCount = @($lowerNames | Where-Object { $_ -match '^third_party/[^/]+\.whl$' }).Count
+    if ($wheelCount -lt 1) {
+        Fail '发布包缺少 third_party/*.whl 依赖文件。'
+    }
+}
+
 if (-not (Test-Path -LiteralPath $PlanPath -PathType Leaf)) {
     Fail "找不到 release-plan.json：$PlanPath"
 }
@@ -165,6 +210,7 @@ $sidecarAsset = $Matches[2].Trim()
 if ($sidecarHash -ne $actualHash -or $sidecarAsset -ne $expectedPackage) {
     Fail 'SHA-256 sidecar 与实际 ZIP 不一致。'
 }
+Assert-PackageRuntime -ArchivePath $packagePath
 
 $metadata = Read-ZipEntryText -ArchivePath $packagePath -EntryName 'utils/release_info.py'
 $metadataFields = @{
@@ -182,7 +228,16 @@ foreach ($field in $metadataFields.Keys) {
 
 $notesPath = Join-Path $planDirectory 'release-notes.md'
 if (-not (Test-Path -LiteralPath $notesPath -PathType Leaf)) {
-    Fail "找不到中文 Release notes 草稿：$notesPath"
+    Fail "找不到 Release notes 文件：$notesPath"
+}
+$notesText = [System.IO.File]::ReadAllText($notesPath)
+if ([string]::IsNullOrWhiteSpace($notesText)) {
+    Fail 'Release notes 文件为空。'
+}
+foreach ($forbiddenPhrase in @('发布说明草稿', '仅供审核', '请在此处补充', '发布前检查')) {
+    if ($notesText.Contains($forbiddenPhrase)) {
+        Fail "Release notes 仍包含内部占位内容：$forbiddenPhrase"
+    }
 }
 
 $title = "etlp $channel $version"
