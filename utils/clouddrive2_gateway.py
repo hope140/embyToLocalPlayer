@@ -9,6 +9,7 @@ resolution fails; direct/internal registrations never expose that file.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import os
 import secrets
 import threading
@@ -17,11 +18,39 @@ from typing import Callable, Optional
 from urllib.parse import quote, urlparse
 
 from utils.clouddrive2_client import CloudDrive2Client
-from utils.configs import configs
+from utils.configs import MyLogger, configs
 
 
 _FALLBACK_URL_MAX_LENGTH = 8192
 _DEFAULT_REFRESH_PARENT_LEVELS = 3
+logger = MyLogger()
+
+
+def _client_ip(client_key: Optional[str]) -> Optional[str]:
+    """Return the canonical IP portion of an HTTP client binding key."""
+
+    if not isinstance(client_key, str):
+        return None
+    raw_ip, _, _ = client_key.partition('\n')
+    raw_ip = raw_ip.strip()
+    try:
+        return ipaddress.ip_address(raw_ip).compressed
+    except ValueError:
+        return None
+
+
+def _same_loopback_ip(first_client_key: Optional[str],
+                      client_key: Optional[str]) -> bool:
+    """Allow reconnect UA changes only for the exact same loopback IP."""
+
+    first_ip = _client_ip(first_client_key)
+    current_ip = _client_ip(client_key)
+    if not first_ip or first_ip != current_ip:
+        return False
+    try:
+        return ipaddress.ip_address(first_ip).is_loopback
+    except ValueError:
+        return False
 
 
 def _normalise_fallback_url(value: object) -> Optional[str]:
@@ -191,10 +220,17 @@ class CloudDrive2Gateway:
 
         now = self._clock()
         with self._lock:
-            self._prune(now)
             entry = self._entries.get(nonce)
-            if entry is None or entry.expires_at <= now:
+            if entry is None:
+                self._prune(now)
+                logger.info('cd2 gateway lookup status=missing')
                 return None
+            if entry.expires_at <= now:
+                self._entries.pop(nonce, None)
+                self._prune(now)
+                logger.info('cd2 gateway lookup status=expired')
+                return None
+            self._prune(now)
             if entry.first_client_key is None:
                 if client_key is not None:
                     entry = GatewayEntry(
@@ -207,6 +243,9 @@ class CloudDrive2Gateway:
                 return entry
             if client_key is not None and entry.first_client_key == client_key:
                 return entry
+            if _same_loopback_ip(entry.first_client_key, client_key):
+                return entry
+            logger.info('cd2 gateway lookup status=client_mismatch')
             return None
 
     def resolve_entry(self, entry: GatewayEntry) -> Optional[str]:

@@ -95,7 +95,7 @@ class CloudDrive2GatewayTests(unittest.TestCase):
         now[0] = 160.0
         self.assertIsNone(gateway.pop_entry('first nonce'))
 
-    def test_lookup_binds_first_client_and_allows_reconnect_only_for_same_client(self):
+    def test_lookup_allows_user_agent_changes_for_same_loopback_ip(self):
         now = [100.0]
         gateway = gateway_module.CloudDrive2Gateway(
             clock=lambda: now[0], token_urlsafe=lambda _: 'nonce-one', ttl_seconds=60)
@@ -107,10 +107,63 @@ class CloudDrive2GatewayTests(unittest.TestCase):
         self.assertEqual(
             gateway.lookup_or_claim('nonce-one', '127.0.0.1\nmpv').local_path,
             r'C:\Media\movie.mkv')
-        self.assertIsNone(gateway.lookup_or_claim('nonce-one', '127.0.0.1\nother'))
+        self.assertEqual(
+            gateway.lookup_or_claim('nonce-one', '127.0.0.1\nother').local_path,
+            r'C:\Media\movie.mkv')
+        self.assertIsNone(
+            gateway.lookup_or_claim('nonce-one', '127.0.0.2\nother'))
+
+        ipv6_gateway = gateway_module.CloudDrive2Gateway(
+            clock=lambda: now[0], token_urlsafe=lambda _: 'nonce-ipv6', ttl_seconds=60)
+        ipv6_gateway.configure('http://[::1]:58000')
+        ipv6_gateway.register(r'C:\Media\movie.mkv')
+        self.assertIsNotNone(ipv6_gateway.lookup_or_claim('nonce-ipv6', '::1\nmpv'))
+        self.assertIsNotNone(ipv6_gateway.lookup_or_claim('nonce-ipv6', '::1\nother'))
 
         now[0] = 161.0
         self.assertIsNone(gateway.lookup_or_claim('nonce-one', '127.0.0.1\nmpv'))
+
+    def test_lookup_keeps_ip_and_user_agent_binding_for_non_loopback_clients(self):
+        gateway = gateway_module.CloudDrive2Gateway(token_urlsafe=lambda _: 'nonce-lan')
+        gateway.configure('http://127.0.0.1:58000')
+        gateway.register(r'C:\Media\movie.mkv')
+
+        self.assertIsNotNone(
+            gateway.lookup_or_claim('nonce-lan', '192.168.1.10\nmpv'))
+        self.assertIsNone(
+            gateway.lookup_or_claim('nonce-lan', '192.168.1.10\nother'))
+        self.assertIsNone(
+            gateway.lookup_or_claim('nonce-lan', '192.168.1.11\nmpv'))
+
+    def test_lookup_logs_redacted_missing_expired_and_client_mismatch(self):
+        now = [100.0]
+        gateway = gateway_module.CloudDrive2Gateway(
+            clock=lambda: now[0], token_urlsafe=lambda _: 'nonce-expired', ttl_seconds=60)
+        gateway.configure('http://127.0.0.1:58000')
+        gateway.register(r'C:\secret\movie.mkv')
+        with mock.patch.object(gateway_module.logger, 'info') as log:
+            self.assertIsNone(gateway.lookup_or_claim(
+                'missing-secret-nonce', '192.168.1.10\nsecret-user-agent'))
+
+            now[0] = 160.0
+            self.assertIsNone(gateway.lookup_or_claim(
+                'nonce-expired', '192.168.1.10\nsecret-user-agent'))
+
+            now[0] = 200.0
+            gateway.register(r'C:\secret\movie.mkv')
+            self.assertIsNotNone(gateway.lookup_or_claim(
+                'nonce-expired', '192.168.1.10\nsecret-user-agent'))
+            self.assertIsNone(gateway.lookup_or_claim(
+                'nonce-expired', '192.168.1.10\nanother-secret-user-agent'))
+
+        messages = '\n'.join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn('cd2 gateway lookup status=missing', messages)
+        self.assertIn('cd2 gateway lookup status=expired', messages)
+        self.assertIn('cd2 gateway lookup status=client_mismatch', messages)
+        for secret in (
+                'missing-secret-nonce', 'secret-user-agent',
+                'another-secret-user-agent', r'C:\secret\movie.mkv'):
+            self.assertNotIn(secret, messages)
 
     def test_default_ttl_is_shorter_than_legacy_day(self):
         gateway = gateway_module.CloudDrive2Gateway()

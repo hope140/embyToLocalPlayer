@@ -106,6 +106,17 @@
 - 验证：`utils/http_server.py`、`utils/players.py` 的单实例逻辑，以及 2026-08-12
   一次双 mpv 实际运行中服务端出现的重复 `Playing`/`Stopped` 会话序列。
 
+## 11. CD2 网关 nonce 的续连绑定要兼容本机播放器
+
+- 现象：mpv 在重定向、Range 请求或退出阶段可能使用不同的 User-Agent 继续请求同一个
+  `/cd2/` nonce；如果所有请求都要求完整的 IP+User-Agent 相同，后续请求会被网关返回
+  404，即使首个请求已经成功解析并开始播放。
+- 结论：nonce 首次声明后，非回环客户端仍绑定完整的 IP+规范化 User-Agent；同一回环
+  IP（如 `127.0.0.1` 或 `::1`）允许 User-Agent 变化，但不同 IP 仍拒绝。缺失、过期和
+  客户端绑定不匹配只记录固定的脱敏状态，不记录 nonce、User-Agent、URL、路径或 token。
+- 验证：`utils/clouddrive2_gateway.py` 的 `lookup_or_claim` 和
+  `tests/test_clouddrive2_gateway.py` 的回环、非回环及脱敏日志测试。
+
 ## 不应直接沉淀的内容
 
 - 未能由当前 ETLP 代码、测试或运行结果确认的另一项目规则。
