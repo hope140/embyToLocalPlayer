@@ -11,7 +11,8 @@ from http.server import HTTPServer
 from socketserver import ThreadingMixIn
 
 from utils.data_parser import parse_received_data_emby, parse_received_data_plex, list_episodes
-from utils.clouddrive2_gateway import configure_gateway, gateway
+from utils.clouddrive2_gateway import (CloudDrive2Gateway, GatewayRouteDecision,
+                                       configure_gateway, gateway)
 from utils.downloader import DownloadManager
 from utils.http_security import (ETLP_PROTOCOL_HEADER, bearer_token_valid,
                                  is_loopback_address, media_url_signature_valid,
@@ -508,6 +509,96 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
 
         self._send_local_file(video_path)
 
+    @staticmethod
+    def _cd2_route_decision(entry, resolver):
+        """Build one final CD2/local/fallback decision for a gateway entry."""
+        entry_kind = 'strm' if entry.local_path.lower().endswith('.strm') else 'media'
+        entry_extension = os.path.splitext(entry.local_path)[1].lower().lstrip('.') or 'none'
+        if (entry_extension != 'strm'
+                and entry_extension not in UserScriptRequestHandler.MEDIA_EXTENSIONS):
+            entry_extension = 'other'
+        fallback_url = getattr(entry, 'fallback_url', None)
+        logger.info(f'cd2 gateway entry kind={entry_kind} ext={entry_extension}')
+
+        if entry_kind == 'strm':
+            candidate = UserScriptRequestHandler._cd2_nonlocal_fallback_url(
+                fallback_url)
+            if candidate:
+                return GatewayRouteDecision('nonlocal', candidate, 'fallback')
+            if not getattr(entry, 'allow_local_fallback', False):
+                logger.info('cd2 pointer fallback source=direct status=blocked')
+                return GatewayRouteDecision('missing', source='blocked')
+            candidate = UserScriptRequestHandler._cd2_strm_fallback_url(
+                entry.local_path, source='direct')
+            if candidate:
+                return GatewayRouteDecision('nonlocal', candidate, 'pointer')
+            return GatewayRouteDecision('missing', source='pointer')
+
+        cd2_url = resolver(entry)
+        if cd2_url:
+            logger.info('cd2 gateway resolve kind=media status=success')
+            return GatewayRouteDecision('cd2', cd2_url, 'cd2')
+        logger.info('cd2 gateway resolve kind=media status=failed')
+        if not getattr(entry, 'allow_local_fallback', False):
+            logger.info('cd2 gateway fallback status=blocked')
+            return GatewayRouteDecision('missing', source='blocked')
+
+        media_allowed = UserScriptRequestHandler._is_allowed_media_extension(
+            entry.local_path)
+        local_media_exists = media_allowed and os.path.isfile(entry.local_path)
+        logger.info(
+            f'cd2 local media exists={"yes" if local_media_exists else "no"}')
+        if local_media_exists:
+            return GatewayRouteDecision('local', source='local')
+        candidate = UserScriptRequestHandler._cd2_nonlocal_fallback_url(
+            fallback_url)
+        if candidate:
+            return GatewayRouteDecision('nonlocal', candidate, 'fallback')
+        # The derived media file can be cold while its tiny sibling pointer is
+        # already present.  Keep the existing pointer fallback as a route
+        # decision so repeated player requests do not reread and relog it.
+        strm_path = os.path.splitext(entry.local_path)[0] + '.strm'
+        candidate = UserScriptRequestHandler._cd2_strm_fallback_url(
+            strm_path, source='sibling')
+        if candidate:
+            return GatewayRouteDecision('nonlocal', candidate, 'sibling')
+        return GatewayRouteDecision('missing', source='media')
+
+    @staticmethod
+    def _cd2_route_cache_valid(entry, decision):
+        """Invalidate cached routes when their mounted-file dependency changes."""
+        path = entry.local_path
+        is_strm = path.lower().endswith('.strm')
+        if decision.kind == 'local':
+            return (UserScriptRequestHandler._is_allowed_media_extension(path)
+                    and os.path.isfile(path))
+        if decision.source == 'pointer':
+            return os.path.isfile(path)
+        if decision.source == 'sibling':
+            sibling = os.path.splitext(path)[0] + '.strm'
+            return os.path.isfile(sibling) and not os.path.isfile(path)
+        if decision.kind == 'missing':
+            if is_strm or not UserScriptRequestHandler._is_allowed_media_extension(path):
+                return True
+            return not os.path.isfile(path)
+        if decision.kind == 'nonlocal' and decision.source == 'fallback' and not is_strm:
+            return not os.path.isfile(path)
+        return True
+
+    @staticmethod
+    def _send_cd2_route_decision(handler, entry, decision):
+        if decision.kind in ('cd2', 'nonlocal') and decision.target:
+            handler.send_response(307)
+            handler.send_header('Location', decision.target)
+            handler.send_header('Cache-Control', 'no-store')
+            handler.end_headers()
+            return
+        if decision.kind == 'local':
+            handler._send_local_file(entry.local_path)
+            return
+        handler.send_response(404)
+        handler.end_headers()
+
     def send_cd2_file(self):
         parsed_path = urllib.parse.urlparse(self.path)
         parts = parsed_path.path.split('/')
@@ -517,43 +608,83 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
+        entry_kind = 'strm' if entry.local_path.lower().endswith('.strm') else 'media'
+        entry_extension = os.path.splitext(entry.local_path)[1].lower().lstrip('.') or 'none'
+        if (entry_extension != 'strm'
+                and entry_extension not in UserScriptRequestHandler.MEDIA_EXTENSIONS):
+            entry_extension = 'other'
+        fallback_url = getattr(entry, 'fallback_url', None)
+        if isinstance(gateway, CloudDrive2Gateway):
+            decision, _ = gateway.resolve_route(
+                nonce,
+                lambda: UserScriptRequestHandler._cd2_route_decision(
+                    entry, gateway.resolve_entry),
+                cache_valid=lambda route: UserScriptRequestHandler._cd2_route_cache_valid(
+                    entry, route),
+            )
+            UserScriptRequestHandler._send_cd2_route_decision(
+                self, entry, decision)
+            return
+        # Legacy/test gateway doubles do not expose the final-decision cache;
+        # preserve their existing per-request diagnostics and behavior.
+        if entry_kind == 'strm':
+            logger.info(f'cd2 gateway entry kind={entry_kind} ext={entry_extension}')
         # A derived local path that is still a .strm pointer cannot be played
         # as media, and its CD2 cloud counterpart (if any) is the same pointer
         # text rather than the media.  Read the pointer and redirect to the
         # real URL inside it, which is the mounted-file fallback applied to
         # .strm files; skip CD2 resolution for this case entirely.
         if entry.local_path.lower().endswith('.strm'):
+            if UserScriptRequestHandler._send_cd2_nonlocal_fallback(
+                    self, fallback_url):
+                return
             if not getattr(entry, 'allow_local_fallback', False):
+                logger.info('cd2 pointer fallback source=direct status=blocked')
                 self.send_response(404)
                 self.end_headers()
                 return
-            if UserScriptRequestHandler._send_cd2_strm_fallback(self, entry.local_path):
+            if UserScriptRequestHandler._send_cd2_strm_fallback(
+                    self, entry.local_path, source='direct'):
                 return
             self.send_response(404)
             self.end_headers()
             return
+        # Legacy/test gateway doubles do not expose the final-decision cache;
+        # preserve their original per-request diagnostics and behavior.
         cd2_url = gateway.resolve_entry(entry)
+        logger.info(f'cd2 gateway entry kind={entry_kind} ext={entry_extension}')
         if cd2_url:
+            logger.info('cd2 gateway resolve kind=media status=success')
             self.send_response(307)
             self.send_header('Location', cd2_url)
             self.send_header('Cache-Control', 'no-store')
             self.end_headers()
             return
+        logger.info('cd2 gateway resolve kind=media status=failed')
         # CD2 is optional.  Keep the old mounted-file path as a transparent
         # fallback when the proxy is offline, unconfigured, or out of scope.
         if not getattr(entry, 'allow_local_fallback', False):
+            logger.info('cd2 gateway fallback status=blocked')
             self.send_response(404)
             self.end_headers()
             return
-        if self._is_allowed_media_extension(entry.local_path) and os.path.isfile(entry.local_path):
+        media_allowed = self._is_allowed_media_extension(entry.local_path)
+        local_media_exists = media_allowed and os.path.isfile(entry.local_path)
+        logger.info(
+            f'cd2 local media exists={"yes" if local_media_exists else "no"}')
+        if local_media_exists:
             self._send_local_file(entry.local_path)
+            return
+        if UserScriptRequestHandler._send_cd2_nonlocal_fallback(
+                self, fallback_url):
             return
         # The derived media file is missing or not a media path (e.g. a cold
         # mount that has not materialized the large file yet).  The tiny
-        # sibling .strm pointer is usually available even then; redirect to
-        # the real URL stored inside it.
+        # sibling .strm pointer is retained only for legacy entries that did
+        # not carry the current playback's non-local fallback URL.
         strm_path = os.path.splitext(entry.local_path)[0] + '.strm'
-        if UserScriptRequestHandler._send_cd2_strm_fallback(self, strm_path):
+        if UserScriptRequestHandler._send_cd2_strm_fallback(
+                self, strm_path, source='sibling'):
             return
         self.send_response(404)
         self.end_headers()
@@ -595,7 +726,14 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             return None
         if any(ord(char) < 32 or ord(char) == 127 for char in candidate):
             return None
-        parsed = urllib.parse.urlparse(candidate)
+        try:
+            parsed = urllib.parse.urlparse(candidate)
+        except ValueError:
+            # Malformed bracketed IPv6 authorities raise from urlparse rather
+            # than returning a rejected ParseResult.  Treat corrupt pointers
+            # like every other unusable .strm body and let the caller return
+            # 404 instead of terminating the request handler.
+            return None
         if parsed.scheme.casefold() not in ('http', 'https') or not parsed.netloc:
             return None
         if parsed.username is not None or parsed.password is not None:
@@ -603,22 +741,87 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         return candidate
 
     @staticmethod
-    def _send_cd2_strm_fallback(handler, local_path):
+    def _cd2_strm_fallback_url(local_path, *, source='direct', log_status=True):
         """Best-effort .strm playback when CD2 resolution is unavailable.
 
-        Redirects the player to the URL stored inside the .strm pointer
-        file, mirroring what the mounted-file fallback does for real media.
-        Returns ``False`` when the file is unreadable or its content is not
-        a usable URL, leaving the caller to answer 404.
+        Returns the URL stored inside the .strm pointer, or ``None`` when the
+        file is unreadable or its content is not usable.  ``log_status`` is
+        disabled for a cached route so repeated player requests do not repeat
+        the detailed fallback diagnostic.
         """
+        source = source if source in ('direct', 'sibling') else 'unknown'
         content = UserScriptRequestHandler._read_strm_content(local_path)
         url = UserScriptRequestHandler._parse_strm_url(content) if content is not None else None
         if not url:
-            logger.info('cd2 strm fallback failed, no usable url in', os.path.basename(local_path))
+            if log_status:
+                logger.info(f'cd2 pointer fallback source={source} status=failed')
+            return None
+        if log_status:
+            logger.info(f'cd2 pointer fallback source={source} status=success')
+        return url
+
+    @staticmethod
+    def _send_cd2_strm_fallback(handler, local_path, *, source='direct',
+                                log_status=True):
+        url = UserScriptRequestHandler._cd2_strm_fallback_url(
+            local_path, source=source, log_status=log_status)
+        if not url:
             return False
-        logger.info('cd2 strm fallback redirect, host', urllib.parse.urlparse(url).netloc)
         handler.send_response(307)
         handler.send_header('Location', url)
+        handler.send_header('Cache-Control', 'no-store')
+        handler.end_headers()
+        return True
+
+    @staticmethod
+    def _cd2_nonlocal_fallback_url(fallback_url, *, log_status=True):
+        """Redirect to the current playback's validated non-local URL.
+
+        Gateway entries normally contain a URL validated at registration time.
+        Repeat the narrow check at the HTTP boundary so test/legacy entries
+        cannot turn this route into an arbitrary redirect.  The URL is returned
+        without logging so a final route decision can be cached before the
+        response is sent.
+        """
+        if not isinstance(fallback_url, str):
+            if log_status:
+                logger.info('cd2 nonlocal fallback status=none')
+            return None
+        candidate = fallback_url.strip()
+        if (not candidate
+                or len(candidate) > UserScriptRequestHandler._STRM_MAX_URL_LENGTH
+                or any(ord(char) < 32 or ord(char) == 127 for char in candidate)):
+            if log_status:
+                logger.info('cd2 nonlocal fallback status=none')
+            return None
+        try:
+            parsed = urllib.parse.urlparse(candidate)
+            valid = (
+                parsed.scheme.casefold() in ('http', 'https')
+                and bool(parsed.netloc)
+                and parsed.username is None
+                and parsed.password is None
+            )
+            if parsed.port is not None:
+                int(parsed.port)
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            if log_status:
+                logger.info('cd2 nonlocal fallback status=none')
+            return None
+        if log_status:
+            logger.info('cd2 nonlocal fallback status=success')
+        return candidate
+
+    @staticmethod
+    def _send_cd2_nonlocal_fallback(handler, fallback_url, *, log_status=True):
+        candidate = UserScriptRequestHandler._cd2_nonlocal_fallback_url(
+            fallback_url, log_status=log_status)
+        if not candidate:
+            return False
+        handler.send_response(307)
+        handler.send_header('Location', candidate)
         handler.send_header('Cache-Control', 'no-store')
         handler.end_headers()
         return True

@@ -2,22 +2,93 @@
 
 The gateway intentionally keeps the URL opaque.  A player receives only a
 random nonce; the local path and CD2 credentials remain in process memory.
-When a request arrives we resolve the CD2 URL just-in-time.  Entries created
-by the configured path_map may fall back to the original mounted file when
+When a request arrives we resolve the CD2 URL just-in-time and retain the
+final route decision briefly for Range/reconnect requests.  Entries created by
+the configured path_map may fall back to the original mounted file when
 resolution fails; direct/internal registrations never expose that file.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import os
 import secrets
 import threading
 import time
 from typing import Callable, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from utils.clouddrive2_client import CloudDrive2Client
-from utils.configs import configs
+from utils.configs import MyLogger, configs
+
+
+_FALLBACK_URL_MAX_LENGTH = 8192
+_DEFAULT_REFRESH_PARENT_LEVELS = 3
+# A player normally makes several requests for one opaque gateway URL while
+# following redirects, probing ranges, and buffering.  Keep a resolved CD2
+# URL briefly so those requests do not repeat the same gRPC lookup.  A failed
+# lookup is cached for much less time because a cold mount may materialize
+# between requests.
+_ROUTE_CACHE_SUCCESS_TTL_SECONDS = 10.0
+_ROUTE_CACHE_FAILURE_TTL_SECONDS = 1.5
+logger = MyLogger()
+
+
+def _client_ip(client_key: Optional[str]) -> Optional[str]:
+    """Return the canonical IP portion of an HTTP client binding key."""
+
+    if not isinstance(client_key, str):
+        return None
+    raw_ip, _, _ = client_key.partition('\n')
+    raw_ip = raw_ip.strip()
+    try:
+        return ipaddress.ip_address(raw_ip).compressed
+    except ValueError:
+        return None
+
+
+def _same_loopback_ip(first_client_key: Optional[str],
+                      client_key: Optional[str]) -> bool:
+    """Allow reconnect UA changes only for the exact same loopback IP."""
+
+    first_ip = _client_ip(first_client_key)
+    current_ip = _client_ip(client_key)
+    if not first_ip or first_ip != current_ip:
+        return False
+    try:
+        return ipaddress.ip_address(first_ip).is_loopback
+    except ValueError:
+        return False
+
+
+def _normalise_fallback_url(value: object) -> Optional[str]:
+    """Accept only a bounded absolute HTTP(S) playback URL.
+
+    The URL is retained only in the in-memory gateway entry.  It is supplied
+    by the parser for the current playback request, never read from a path or
+    logged by the gateway.
+    """
+    if not isinstance(value, str):
+        return None
+    url = value.strip()
+    if not url or len(url) > _FALLBACK_URL_MAX_LENGTH:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in url):
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme.casefold() not in {'http', 'https'} or not parsed.netloc:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        if parsed.port is not None:
+            int(parsed.port)
+    except (TypeError, ValueError):
+        return None
+    return url
 
 
 @dataclass(frozen=True)
@@ -32,6 +103,24 @@ class GatewayEntry:
     # for internal/tests-only URL registration and must never become an
     # arbitrary local-file server.
     allow_local_fallback: bool = False
+    # The original non-local stream URL for this playback request.  It is an
+    # in-memory fallback only and is intentionally absent from diagnostics.
+    fallback_url: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class GatewayRouteDecision:
+    """Final route selected for one validated gateway nonce."""
+
+    kind: str
+    target: Optional[str] = None
+    source: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _DecisionCacheEntry:
+    decision: GatewayRouteDecision
+    expires_at: float
 
 
 class CloudDrive2Gateway:
@@ -44,6 +133,11 @@ class CloudDrive2Gateway:
         self.ttl_seconds = max(60, int(ttl_seconds))
         self._lock = threading.RLock()
         self._entries: dict[str, GatewayEntry] = {}
+        # These caches are keyed by the opaque nonce, never by a local path.
+        # This prevents one playback request from reusing another request's
+        # route or fallback decision.
+        self._decision_cache: dict[str, _DecisionCacheEntry] = {}
+        self._decision_inflight: dict[str, threading.Event] = {}
         self._base_url = ''
         self._client_key = None
         self._client: Optional[CloudDrive2Client] = None
@@ -62,42 +156,66 @@ class CloudDrive2Gateway:
             origin = configs.raw.get('clouddrive2', 'origin', fallback='http://127.0.0.1:19798').strip()
             path_map = configs.raw.get('clouddrive2', 'path_map', fallback='').strip()
             timeout = configs.raw.getfloat('clouddrive2', 'request_timeout_seconds', fallback=2)
+            refresh_parent_levels = configs.raw.get(
+                'clouddrive2', 'refresh_parent_levels',
+                fallback=str(_DEFAULT_REFRESH_PARENT_LEVELS))
+            try:
+                refresh_parent_levels = int(refresh_parent_levels)
+            except (TypeError, ValueError, OverflowError):
+                refresh_parent_levels = _DEFAULT_REFRESH_PARENT_LEVELS
         except (ValueError, TypeError):
+            with self._lock:
+                self._client = None
+                self._client_key = None
+                self._decision_cache.clear()
             return None
         # The gateway receives a local mounted path.  Requiring an explicit
         # mapping prevents a Windows drive path from being sent to CD2 as if
         # it were already a cloud path when the user forgot to configure it.
         if not enabled or not token or not path_map:
+            with self._lock:
+                self._client = None
+                self._client_key = None
+                self._decision_cache.clear()
             return None
-        key = (origin, token, path_map, timeout)
+        key = (origin, token, path_map, timeout, refresh_parent_levels)
         with self._lock:
             if key != self._client_key:
                 self._client = CloudDrive2Client(
                     origin, token, path_map=path_map, request_timeout_seconds=timeout,
-                    logger=getattr(configs, 'logger', None))
+                    logger=getattr(configs, 'logger', None),
+                    refresh_parent_levels=refresh_parent_levels)
                 self._client_key = key
+                # A changed CD2 origin, token, mapping, or refresh setting
+                # must not reuse a URL resolved under the old client.
+                self._decision_cache.clear()
             return self._client
 
-    def register(self, local_path: str, *, allow_local_fallback: bool = False) -> Optional[str]:
+    def register(self, local_path: str, *, allow_local_fallback: bool = False,
+                 fallback_url: Optional[str] = None) -> Optional[str]:
         if not self._base_url or not local_path:
             return None
+        fallback_url = _normalise_fallback_url(fallback_url)
         now = self._clock()
         with self._lock:
             self._prune(now)
             if len(self._entries) >= self.max_entries:
                 oldest = min(self._entries, key=lambda key: self._entries[key].expires_at)
                 self._entries.pop(oldest, None)
+                self._decision_cache.pop(oldest, None)
             for _ in range(3):
                 nonce = self._token_urlsafe(24)
                 if nonce not in self._entries:
                     self._entries[nonce] = GatewayEntry(
                         str(local_path), now + self.ttl_seconds,
                         allow_local_fallback=bool(allow_local_fallback),
+                        fallback_url=fallback_url,
                     )
                     return f'{self._base_url}/cd2/{quote(nonce, safe="")}'
         return None
 
-    def maybe_register(self, local_path: str) -> Optional[str]:
+    def maybe_register(self, local_path: str,
+                       fallback_url: Optional[str] = None) -> Optional[str]:
         """Return an opaque gateway URL when CD2 is configured and resolvable."""
         if not self._base_url or not local_path:
             return None
@@ -116,7 +234,8 @@ class CloudDrive2Gateway:
         # fast path, while the actual request still has a local fallback.
         if not client.map_local_path_to_cloud_path(local_path):
             return None
-        return self.register(local_path, allow_local_fallback=True)
+        return self.register(
+            local_path, allow_local_fallback=True, fallback_url=fallback_url)
 
     def pop_entry(self, nonce: str) -> Optional[GatewayEntry]:
         """Look up a legacy entry name without consuming the URL.
@@ -141,31 +260,119 @@ class CloudDrive2Gateway:
 
         now = self._clock()
         with self._lock:
-            self._prune(now)
             entry = self._entries.get(nonce)
-            if entry is None or entry.expires_at <= now:
+            if entry is None:
+                self._prune(now)
+                logger.info('cd2 gateway lookup status=missing')
                 return None
+            if entry.expires_at <= now:
+                self._entries.pop(nonce, None)
+                self._prune(now)
+                logger.info('cd2 gateway lookup status=expired')
+                return None
+            self._prune(now)
             if entry.first_client_key is None:
                 if client_key is not None:
                     entry = GatewayEntry(
                         entry.local_path, entry.expires_at,
                         allow_local_fallback=entry.allow_local_fallback,
+                        fallback_url=entry.fallback_url,
                         first_client_key=client_key,
                     )
                     self._entries[nonce] = entry
                 return entry
             if client_key is not None and entry.first_client_key == client_key:
                 return entry
+            if _same_loopback_ip(entry.first_client_key, client_key):
+                return entry
+            logger.info('cd2 gateway lookup status=client_mismatch')
             return None
 
     def resolve_entry(self, entry: GatewayEntry) -> Optional[str]:
+        """Resolve one entry without caching a final HTTP route decision."""
         client = self._client_from_config()
         return client.resolve_download_url(entry.local_path) if client else None
+
+    def resolve_route(
+            self, cache_key: Optional[str],
+            resolver: Callable[[], GatewayRouteDecision], *,
+            cache_valid: Optional[Callable[[GatewayRouteDecision], bool]] = None,
+    ) -> tuple[GatewayRouteDecision, bool]:
+        """Compute and cache a final route decision for one nonce.
+
+        The caller must perform ``lookup_or_claim`` before invoking this
+        method.  ``cache_valid`` is evaluated outside the gateway lock so the
+        HTTP layer can invalidate a cached local decision immediately when the
+        mounted file disappears or materializes.  A per-nonce event coalesces
+        concurrent Range/reconnect requests, including negative decisions.
+        """
+        if cache_key is None:
+            return resolver(), False
+
+        while True:
+            now = self._clock()
+            with self._lock:
+                cached = self._decision_cache.get(cache_key)
+                waiter = self._decision_inflight.get(cache_key)
+                if cached is not None and cached.expires_at <= now:
+                    self._decision_cache.pop(cache_key, None)
+                    cached = None
+                if cached is not None:
+                    decision = cached.decision
+                else:
+                    decision = None
+            if (decision is not None
+                    and (cache_valid is None or cache_valid(decision))):
+                return decision, True
+            if decision is not None:
+                with self._lock:
+                    current = self._decision_cache.get(cache_key)
+                    if current is cached:
+                        self._decision_cache.pop(cache_key, None)
+                continue
+            if waiter is not None:
+                waiter.wait()
+                continue
+            with self._lock:
+                # Re-check after the validation work before becoming the
+                # owner, because another request may have filled the cache.
+                if cache_key in self._decision_cache:
+                    continue
+                waiter = self._decision_inflight.get(cache_key)
+                if waiter is None:
+                    waiter = threading.Event()
+                    self._decision_inflight[cache_key] = waiter
+                    generation = self._client_key
+                    break
+            waiter.wait()
+
+        decision: Optional[GatewayRouteDecision] = None
+        completed = False
+        try:
+            decision = resolver()
+            if not isinstance(decision, GatewayRouteDecision):
+                raise TypeError('route resolver returned an invalid decision')
+            completed = True
+            return decision, False
+        finally:
+            with self._lock:
+                current_entry = self._entries.get(cache_key)
+                if (completed and current_entry is not None
+                        and self._client_key == generation
+                        and current_entry.expires_at > self._clock()):
+                    ttl = (_ROUTE_CACHE_SUCCESS_TTL_SECONDS
+                           if decision.kind == 'cd2'
+                           else _ROUTE_CACHE_FAILURE_TTL_SECONDS)
+                    self._decision_cache[cache_key] = _DecisionCacheEntry(
+                        decision, self._clock() + ttl)
+                self._decision_inflight.pop(cache_key, None)
+                waiter.set()
 
     def _prune(self, now: float) -> None:
         expired = [key for key, entry in self._entries.items() if entry.expires_at <= now]
         for key in expired:
             self._entries.pop(key, None)
+            self._decision_cache.pop(key, None)
 
 
 gateway = CloudDrive2Gateway()
@@ -175,11 +382,13 @@ def configure_gateway(base_url: str) -> None:
     gateway.configure(base_url)
 
 
-def maybe_register_strm_cd2_url(local_path: str) -> Optional[str]:
-    return gateway.maybe_register(local_path)
+def maybe_register_strm_cd2_url(
+        local_path: str, fallback_url: Optional[str] = None) -> Optional[str]:
+    return gateway.maybe_register(local_path, fallback_url=fallback_url)
 
 
 __all__ = [
-    'CloudDrive2Gateway', 'GatewayEntry', 'configure_gateway', 'gateway',
+    'CloudDrive2Gateway', 'GatewayEntry', 'GatewayRouteDecision',
+    'configure_gateway', 'gateway',
     'maybe_register_strm_cd2_url',
 ]

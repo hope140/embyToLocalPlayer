@@ -7,6 +7,8 @@
 - `stable` 作为默认稳定分支，`beta` 作为测试分支，`main` 只用于同步上游。
 - 新增统一的频道打包入口：只能从对应分支生成 `etlp-remote-control-stable.zip` 或
   `etlp-remote-control-beta.zip`，并同时生成 `.sha256` sidecar。
+- Windows 频道包现在同时携带 Python 3.9 x86 embedded runtime 与 `third_party/*.whl`；
+  用户不需要单独安装 Python，首次启动只从包内本地准备依赖，不会联网下载依赖。
 - 更新器按安装包内的频道查询 GitHub Releases API，只下载同频道且同时存在 ZIP 与
   sidecar 的 Release 资产；旧版或源码安装继续按 beta 兼容。
 - 为兼容旧版 beta 更新器，stable Latest Release 暂时额外保留旧路径所需的 beta ZIP 和

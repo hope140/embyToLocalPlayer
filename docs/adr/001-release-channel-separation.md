@@ -30,9 +30,14 @@ Latest 指针，不能同时表达 beta 和 stable；如果两个频道共用包
   结尾，stable 版本不以 `-beta` 结尾。两个 wrapper 分别固定传入 beta/stable。
 - 频道使用不同资产名：`etlp-remote-control-beta.zip` 和
   `etlp-remote-control-stable.zip`，各自带同名 `.sha256` sidecar。
+- GitHub 展示规则固定为：stable Release 标记为仓库 `Latest`，beta Release 标记为
+  `Prerelease`；更新器仍按频道查询 Releases API，不把 GitHub 的 `Latest` 当作频道选择依据。
 - `release_info.py` 将频道写入运行包。更新器访问 GitHub Releases API，只选择非 draft、
   同频道 tag 且同时有 ZIP 和 sidecar 的 Release，再下载明确 tag 下的资产，不使用
   `Latest` 地址。
+- 新 Release 可以额外上传 `release-plan.json`。发现该资产时，更新器在下载 ZIP 前校验
+  schema、频道、tag、分支、资产名和 sidecar SHA-256，并在下载后校验包大小；历史 Release
+  没有该资产时仍走原有的三次请求和 SHA-256 兼容路径，避免破坏已存在的发布物。
 - 为兼容已部署的旧 beta 更新器，stable Latest Release 在过渡期额外保留旧路径所需的
   `etlp-remote-control-beta.zip` 和 `.sha256` 兼容资产。它们必须是当前 beta 包的原样副本，
   新更新器不得选择这两个兼容资产。
@@ -48,6 +53,8 @@ Latest 指针，不能同时表达 beta 和 stable；如果两个频道共用包
 ## 已知代价
 
 - 更新器需要额外请求 GitHub Releases API，并依赖每个频道同时上传 ZIP 和 sidecar。
+- 含清单的 Release 会额外请求一个小型 JSON 资产；清单缺失仍可兼容历史 Release，但
+  清单存在且校验失败时更新会失败关闭。
 - 过渡期 stable Release 会多出两个 beta 兼容资产；旧客户端完成一次自举升级后应移除，
   之后 stable Release 恢复只保留 stable 正式资产。
 - API 列表缺少合格资产、tag 不合规或 sidecar 校验失败时更新会失败关闭，用户需要

@@ -24,9 +24,27 @@
   `scripts/package_stable.ps1`，包名为 `etlp-remote-control-stable.zip`。
 - `beta` 是测试频道。只能从 `beta` 运行 `scripts/package_beta.ps1`，版本 tag 以
   `-beta` 结尾，包名为 `etlp-remote-control-beta.zip`。
+- Windows 频道包必须包含 `python_embed/python.exe`、`python_embed/python39.dll`、
+  `python_embed/python39._pth` 和 `third_party/*.whl`。发布包自带 Python 3.9 x86
+  embedded runtime 与依赖，运行时只从包内本地准备依赖，不联网下载；维护者可通过
+  `-PythonEmbedDirectory <目录>` 指定未提交到仓库的本机运行时目录。
 - `main` 只同步上游，不打包、不创建频道 Release，也不作为用户安装入口。
+- GitHub 展示规则固定为：stable Release 是 `Latest`，beta Release 是 `Prerelease`；
+  更新器仍通过 Releases API 按频道选择资产，不依赖单一 `Latest` 下载入口。
+- 发布入口使用 `scripts/release_prepare.ps1` 生成的 `release-plan.json`；
+  `scripts/release_publish.ps1` 默认只做本地校验和 dry-run，只有显式 `-Execute` 才会调用
+  `gh` 创建新 Release，并拒绝覆盖已有 Release。
 - 更新器读取 `utils/release_info.py` 中的频道值，通过 GitHub Releases API 选择同频道且
   同时包含 ZIP 与 `.sha256` 的已发布 tag；旧版或源码安装没有合法频道值时兼容为 beta。
+- `[dev] update_cdn_url` 可选，留空时直连 GitHub；填写时必须是包含且仅包含一个 `{url}`
+  的 HTTPS URL 模板，例如 `https://your-cdn.example/{url}`。启用后 Releases API、checksum
+  sidecar 和 ZIP 请求都套用该模板，非法模板会明确失败。这是用户自选代理，默认不内置
+  `ghproxy`、`ghfast` 等不稳定第三方域名，日志只记录 CDN 是否启用，不打印完整配置值。
+  jsDelivr 适合仓库文件或油猴脚本分发，不能直接承载本项目生成的 Release ZIP；不要将其
+  假设为 Release 资产的默认代理。
+- 新 Release 若包含 `release-plan.json`，更新器会在下载 ZIP 前校验清单的频道、tag、分支、
+  资产名、SHA-256 和 schema；下载后还会校验 ZIP 大小。历史 Release 没有该清单时，继续
+  使用原有的 Releases API、checksum sidecar、ZIP 三次请求和 SHA-256 兼容路径。
 - 旧版 beta 更新器仍请求 `releases/latest/download/etlp-remote-control-beta.zip`；为完成一次性
   自举升级，stable Latest Release 暂时保留同名 beta ZIP 与 `.sha256` 兼容资产。新更新器
   不使用这两个跨 Release 兼容资产。
@@ -93,9 +111,9 @@ flowchart LR
 | `[exe]` | `mpv`、`iina`、`pot` 等 | 播放器可执行文件路径和别名。 |
 | `[emby]` | `player`、`update_progress`、`fullscreen` | 默认播放器、最终进度回传、自动全屏。 |
 | `[src]` / `[dst]` | 同名前缀键 | 把服务端显示路径映射为本地或挂载路径；按配置顺序匹配。 |
-| `[clouddrive2]` | `enable`、`origin`、`api_token`、`path_map`、`request_timeout_seconds` | CloudDrive2 gRPC 和 STRM gateway。Windows/UNC 路径必须有明确 `path_map`。 |
+| `[clouddrive2]` | `enable`、`origin`、`api_token`、`path_map`、`request_timeout_seconds`、`refresh_parent_levels` | CloudDrive2 gRPC 和 STRM gateway。Windows/UNC 路径必须有明确 `path_map`；`refresh_parent_levels` 默认 `3`，控制缺失文件时向上探测的祖先目录层数（范围 `1`–`8`）。 |
 | `[playlist]` | `enable_host`、`version_filter`、`item_limit`、`http_sub_auto_next_ep` | 连续播放范围、版本匹配、条数限制和简易自动下一集。 |
-| `[dev]` | `listen_on_localhost`、`http_server_token`、`strm_*`、`playing_feedback_*`、`force_disk_mode_path` | 本地 HTTP 安全、STRM、本地预热、实时反馈、代理、日志和高级播放策略。 |
+| `[dev]` | `listen_on_localhost`、`http_server_token`、`update_cdn_url`、`strm_*`、`playing_feedback_*`、`force_disk_mode_path` | 本地 HTTP 安全、更新器 CDN、STRM、本地预热、实时反馈、代理、日志和高级播放策略。 |
 | `[remote_control]` | `enable` | 当前 mpv/IINA 的 Emby 控制 WebSocket；默认 `yes`。 |
 
 浏览器脚本的 `webPlayerEnable`、`mountDiskEnable`、继续观看排序/隐藏等状态保存在油猴本地存储，不属于 INI；修改网页端行为时要同时检查脚本和 Python 入口收到的字段。
@@ -105,6 +123,7 @@ flowchart LR
 - `origin` 默认是 `http://127.0.0.1:19798`，指向 CloudDrive2 本机 API，不是 Emby 登录地址。
 - token 优先从 `ETLP_CLOUDDRIVE2_TOKEN` 读取；配置文件中的 `api_token` 只能作为回退来源，禁止提交真实 token。
 - `path_map` 使用 `本地前缀=>云端前缀`，例如 `X:\115=>/115open/115`。没有 token、映射或可用 gRPC 时，gateway 不会登记路径。
+- `refresh_parent_levels` 默认 `3`，直接父目录算第 1 层，用于覆盖“分类→剧名→Season→文件”等目录；非法值回退为 `3`，范围为 `1`–`8`。层数越大，冷目录缺失时可能产生更多刷新请求。
 - gateway URL 只暴露随机 nonce；本地路径和 CloudDrive2 凭据留在进程内存。解析失败必须继续走原挂载文件回退路径；本地回退只接受两类目标：扩展名合法且存在的媒体文件，或 `.strm` 指针文件内容中的首个 http(s) URL（307 重定向）。
 - 不要把 gateway 或本地 HTTP 服务配置为公网媒体服务；其设计目标是本机播放和受控的局部接口。
 

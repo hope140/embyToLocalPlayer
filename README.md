@@ -12,8 +12,42 @@
 
 beta 和 stable 保留相同的 Tampermonkey 脚本身份，安装时只选择一个频道，不要同时安装两份。更新器读取安装包内的频道元数据，只查找对应频道的 Release 资产，不使用跨频道的 `Latest` 下载地址。
 
+GitHub 页面上，stable Release 作为 `Latest` 展示，beta Release 标记为 `Prerelease`；这只影响网页展示，不改变更新器按频道查询资产的规则。
+
 为兼容尚未升级的旧 beta 安装，当前 stable 的 Latest Release 暂时额外保留旧版更新器请求的
 `etlp-remote-control-beta.zip` 和对应 `.sha256` 兼容资产。这两个文件内容仍是 beta 包；新更新器不会跨频道使用它们。
+
+### 维护者本地准备 Release
+
+在 `beta` 或 `stable` 分支的干净工作区中运行：
+
+```powershell
+pwsh -File .\scripts\release_prepare.ps1 -Version <版本>
+```
+
+将 `<版本>` 替换为实际版本号；beta 版本以 `-beta` 结尾，stable 版本不带该后缀。
+脚本会根据当前分支自动确定频道，并校验版本后缀、分支和工作区状态；成功后在默认的
+`publish/` 目录生成对应 ZIP、SHA-256 sidecar、`release-plan.json` 和中文
+`release-notes.md`。Windows 发布包会把 `python_embed` 运行时和 `third_party/*.whl`
+一起打进 ZIP，用户不需要另行安装 Python，运行时也不会联网下载依赖。维护者在本机
+没有仓库根目录 `python_embed/` 时，应显式传入 Python 3.9 x86 embedded runtime 目录：
+
+```powershell
+pwsh -File .\scripts\release_prepare.ps1 -Version <版本> `
+  -PythonEmbedDirectory <Python-3.9-x86-embedded目录>
+```
+
+该命令只准备本地发布材料，不会 push、创建 tag 或创建 GitHub Release。
+
+确认材料后先运行发布预览：
+
+```powershell
+pwsh -File .\scripts\release_publish.ps1 -PlanPath .\publish\release-plan.json
+```
+
+预览会重新校验 ZIP、sidecar、包内频道元数据、当前分支和 commit；只有在 tag 已存在、
+并且明确获得远端发布授权后，才使用 `-Execute` 执行 GitHub Release 创建。该入口不会
+自动创建 tag 或 push 分支，也不会覆盖同名 Release。
 
 ## 开源许可与致谢
 
@@ -45,7 +79,7 @@ beta 和 stable 保留相同的 Tampermonkey 脚本身份，安装时只选择�
 
 1. 安装 Tampermonkey 或 Violentmonkey。
 2. 按需安装一个频道的 [stable 用户脚本](https://raw.githubusercontent.com/hope140/embyToLocalPlayer/stable/user_script/embyToLocalPlayer.user.js) 或 [beta 用户脚本](https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js)，刷新 Emby/Jellyfin 页面。两者不要同时安装。
-3. 从 [hope140 Releases](https://github.com/hope140/embyToLocalPlayer/releases) 选择对应频道的 Release，下载 `etlp-remote-control-stable.zip` 或 `etlp-remote-control-beta.zip` 及其 `.sha256`，解压到英文路径。发布包包含 `embyToLocalPlayer_config.ini`、运行时依赖和 Windows 启动脚本。
+3. 从 [hope140 Releases](https://github.com/hope140/embyToLocalPlayer/releases) 选择对应频道的 Release，下载 `etlp-remote-control-stable.zip` 或 `etlp-remote-control-beta.zip` 及其 `.sha256`，解压到英文路径。发布包包含 `python_embed` 的 Windows Python 3.9 x86 运行时、`third_party/*.whl` 依赖、`embyToLocalPlayer_config.ini` 和 Windows 启动脚本；首次启动只会从包内本地准备依赖，不会联网下载。
 
 ### 2. Windows
 
@@ -96,6 +130,7 @@ origin = http://127.0.0.1:19798
 api_token =
 path_map = X:\115=>/115open/115
 request_timeout_seconds = 2
+refresh_parent_levels = 3
 ```
 
 使用前必须满足：
@@ -104,6 +139,8 @@ request_timeout_seconds = 2
 2. 提供 CloudDrive2 API token。优先设置环境变量 `ETLP_CLOUDDRIVE2_TOKEN`，否则填写 `api_token`；不要把真实 token 提交到仓库。
 3. 为 Windows 盘符或 UNC 路径配置明确的 `path_map`，格式为 `本地前缀=>云端前缀`。它必须和 `[src]/[dst]` 产出的本地挂载路径一致。
 4. ETLP 会把可解析的本地 `.strm` 路径登记到本地短期 `/cd2/<nonce>` gateway，再按需解析 CloudDrive2 URL；解析失败会回退原挂载盘文件，不应把 gateway 当成公网媒体服务。
+
+`refresh_parent_levels` 控制文件未找到时从直接父目录向上探测的最大祖先层数，默认值为 `3`。直接父目录算第 1 层，因此可覆盖常见的“分类→剧名→Season→文件”目录；可配置范围为 `1`–`8`，非法值回退为 `3`。层数越大，冷目录缺失时可能产生更多刷新请求。
 
 没有 token、`path_map` 或可用 gRPC 依赖时，CloudDrive2 gateway 不会接管播放；这不等同于 CloudDrive2 已经配置成功。
 

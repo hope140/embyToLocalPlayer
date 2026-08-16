@@ -9,7 +9,7 @@ import sys
 import zipfile
 from configparser import ConfigParser
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from utils.configs import configs
@@ -34,6 +34,9 @@ CHANNEL_ASSETS = {
         'checksum': 'etlp-remote-control-stable.zip.sha256',
     },
 }
+# New releases may publish this optional metadata asset alongside the package
+# and checksum. Historical releases do not have it and remain valid.
+MANIFEST_ASSET = 'release-plan.json'
 # Compatibility default for callers that used the old parser directly. New
 # downloads always pass the selected channel's asset explicitly.
 PACKAGE_ASSET = CHANNEL_ASSETS['beta']['package']
@@ -41,6 +44,7 @@ CONFIG_PREFIX = 'embyToLocalPlayer_config'
 
 _CHECKSUM_RECORD = re.compile(r'(?P<digest>[0-9a-fA-F]{64}) {2}(?P<filename>\S+)')
 _RELEASE_TAG = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+/\-]{0,127}$')
+_UPDATE_CDN_PLACEHOLDER = '{url}'
 
 
 def _normalise_channel(channel):
@@ -55,6 +59,40 @@ def _release_download_url(tag, asset_name):
     if not isinstance(tag, str) or _RELEASE_TAG.fullmatch(tag) is None:
         raise ValueError(f'unsupported GitHub release tag: {tag!r}')
     return f'https://github.com/{REPOSITORY}/releases/download/{quote(tag, safe="")}/{quote(asset_name, safe="")}'
+
+
+def _validate_update_cdn_url(update_cdn_url):
+    """Validate an optional HTTPS URL template used for updater requests."""
+    if update_cdn_url is None:
+        return None
+    if not isinstance(update_cdn_url, str):
+        raise ValueError('update_cdn_url must be a string')
+    if update_cdn_url == '':
+        return None
+
+    placeholder_count = update_cdn_url.count(_UPDATE_CDN_PLACEHOLDER)
+    if placeholder_count != 1:
+        raise ValueError('update_cdn_url must contain exactly one {url} placeholder')
+    if any(character.isspace() for character in update_cdn_url):
+        raise ValueError('update_cdn_url must be a valid HTTPS URL template')
+
+    try:
+        parsed = urlsplit(update_cdn_url)
+    except ValueError as exc:
+        raise ValueError('update_cdn_url must be a valid HTTPS URL template') from exc
+    if parsed.scheme.casefold() != 'https' or not parsed.netloc:
+        raise ValueError('update_cdn_url must be an absolute HTTPS URL template')
+    if _UPDATE_CDN_PLACEHOLDER in parsed.netloc:
+        raise ValueError('update_cdn_url placeholder must be outside the URL authority')
+    return update_cdn_url
+
+
+def _apply_update_cdn_url(url, update_cdn_url=None):
+    """Return ``url`` directly or apply the validated CDN URL template."""
+    update_cdn_url = _validate_update_cdn_url(update_cdn_url)
+    if update_cdn_url is None:
+        return url
+    return update_cdn_url.replace(_UPDATE_CDN_PLACEHOLDER, url)
 
 
 def select_latest_release(releases, channel):
@@ -93,13 +131,13 @@ def select_latest_release(releases, channel):
         release_id = release.get('id')
         if not isinstance(release_id, int):
             release_id = 0
-        candidates.append((published_at, release_id, tag))
+        candidates.append((published_at, release_id, tag, asset_names))
 
     if not candidates:
         raise ValueError(f'no published {channel} release with matching assets was found')
 
-    _, _, tag = max(candidates)
-    return {
+    _, _, tag, asset_names = max(candidates, key=lambda candidate: candidate[:3])
+    selected = {
         'channel': channel,
         'tag': tag,
         'package_asset': assets['package'],
@@ -107,13 +145,22 @@ def select_latest_release(releases, channel):
         'update_url': _release_download_url(tag, assets['package']),
         'checksum_url': _release_download_url(tag, assets['checksum']),
     }
+    if MANIFEST_ASSET in asset_names:
+        selected.update(
+            {
+                'manifest_asset': MANIFEST_ASSET,
+                'manifest_url': _release_download_url(tag, MANIFEST_ASSET),
+            }
+        )
+    return selected
 
 
-def resolve_update_urls(channel=None):
-    """Resolve immutable package URLs for the installed beta/stable channel."""
+def resolve_update_urls(channel=None, update_cdn_url=None):
+    """Resolve package URLs for the installed channel, optionally via a CDN."""
     channel = _normalise_channel(channel)
+    update_cdn_url = _validate_update_cdn_url(update_cdn_url)
     releases = requests_urllib(
-        RELEASES_API_URL,
+        _apply_update_cdn_url(RELEASES_API_URL, update_cdn_url),
         get_json=True,
         headers={'Accept': 'application/vnd.github+json'},
         timeout=10,
@@ -124,7 +171,17 @@ def resolve_update_urls(channel=None):
             releases = json.loads(releases)
         except json.JSONDecodeError as exc:
             raise ValueError('GitHub releases response is not valid JSON') from exc
-    return select_latest_release(releases, channel)
+    release = select_latest_release(releases, channel)
+    if update_cdn_url is None:
+        return release
+    resolved = {
+        **release,
+        'update_url': _apply_update_cdn_url(release['update_url'], update_cdn_url),
+        'checksum_url': _apply_update_cdn_url(release['checksum_url'], update_cdn_url),
+    }
+    if 'manifest_url' in release:
+        resolved['manifest_url'] = _apply_update_cdn_url(release['manifest_url'], update_cdn_url)
+    return resolved
 
 
 def parse_checksum(checksum_text, expected_asset=PACKAGE_ASSET):
@@ -162,19 +219,92 @@ def calculate_sha256(path, chunk_size=1024 * 1024):
     return digest.hexdigest()
 
 
-def download_verified_update(cwd, channel=None):
+def _validate_release_manifest(
+    manifest_text,
+    *,
+    channel,
+    tag,
+    package_asset,
+    checksum_asset,
+    expected_digest,
+):
+    """Validate optional release metadata and return its parsed fields."""
+    if isinstance(manifest_text, bytes):
+        try:
+            manifest_text = manifest_text.decode('utf-8')
+        except UnicodeDecodeError as exc:
+            raise ValueError('release manifest is not valid UTF-8 text') from exc
+    if not isinstance(manifest_text, str):
+        raise ValueError('release manifest response must be text')
+
+    try:
+        manifest = json.loads(manifest_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError('release manifest is not valid JSON') from exc
+    if not isinstance(manifest, dict):
+        raise ValueError('release manifest must be a JSON object')
+
+    if type(manifest.get('schema')) is not int or manifest['schema'] != 1:
+        raise ValueError('release manifest schema must be 1')
+    if manifest.get('channel') != channel:
+        raise ValueError('release manifest channel does not match selected channel')
+    if manifest.get('version') != tag:
+        raise ValueError('release manifest version does not match release tag')
+    if manifest.get('branch') != channel:
+        raise ValueError('release manifest branch does not match selected channel')
+    if manifest.get('packageAsset') != package_asset:
+        raise ValueError('release manifest packageAsset does not match selected asset')
+    if manifest.get('checksumAsset') != checksum_asset:
+        raise ValueError('release manifest checksumAsset does not match selected asset')
+
+    manifest_digest = manifest.get('packageSha256')
+    if not isinstance(manifest_digest, str) or re.fullmatch(r'[0-9a-fA-F]{64}', manifest_digest) is None:
+        raise ValueError('release manifest packageSha256 must contain 64 hexadecimal characters')
+    manifest_digest = manifest_digest.lower()
+    if manifest_digest != expected_digest:
+        raise ValueError('release manifest packageSha256 does not match checksum sidecar')
+
+    package_size = manifest.get('packageSize')
+    if isinstance(package_size, bool) or not isinstance(package_size, int) or package_size < 0:
+        raise ValueError('release manifest packageSize must be a non-negative integer')
+
+    return {
+        'package_sha256': manifest_digest,
+        'package_size': package_size,
+    }
+
+
+def download_verified_update(cwd, channel=None, update_cdn_url=None):
     """Download and verify the update archive, returning its live archive path."""
     cwd = Path(cwd)
     zip_path = cwd / 'embyToLocalPlayer.zip'
     zip_part_path = Path(f'{zip_path}.part')
     try:
-        release = resolve_update_urls(channel)
+        release = resolve_update_urls(channel, update_cdn_url=update_cdn_url)
         checksum_text = requests_urllib(release['checksum_url'], decode=True)
         expected_digest = parse_checksum(checksum_text, release['package_asset'])
+        manifest = None
+        if release.get('manifest_url'):
+            manifest_text = requests_urllib(release['manifest_url'], decode=True)
+            manifest = _validate_release_manifest(
+                manifest_text,
+                channel=release['channel'],
+                tag=release['tag'],
+                package_asset=release['package_asset'],
+                checksum_asset=release['checksum_asset'],
+                expected_digest=expected_digest,
+            )
 
         requests_urllib(release['update_url'], save_path=str(zip_part_path))
         if not zip_part_path.is_file():
             raise FileNotFoundError('update archive download did not produce a file')
+        if manifest is not None:
+            actual_size = zip_part_path.stat().st_size
+            if actual_size != manifest['package_size']:
+                raise ValueError(
+                    'update archive size mismatch: '
+                    f"expected {manifest['package_size']}, got {actual_size}"
+                )
         actual_digest = calculate_sha256(zip_part_path)
         if actual_digest != expected_digest:
             raise ValueError(
@@ -405,8 +535,10 @@ def main():
     print('#' * 50)
 
     print(f'{configs.script_proxy=}')
+    update_cdn_url = configs.raw.get('dev', 'update_cdn_url', fallback='')
+    print(f'update CDN enabled={bool(update_cdn_url)}')
     print('downloading checksum and archive...')
-    zip_path = download_verified_update(cwd)
+    zip_path = download_verified_update(cwd, update_cdn_url=update_cdn_url)
 
     print('unpacking...')
     prefix = extract_update_archive(zip_path, cwd, ini_example)

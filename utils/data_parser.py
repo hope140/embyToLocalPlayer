@@ -250,7 +250,19 @@ def parse_received_data_emby(received_data):
 
     if mount_disk_mode:  # 肯定不会是 http
         if use_strm_local_path:
-            media_path = translate_path_by_ini(strm_local_media_path(file_path, source_path))
+            local_media_path = translate_path_by_ini(
+                strm_local_media_path(file_path, source_path))
+            if (isinstance(local_media_path, str)
+                    and local_media_path.lower().endswith('.strm')):
+                # No media extension could be derived from the STRM source.
+                # Keep the original non-local stream path and do not expose
+                # the pointer itself through the CD2 gateway.
+                logger.info('strm local path derivation failed, fallback=nonlocal')
+                use_strm_local_path = False
+                mount_disk_mode = False
+                media_path = stream_url
+            else:
+                media_path = local_media_path
         elif is_strm:
             if strm_direct:
                 media_path = translate_path_by_ini(source_path)
@@ -266,7 +278,11 @@ def parse_received_data_emby(received_data):
             media_path = stream_url
 
     strm_cd2_local_path = media_path if use_strm_local_path and not media_path.startswith(('http://', 'https://')) else None
-    strm_cd2_url = maybe_register_strm_cd2_url(strm_cd2_local_path) if strm_cd2_local_path else None
+    strm_cd2_url = (
+        maybe_register_strm_cd2_url(
+            strm_cd2_local_path, fallback_url=stream_url)
+        if strm_cd2_local_path else None
+    )
     use_strm_cd2_url = bool(strm_cd2_url)
     if strm_cd2_url:
         media_path = strm_cd2_url
@@ -796,6 +812,7 @@ def list_episodes(data: dict):
     need_check_inner_sub = {True: -1, False: -3}[bool(data.get('sub_inner_idx'))]
 
     def parse_item(item, order):
+        item_mount_disk_mode = mount_disk_mode
         source_info = item['MediaSources'][0]
         media_source_id = source_info["Id"]
         file_path = item['Path']
@@ -806,7 +823,7 @@ def list_episodes(data: dict):
         )
         item_is_http_source = source_path.lower().startswith(('http://', 'https://'))
         use_strm_local_path = (
-            mount_disk_mode and item_is_strm and item_is_http_source
+            item_mount_disk_mode and item_is_strm and item_is_http_source
             and strm_local_by_file_path
         )
         fake_name = os.path.splitdrive(file_path)[1].replace('/', '__').replace('\\', '__')
@@ -818,9 +835,19 @@ def list_episodes(data: dict):
         if is_http_direct_strm:
             stream_url = source_path
 
-        if mount_disk_mode:  # 肯定不会是 http
+        if item_mount_disk_mode:  # 肯定不会是 http
             if use_strm_local_path:
-                media_path = translate_path_by_ini(strm_local_media_path(file_path, source_path))
+                local_media_path = translate_path_by_ini(
+                    strm_local_media_path(file_path, source_path))
+                if (isinstance(local_media_path, str)
+                        and local_media_path.lower().endswith('.strm')):
+                    logger.info(
+                        'strm local path derivation failed, fallback=nonlocal')
+                    use_strm_local_path = False
+                    item_mount_disk_mode = False
+                    media_path = stream_url
+                else:
+                    media_path = local_media_path
             elif is_strm:
                 if strm_direct:
                     media_path = translate_path_by_ini(source_path)
@@ -835,7 +862,11 @@ def list_episodes(data: dict):
                 media_path = stream_url
 
         strm_cd2_local_path = media_path if use_strm_local_path and not media_path.startswith(('http://', 'https://')) else None
-        strm_cd2_url = maybe_register_strm_cd2_url(strm_cd2_local_path) if strm_cd2_local_path else None
+        strm_cd2_url = (
+            maybe_register_strm_cd2_url(
+                strm_cd2_local_path, fallback_url=stream_url)
+            if strm_cd2_local_path else None
+        )
         use_strm_cd2_url = bool(strm_cd2_url)
         if strm_cd2_url:
             media_path = strm_cd2_url
@@ -852,7 +883,7 @@ def list_episodes(data: dict):
         size = int(source_info.get('Size', 0)) or 0
 
         media_streams = source_info['MediaStreams']
-        subtitle_disk_mode = mount_disk_mode and not use_strm_local_path
+        subtitle_disk_mode = item_mount_disk_mode and not use_strm_local_path
         sub_index, sub_inner_idx, sub_dict = subtitle_checker(
             media_streams, need_check_inner_sub, subtitle_disk_mode)
 
@@ -897,6 +928,7 @@ def list_episodes(data: dict):
             order=order,
             sub_inner_idx=sub_inner_idx,
             source_path=source_path,
+            mount_disk_mode=item_mount_disk_mode,
             use_strm_local_path=use_strm_local_path,
             use_strm_cd2_url=use_strm_cd2_url,
             strm_cd2_local_path=strm_cd2_local_path,

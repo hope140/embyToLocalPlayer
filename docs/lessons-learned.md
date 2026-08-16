@@ -93,6 +93,30 @@
 - 验证：`utils/http_server.py` 的 `_send_cd2_strm_fallback` 及
   `tests/test_clouddrive2_gateway.py` 的 `HttpGatewayRouteTests`、`StrmContentParseTests`。
 
+## 10. mpv 播放器必须保持单实例
+
+- 现象：`one_instance_mode = no` 时，即使第二个 mpv 只短暂启动后立即关闭，也可能
+  让同一个 `PlaySessionId` 的 `Playing/Progress/Stopped` 回传交错。服务端先收到停止，
+  随后旧式 `embyToLocalPlayer` 回传又创建 `Playing`，Emby 控制台会短时间保留旧会话，
+  直到后续播放请求触发清理。
+- 结论：默认开启 `one_instance_mode = yes`，不把播放器多开视为受支持场景。
+  `start_play()` 的运行中保护和 mpv 的 `--one-instance` 参数共同避免多个实例争用同一
+  播放回传状态。若未来需要支持多开，必须先为每个实例隔离 `PlayerManager`、远程控制
+  客户端和实时回传状态。
+- 验证：`utils/http_server.py`、`utils/players.py` 的单实例逻辑，以及 2026-08-12
+  一次双 mpv 实际运行中服务端出现的重复 `Playing`/`Stopped` 会话序列。
+
+## 11. CD2 网关 nonce 的续连绑定要兼容本机播放器
+
+- 现象：mpv 在重定向、Range 请求或退出阶段可能使用不同的 User-Agent 继续请求同一个
+  `/cd2/` nonce；如果所有请求都要求完整的 IP+User-Agent 相同，后续请求会被网关返回
+  404，即使首个请求已经成功解析并开始播放。
+- 结论：nonce 首次声明后，非回环客户端仍绑定完整的 IP+规范化 User-Agent；同一回环
+  IP（如 `127.0.0.1` 或 `::1`）允许 User-Agent 变化，但不同 IP 仍拒绝。缺失、过期和
+  客户端绑定不匹配只记录固定的脱敏状态，不记录 nonce、User-Agent、URL、路径或 token。
+- 验证：`utils/clouddrive2_gateway.py` 的 `lookup_or_claim` 和
+  `tests/test_clouddrive2_gateway.py` 的回环、非回环及脱敏日志测试。
+
 ## 不应直接沉淀的内容
 
 - 未能由当前 ETLP 代码、测试或运行结果确认的另一项目规则。
