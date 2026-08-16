@@ -321,7 +321,7 @@
                 'X-ETLP-Protocol': '1'
             },
             onerror: function (error) {
-                alert(`${url}\n请求错误，本地服务未运行，请查看使用说明。\nhttps://github.com/hope140/embyToLocalPlayer/tree/beta#faq`);
+                alert(`${url}\n请求错误，本地服务未运行，请查看使用说明。\nhttps://github.com/hope140/embyToLocalPlayer/tree/stable#faq`);
                 console.error('请求错误:', error);
             }
         });

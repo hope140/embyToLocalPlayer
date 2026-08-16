@@ -33,6 +33,8 @@ class UserScriptChannelTests(unittest.TestCase):
         self.assertNotIn("releases/latest", source)
         self.assertNotIn("/main/", source)
         self.assertNotIn("/beta/", source)
+        self.assertNotIn("tree/beta", source)
+        self.assertIn("tree/stable#faq", source)
 
     def test_playback_paths_force_refresh_cached_metadata(self):
         source = SCRIPT.read_text(encoding="utf-8")
