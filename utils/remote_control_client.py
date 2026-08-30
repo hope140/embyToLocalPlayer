@@ -11,6 +11,7 @@ import hashlib
 import importlib
 import json
 from pathlib import Path
+import queue
 import socket
 import sys
 import threading
@@ -35,8 +36,26 @@ _BUILTIN_WEBSOCKET_SHA256 = (
     '17b44cc997f5c498e809b22cdf2d9c7a9e71c02c8cc2b6c56e7c2d1239bfa526'
 )
 _CAPABILITIES_RETRY_INTERVAL = 1.0
+_CAPABILITIES_MAX_ATTEMPTS = 3
+_COMMAND_QUEUE_MAXSIZE = 32
+_HEARTBEAT_DEFAULT_INTERVAL = 5.0
+_HEARTBEAT_DEFAULT_TIMEOUT = 5.0
 _PAUSE_CONFIRM_TIMEOUT = 0.5
 _PAUSE_CONFIRM_INTERVAL = 0.02
+
+# websocket-client exposes these values through ``ABNF``.  Keeping the small
+# numeric table local means the optional dependency is still imported lazily
+# and fake/wrapper sockets can use the same control-frame contract.
+_WS_OPCODE_CONTINUATION = 0x0
+_WS_OPCODE_TEXT = 0x1
+_WS_OPCODE_BINARY = 0x2
+_WS_OPCODE_CLOSE = 0x8
+_WS_OPCODE_PING = 0x9
+_WS_OPCODE_PONG = 0xA
+
+
+class _HeartbeatTimeout(ConnectionError):
+    """Raised when a sent WebSocket ping has no matching Pong in time."""
 
 
 def _short_hash(value):
@@ -173,7 +192,9 @@ class RemoteControlClient:
     def __init__(self, data=None, player=None, *, mpv=None, session_api=None,
                  enabled=None, remote_enabled=None,
                  remote_control_enabled=None, ws_factory=None, report_interval=10.0,
-                 heartbeat_interval=20.0, ws_timeout=0.5, reconnect_min=1.0,
+                 heartbeat_interval=_HEARTBEAT_DEFAULT_INTERVAL,
+                 heartbeat_timeout=_HEARTBEAT_DEFAULT_TIMEOUT,
+                 ws_timeout=0.5, reconnect_min=1.0,
                  reconnect_max=30.0, seek_threshold=3.0, snapshot_interval=0.2,
                  clock=None, episodes_by_title=None):
         self.data = data or {}
@@ -197,7 +218,8 @@ class RemoteControlClient:
         self.session_api = session_api or EmbySessionApi(self.data)
         self.ws_factory = ws_factory
         self.report_interval = max(0.1, float(report_interval))
-        self.heartbeat_interval = max(1.0, float(heartbeat_interval))
+        self.heartbeat_interval = max(0.05, float(heartbeat_interval))
+        self.heartbeat_timeout = max(0.05, float(heartbeat_timeout))
         self.ws_timeout = max(0.05, float(ws_timeout))
         self.reconnect_min = max(0.05, float(reconnect_min))
         self.reconnect_max = max(self.reconnect_min, float(reconnect_max))
@@ -208,14 +230,25 @@ class RemoteControlClient:
         self._clock = clock or time.monotonic
         self._stop_event = threading.Event()
         self._thread = None
+        self._report_thread = None
+        self._command_thread = None
         self._ws = None
+        self._generation = 0
+        self._ws_generation = None
         self._ws_lock = threading.RLock()
+        self._snapshot_lock = threading.RLock()
         self._report_lock = threading.RLock()
+        self._report_wakeup = threading.Event()
+        self._stop_report_requested = threading.Event()
+        self._command_queue = queue.Queue(maxsize=_COMMAND_QUEUE_MAXSIZE)
+        self._in_command_worker = False
         self._started = False
         self._stopped_reported = False
         self._session_capabilities_declared = False
         self._initial_playing_reported = False
         self._next_capabilities_attempt_at = 0.0
+        self._capabilities_generation = None
+        self._capabilities_attempt = 0
         self._last_snapshot = None
         self._last_report_at = None
         self._last_snapshot_at = None
@@ -223,13 +256,36 @@ class RemoteControlClient:
         self._last_pause = None
         self._last_playback_rate = 1.0
         self._last_heartbeat_at = None
+        self._last_receive_at = None
+        self._last_ping_at = None
+        self._last_pong_at = None
+        self._pending_ping = None
+        self._pending_ping_at = None
+        self._ping_sequence = 0
+        self._control_frame_supported = False
+        self._last_close_code = None
+        self._last_close_reason_hash = None
+        self._ws_started_at = None
         self._next_connect_at = 0.0
         self._next_snapshot_at = 0.0
         self._backoff = self.reconnect_min
+        self._reconnect_attempt = 0
+        # Direct unit/integration callers historically invoke handle_message
+        # without starting the worker.  Once start() is called, messages are
+        # accepted only from the active socket generation.
+        self._transport_state_required = False
 
     @property
     def thread(self):
         return self._thread
+
+    @property
+    def report_thread(self):
+        return self._report_thread
+
+    @property
+    def command_thread(self):
+        return self._command_thread
 
     @property
     def control_device_id(self):
@@ -240,6 +296,88 @@ class RemoteControlClient:
         """Alias used by callers that treat the control id as a device id."""
 
         return self.control_device_id
+
+    @property
+    def connection_generation(self):
+        """Return the active WebSocket generation for diagnostics/tests."""
+
+        with self._ws_lock:
+            return self._ws_generation
+
+    def _connection_is_current(self, ws, generation):
+        """Check the ``(socket, generation)`` compare-and-clear contract."""
+
+        with self._ws_lock:
+            return (
+                ws is not None
+                and self._ws is ws
+                and self._ws_generation == generation
+            )
+
+    def _current_connection(self):
+        with self._ws_lock:
+            return self._ws, self._ws_generation
+
+    def _connection_diagnostics(self, ws=None, generation=None, now=None):
+        """Build bounded, monotonic WebSocket diagnostics without secrets."""
+
+        now = self._clock() if now is None else float(now)
+        with self._ws_lock:
+            if ws is None:
+                ws = self._ws
+            if generation is None and ws is self._ws:
+                generation = self._ws_generation
+            current = ws is self._ws and self._ws_generation == generation
+            started_at = self._ws_started_at if current else None
+            last_receive_at = self._last_receive_at if current else None
+            last_ping_at = self._last_ping_at if current else None
+            last_pong_at = self._last_pong_at if current else None
+            close_code = self._last_close_code if current else None
+            close_reason_hash = (
+                self._last_close_reason_hash if current else None
+            )
+            control_frames = self._control_frame_supported if current else None
+        def age(timestamp):
+            if timestamp is None:
+                return 'none'
+            return f'{max(0.0, now - timestamp):.3f}'
+        lifetime = 'none'
+        if started_at is not None:
+            lifetime = f'{max(0.0, now - started_at):.3f}'
+        return {
+            'generation': generation if generation is not None else 'none',
+            'lifetime': lifetime,
+            'since_receive': age(last_receive_at),
+            'since_ping': age(last_ping_at),
+            'since_pong': age(last_pong_at),
+            'close_code': close_code if close_code is not None else 'none',
+            'close_reason_hash': close_reason_hash or 'none',
+            'pong_validation': 'enabled' if control_frames else 'unavailable',
+        }
+
+    @staticmethod
+    def _error_label(exc):
+        """Map exceptions to a fixed safe label; never log their message."""
+
+        if isinstance(exc, _HeartbeatTimeout):
+            return 'heartbeat_timeout'
+        if isinstance(exc, ConnectionResetError):
+            return 'connection_reset'
+        if isinstance(exc, (ConnectionAbortedError, BrokenPipeError)):
+            return 'connection_aborted'
+        if isinstance(exc, (socket.timeout, TimeoutError)):
+            return 'timeout'
+        if isinstance(exc, ConnectionError):
+            return 'connection_error'
+        return 'socket_error'
+
+    @staticmethod
+    def _error_number(exc, *names):
+        for name in names:
+            value = getattr(exc, name, None)
+            if isinstance(value, int):
+                return value
+        return 'none'
 
     @property
     def play_session_id(self):
@@ -273,21 +411,42 @@ class RemoteControlClient:
         return factory
 
     def start(self):
-        """Start the state/WebSocket worker, returning whether it started."""
+        """Start the report, command, and WebSocket workers."""
 
         if not self.is_enabled() or self._started:
             return bool(self._started)
         self.ws_factory = self._load_websocket_factory()
         if self.ws_factory is None:
             return False
+        self._discard_pending_commands()
         self._stop_event.clear()
+        self._report_wakeup.clear()
+        self._stop_report_requested.clear()
         self._stopped_reported = False
+        self._transport_state_required = True
         self._started = True
+        self._report_thread = threading.Thread(
+            target=self._report_run, name='emby-report-state', daemon=True,
+        )
+        self._command_thread = threading.Thread(
+            target=self._command_run, name='emby-remote-command', daemon=True,
+        )
         self._thread = threading.Thread(
             target=self._run, name='emby-remote-control', daemon=True,
         )
+        self._report_thread.start()
+        self._command_thread.start()
         self._thread.start()
         return True
+
+    def _discard_pending_commands(self):
+        while True:
+            try:
+                self._command_queue.get_nowait()
+            except queue.Empty:
+                return
+            else:
+                self._command_queue.task_done()
 
     def stop(self, timeout=5.0):
         """Report Stopped, then close the WebSocket and join the worker."""
@@ -302,29 +461,74 @@ class RemoteControlClient:
         # Setting the event first prevents a fresh progress poll from starting
         # after the final Stopped event.
         self._report_stopped()
-        thread = self._thread
-        if thread and thread is not threading.current_thread():
-            thread.join(timeout=max(0.0, float(timeout)))
-        if thread and thread.is_alive():
+        wait_timeout = max(0.0, float(timeout))
+        ws_thread = self._thread
+        report_thread = self._report_thread
+        command_thread = self._command_thread
+        for thread in (ws_thread, report_thread, command_thread):
+            if thread and thread is not threading.current_thread():
+                thread.join(timeout=wait_timeout)
+        if ws_thread and ws_thread.is_alive():
             # A custom test socket or a broken third-party socket may ignore a
             # timeout.  Closing it unblocks recv and lets the daemon exit.
             self._close_ws()
-            thread.join(timeout=max(0.0, float(timeout)))
-        else:
-            self._close_ws()
+            if ws_thread is not threading.current_thread():
+                ws_thread.join(timeout=wait_timeout)
         self._started = False
         self._thread = None
+        self._report_thread = None
+        self._command_thread = None
 
-    def _close_ws(self):
+    def _close_ws(self, ws=None, generation=None):
+        """Close a socket only after an identity-checked state detach.
+
+        Passing ``ws`` and ``generation`` is required for worker-side cleanup.
+        A stale receive loop can still close its own old socket, but it cannot
+        clear or close the current connection registered by a newer loop.
+        """
+
         with self._ws_lock:
-            ws, self._ws = self._ws, None
-        if ws is None:
-            return
+            current_ws = self._ws
+            current_generation = self._ws_generation
+            if ws is None:
+                ws = current_ws
+                generation = current_generation
+            if current_ws is not ws or current_generation != generation:
+                # The old socket is no longer current.  Close it below without
+                # touching any state belonging to the replacement generation.
+                details = self._connection_diagnostics(ws, generation)
+                close_target = not (
+                    current_ws is ws and current_generation != generation
+                )
+            else:
+                details = self._connection_diagnostics(ws, generation)
+                close_target = True
+                self._ws = None
+                self._ws_generation = None
+                self._ws_started_at = None
+                self._last_receive_at = None
+                self._last_ping_at = None
+                self._last_pong_at = None
+                self._pending_ping = None
+                self._pending_ping_at = None
+                self._control_frame_supported = False
+                self._last_close_code = None
+                self._last_close_reason_hash = None
+        if ws is None or not close_target:
+            return False
         try:
             ws.close()
         except Exception:
             pass
-        logger.info('remote-control websocket status=closed')
+        logger.info(
+            'remote-control websocket status=closed '
+            f"generation={details['generation']} "
+            f"lifetime={details['lifetime']} "
+            f"pong_validation={details['pong_validation']} "
+            f"close_code={details['close_code']} "
+            f"close_reason_hash={details['close_reason_hash']}"
+        )
+        return True
 
     def _connect_ws(self):
         factory = self.ws_factory
@@ -333,6 +537,10 @@ class RemoteControlClient:
         # websocket-client uses ``header``.  The fallback signatures keep the
         # same client easy to fake in tests and support wrappers using
         # ``headers`` or positional-only URL arguments.
+        # websocket-client 1.8.0's default socket options already enable
+        # SO_KEEPALIVE.  Leave ``sockopt`` unspecified so wrappers remain
+        # compatible; Windows TCP_KEEPIDLE/KEEPINTVL probes are intentionally
+        # not treated as the WebSocket liveness mechanism here.
         call_variants = (
             {'timeout': self.ws_timeout, 'header': self.session_api.websocket_headers},
             {'timeout': self.ws_timeout, 'headers': self.session_api.websocket_headers},
@@ -353,25 +561,63 @@ class RemoteControlClient:
             if last_error:
                 raise last_error
             raise ConnectionError('websocket factory returned no connection')
+        connected_at = self._clock()
         with self._ws_lock:
+            if self._ws is not None:
+                # The current implementation has one worker and one socket.
+                # Refuse an accidental overlapping connection instead of
+                # allowing two receive loops to race over shared state.
+                if ws is not self._ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                raise ConnectionError('websocket connection already active')
+            self._generation += 1
+            generation = self._generation
             self._ws = ws
-        if not self._send_identity(ws):
-            self._close_ws()
+            self._ws_generation = generation
+            self._ws_started_at = connected_at
+            self._last_receive_at = connected_at
+            self._last_ping_at = None
+            self._last_pong_at = None
+            self._pending_ping = None
+            self._pending_ping_at = None
+            self._ping_sequence = 0
+            self._control_frame_supported = bool(
+                callable(getattr(ws, 'recv_data', None))
+                or callable(getattr(ws, 'recv_frame', None))
+            )
+            self._last_close_code = None
+            self._last_close_reason_hash = None
+            self._capabilities_generation = generation
+            self._capabilities_attempt = 0
+            self._session_capabilities_declared = False
+            self._next_capabilities_attempt_at = 0.0
+        if self._stop_event.is_set() or not self._connection_is_current(ws, generation):
+            self._close_ws(ws, generation)
+            raise ConnectionError('websocket connection cancelled')
+        if not self._send_identity(ws, generation):
+            self._close_ws(ws, generation)
             raise ConnectionError('websocket identity send failed')
         logger.info(
             'remote-control websocket connected '
+            f'generation={generation} '
+            f'reconnect_attempt={self._reconnect_attempt} '
             f'device_hash={_short_hash(self.session_api.control_device_id)}'
         )
         # A new WebSocket is a fresh opportunity to resolve the server-side
         # session immediately, even if the previous connection was throttled.
-        self._next_capabilities_attempt_at = 0.0
-        self._declare_capabilities()
-        self._backoff = self.reconnect_min
-        self._next_connect_at = 0.0
-        self._last_heartbeat_at = self._clock()
+        self._declare_capabilities(generation=generation)
+        with self._ws_lock:
+            if self._ws is not ws or self._ws_generation != generation:
+                raise ConnectionError('websocket connection replaced')
+            self._backoff = self.reconnect_min
+            self._next_connect_at = 0.0
+            self._last_heartbeat_at = self._clock()
         return ws
 
-    def _send_identity(self, ws):
+    def _send_identity(self, ws, generation=None):
         # Emby.ApiClient's ApiWebSocket expects a pipe-delimited identity,
         # rather than JSON in Data: ClientName|DeviceId|Version|DeviceName.
         identity = '|'.join((
@@ -387,6 +633,7 @@ class RemoteControlClient:
         logger.info(
             'remote-control websocket identity '
             f'status={"ok" if sent else "failed"} '
+            f'generation={generation if generation is not None else "none"} '
             f'device_hash={_short_hash(self.session_api.control_device_id)}'
         )
         return sent
@@ -398,14 +645,84 @@ class RemoteControlClient:
         except Exception:
             return False
 
-    def _declare_capabilities(self):
+    def _declare_capabilities(self, generation=None):
         now = self._clock()
-        if (
-            self._session_capabilities_declared
-            or not self._initial_playing_reported
-            or now < self._next_capabilities_attempt_at
-        ):
+        ws, current_generation = self._current_connection()
+        if generation is None:
+            generation = current_generation
+        if generation is not None and not self._connection_is_current(ws, generation):
             return False
+        with self._ws_lock:
+            if generation is not None and (
+                self._ws is not ws or self._ws_generation != generation
+            ):
+                return False
+            if self._capabilities_generation != generation:
+                self._capabilities_generation = generation
+                self._capabilities_attempt = 0
+            if (
+                self._session_capabilities_declared
+                or not self._initial_playing_reported
+                or now < self._next_capabilities_attempt_at
+            ):
+                return False
+            attempt = self._capabilities_attempt + 1
+        if attempt > _CAPABILITIES_MAX_ATTEMPTS:
+            with self._ws_lock:
+                if generation is not None and (
+                    self._ws is not ws or self._ws_generation != generation
+                ):
+                    return False
+                self._next_capabilities_attempt_at = float('inf')
+            logger.info(
+                'remote-control capabilities status=exhausted '
+                f'generation={generation if generation is not None else "none"} '
+                f'attempt={self._capabilities_attempt} '
+                'duration_ms=0'
+            )
+            return False
+        with self._ws_lock:
+            if generation is not None and (
+                self._ws is not ws or self._ws_generation != generation
+            ):
+                return False
+            self._capabilities_attempt = attempt
+        started_at = now
+        logger.info(
+            'remote-control capabilities status=start '
+            f'generation={generation if generation is not None else "none"} '
+            f'attempt={attempt}'
+        )
+
+        def finish(status, *, reason=None, session_id=None, retry=True):
+            duration_ms = int(max(0.0, self._clock() - started_at) * 1000)
+            current = True
+            with self._ws_lock:
+                if generation is not None and (
+                    self._ws is not ws or self._ws_generation != generation
+                ):
+                    current = False
+                elif retry and attempt < _CAPABILITIES_MAX_ATTEMPTS:
+                    self._next_capabilities_attempt_at = (
+                        self._clock() + _CAPABILITIES_RETRY_INTERVAL
+                    )
+                else:
+                    self._next_capabilities_attempt_at = float('inf')
+            if not current:
+                return
+            fields = [
+                'remote-control capabilities',
+                f'status={status}',
+                f'generation={generation if generation is not None else "none"}',
+                f'attempt={attempt}',
+                f'duration_ms={duration_ms}',
+            ]
+            if reason:
+                fields.append(f'reason={_safe_label(reason)}')
+            if session_id:
+                fields.append(f'session_hash={_short_hash(session_id)}')
+            logger.info(' '.join(fields))
+
         try:
             # The first Playing report creates the server-side session.  Look
             # it up explicitly before advertising capabilities so stale
@@ -430,11 +747,7 @@ class RemoteControlClient:
                 # storing the concrete id on the API object.
                 session_id = getattr(self.session_api, 'session_id', None)
             if session_id is None or not str(session_id).strip():
-                logger.info(
-                    'remote-control capabilities '
-                    'status=unavailable reason=session_not_found'
-                )
-                self._next_capabilities_attempt_at = now + _CAPABILITIES_RETRY_INTERVAL
+                finish('unavailable', reason='session_not_found')
                 return False
             session_id = str(session_id).strip()
             declare_capabilities = getattr(
@@ -452,31 +765,64 @@ class RemoteControlClient:
                 except Exception:
                     pass
                 declare_capabilities(full=True)
-            self._session_capabilities_declared = True
-            self._next_capabilities_attempt_at = 0.0
+            if generation is not None and not self._connection_is_current(ws, generation):
+                # A declaration response from an old socket must not mark the
+                # replacement socket as capable.
+                return False
+            with self._ws_lock:
+                if generation is not None and (
+                    self._ws is not ws or self._ws_generation != generation
+                ):
+                    return False
+                self._session_capabilities_declared = True
+                self._next_capabilities_attempt_at = 0.0
+            duration_ms = int(max(0.0, self._clock() - started_at) * 1000)
             logger.info(
                 'remote-control capabilities status=declared '
+                f'generation={generation if generation is not None else "none"} '
+                f'attempt={attempt} duration_ms={duration_ms} '
                 f'session_hash={_short_hash(session_id)}'
             )
             return True
         except Exception:
-            # Keep this retryable on reconnect while avoiding IDs, URLs and
-            # credentials that an exception message might contain.
-            logger.info(
-                'remote-control capabilities '
-                'status=failed reason=declaration_error'
-            )
-            self._next_capabilities_attempt_at = now + _CAPABILITIES_RETRY_INTERVAL
+            # Keep this retryable on the same generation for a bounded number
+            # of attempts while avoiding IDs, URLs and credentials that an
+            # exception message might contain.
+            finish('failed', reason='declaration_error')
             return False
 
-    def _schedule_reconnect(self):
-        self._next_connect_at = self._clock() + self._backoff
-        self._backoff = min(self.reconnect_max, self._backoff * 2)
-        # Capabilities belong to the active Emby control connection.  A fresh
-        # socket must advertise them again, while any failed declaration stays
-        # retryable on the same socket through the throttled path above.
-        self._session_capabilities_declared = False
-        self._close_ws()
+    def _schedule_reconnect(self, ws=None, generation=None):
+        """Schedule one reconnect, guarded by the active socket identity."""
+
+        now = self._clock()
+        with self._ws_lock:
+            current_ws, current_generation = self._ws, self._ws_generation
+            if ws is None:
+                ws, generation = current_ws, current_generation
+            elif current_ws is not ws or current_generation != generation:
+                # A stale receive loop may finish after a newer connection is
+                # installed.  It must not reset the newer connection's backoff
+                # or capability state.
+                return False
+            delay = self._backoff
+            self._next_connect_at = now + delay
+            self._backoff = min(self.reconnect_max, self._backoff * 2)
+            self._reconnect_attempt += 1
+            # Capabilities belong to the active Emby control connection.  A
+            # fresh socket must advertise them again, while any failed
+            # declaration stays retryable on the same socket through the
+            # throttled path above.
+            self._session_capabilities_declared = False
+        details = self._connection_diagnostics(ws, generation, now=now)
+        self._close_ws(ws, generation)
+        logger.info(
+            'remote-control websocket reconnect '
+            f'generation={details["generation"]} '
+            f'attempt={self._reconnect_attempt} '
+            f'backoff={delay:.3f} '
+            f'lifetime={details["lifetime"]}'
+        )
+        return True
 
     @staticmethod
     def _is_timeout_error(exc):
@@ -485,75 +831,427 @@ class RemoteControlClient:
         name = type(exc).__name__.lower()
         return 'timeout' in name or 'timedout' in name
 
-    def _recv_ws(self, ws):
+    @staticmethod
+    def _opcode(value):
+        if isinstance(value, int):
+            return value
+        normalized = str(value or '').strip().lower()
+        return {
+            'continuation': _WS_OPCODE_CONTINUATION,
+            'text': _WS_OPCODE_TEXT,
+            'binary': _WS_OPCODE_BINARY,
+            'close': _WS_OPCODE_CLOSE,
+            'ping': _WS_OPCODE_PING,
+            'pong': _WS_OPCODE_PONG,
+        }.get(normalized)
+
+    @staticmethod
+    def _payload_bytes(value):
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, bytearray):
+            return bytes(value)
+        if value is None:
+            return b''
+        return str(value).encode('utf-8', 'replace')
+
+    @staticmethod
+    def _close_frame_details(data):
+        """Return a numeric close code and a hash-only reason diagnostic."""
+
+        code = None
+        reason = None
+        if isinstance(data, dict):
+            code = _field(data, 'code') or _field(data, 'Code')
+            reason = _field(data, 'reason') or _field(data, 'Reason')
+        else:
+            raw = RemoteControlClient._payload_bytes(data)
+            if len(raw) >= 2:
+                code = int.from_bytes(raw[:2], 'big')
+                reason = raw[2:].decode('utf-8', 'replace')
         try:
-            return ws.recv()
+            code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code = None
+        return code, _short_hash(reason) if reason else None
+
+    def _capture_close_attributes(self, ws, generation):
+        """Use wrapper-provided close metadata when no close frame was read."""
+
+        code = getattr(ws, 'close_code', None)
+        if code is None:
+            code = getattr(ws, 'close_status', None)
+        reason = getattr(ws, 'close_reason', None)
+        if reason is None:
+            reason = getattr(ws, 'reason', None)
+        try:
+            code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code = None
+        reason_hash = _short_hash(reason) if reason else None
+        if code is None and reason_hash is None:
+            return
+        with self._ws_lock:
+            if self._ws is ws and self._ws_generation == generation:
+                if self._last_close_code is None:
+                    self._last_close_code = code
+                if self._last_close_reason_hash is None:
+                    self._last_close_reason_hash = reason_hash
+
+    def _mark_received(self, ws, generation, now=None):
+        now = self._clock() if now is None else float(now)
+        with self._ws_lock:
+            if self._ws is not ws or self._ws_generation != generation:
+                return False
+            self._last_receive_at = now
+        return True
+
+    def _mark_pong(self, ws, generation, data, now=None):
+        now = self._clock() if now is None else float(now)
+        with self._ws_lock:
+            if self._ws is not ws or self._ws_generation != generation:
+                return False
+            self._last_pong_at = now
+            pending = self._pending_ping
+            if pending is not None and (
+                self._payload_bytes(data) == self._payload_bytes(pending)
+            ):
+                self._pending_ping = None
+                self._pending_ping_at = None
+        return True
+
+    def _consume_ws_frame(self, ws, generation, frame, *, respond_to_ping=False):
+        """Consume one control/data frame and return application payloads."""
+
+        if frame is None:
+            return None
+        opcode = None
+        data = frame
+        if isinstance(frame, tuple) and len(frame) >= 2:
+            opcode, data = frame[0], frame[1]
+        elif not isinstance(frame, (str, bytes, bytearray, dict)):
+            opcode = getattr(frame, 'opcode', None)
+            data = getattr(frame, 'data', frame)
+        opcode = self._opcode(opcode)
+        self._mark_received(ws, generation)
+        if opcode == _WS_OPCODE_PONG:
+            self._mark_pong(ws, generation, data)
+            return None
+        if opcode == _WS_OPCODE_PING:
+            if respond_to_ping:
+                pong = getattr(ws, 'pong', None)
+                if callable(pong):
+                    pong(data)
+            return None
+        if opcode == _WS_OPCODE_CLOSE:
+            code, reason_hash = self._close_frame_details(data)
+            with self._ws_lock:
+                if self._ws is ws and self._ws_generation == generation:
+                    self._last_close_code = code
+                    self._last_close_reason_hash = reason_hash
+            raise ConnectionError('remote-control close frame')
+        # A data frame (or a recv()-only wrapper with no opcode) is returned to
+        # the command decoder.  Continuation handling remains websocket-client
+        #'s responsibility, as recv_data() already reassembles it.
+        return data
+
+    def _recv_ws(self, ws, generation=None):
+        if generation is None:
+            _, generation = self._current_connection()
+        try:
+            recv_data = getattr(ws, 'recv_data', None)
+            if callable(recv_data):
+                auto_pong = False
+                try:
+                    frame = recv_data(control_frame=True)
+                    # websocket-client 1.8.0's control_frame path handles
+                    # incoming PING frames itself.  Do not send a duplicate
+                    # Pong here.
+                    auto_pong = True
+                except TypeError:
+                    # A small wrapper may expose recv_data() without the
+                    # websocket-client keyword while still returning frames.
+                    try:
+                        frame = recv_data(True)
+                    except TypeError:
+                        frame = recv_data()
+                return self._consume_ws_frame(
+                    ws, generation, frame, respond_to_ping=not auto_pong,
+                )
+            recv_frame = getattr(ws, 'recv_frame', None)
+            if callable(recv_frame):
+                return self._consume_ws_frame(
+                    ws, generation, recv_frame(), respond_to_ping=True,
+                )
+            # Compatibility path for existing simple fakes/wrappers that only
+            # expose recv().  Such a socket cannot prove Pong matching, so the
+            # bounded heartbeat check is enabled only when control frames are
+            # available; send/recv errors still trigger reconnects.
+            return self._consume_ws_frame(
+                ws, generation, ws.recv(), respond_to_ping=True,
+            )
         except Exception as exc:
             if self._is_timeout_error(exc):
                 return None
             raise
 
-    def _heartbeat(self, ws, now):
-        if now - (self._last_heartbeat_at or 0) < self.heartbeat_interval:
-            return
+    def _heartbeat(self, ws, now, generation=None):
+        # Emby can mark a session ineligible as soon as its server-side
+        # command path is gone.  The client observes a separate event: the
+        # receive call must first reach its timeout and the Pong deadline must
+        # then expire.  With the defaults (5s interval, 5s deadline, 0.5s
+        # receive timeout and 50ms loop wait), this is a bounded ~10.55s local
+        # observation window; it cannot identify which network component sent
+        # a TCP reset.
+        if self._stop_event.is_set():
+            return False
+        if generation is None:
+            _, generation = self._current_connection()
+        if not self._connection_is_current(ws, generation):
+            return False
+        with self._ws_lock:
+            pending_at = self._pending_ping_at
+            pending = self._pending_ping
+            last_heartbeat_at = self._last_heartbeat_at
+            control_frames = self._control_frame_supported
+        if pending is not None and pending_at is not None:
+            if now - pending_at >= self.heartbeat_timeout:
+                with self._ws_lock:
+                    if (
+                        self._ws is ws
+                        and self._ws_generation == generation
+                        and self._pending_ping == pending
+                        and self._pending_ping_at == pending_at
+                    ):
+                        raise _HeartbeatTimeout(
+                            'remote-control Pong deadline exceeded'
+                        )
+            return False
+        if last_heartbeat_at is not None and (
+            now - last_heartbeat_at < self.heartbeat_interval
+        ):
+            return False
         sent = False
-        try:
-            ping = getattr(ws, 'ping', None)
-            if ping:
+        ping_payload = None
+        ping = getattr(ws, 'ping', None)
+        if callable(ping):
+            with self._ws_lock:
+                self._ping_sequence += 1
+                ping_payload = (
+                    f'etlp-{generation}-{self._ping_sequence}'
+                ).encode('ascii')
+            try:
+                ping(ping_payload)
+                sent = True
+            except TypeError:
+                # Existing wrappers/fakes may expose ping() without a payload.
                 ping()
                 sent = True
-        except Exception:
-            pass
-        if not sent:
+                ping_payload = None
+        else:
+            # Keep the historical application-level fallback for wrappers that
+            # do not expose ping().  It is not treated as a Pong acknowledgement.
             sent = self._send_ws(ws, {'MessageType': 'KeepAlive', 'Data': ''})
+            ping_payload = None
         if not sent:
             raise ConnectionError('remote-control heartbeat failed')
-        self._last_heartbeat_at = now
+        with self._ws_lock:
+            if self._ws is not ws or self._ws_generation != generation:
+                return False
+            self._last_heartbeat_at = now
+            self._last_ping_at = now
+            if control_frames and ping_payload is not None:
+                self._pending_ping = ping_payload
+                self._pending_ping_at = now
+            else:
+                self._pending_ping = None
+                self._pending_ping_at = None
+        return True
+
+    def _log_disconnect(self, exc, ws, generation, now=None):
+        self._capture_close_attributes(ws, generation)
+        details = self._connection_diagnostics(ws, generation, now=now)
+        errno = self._error_number(exc, 'errno')
+        winerror = self._error_number(exc, 'winerror', 'win_errno')
+        logger.info(
+            'remote-control websocket status=disconnected '
+            f"generation={details['generation']} "
+            f"lifetime={details['lifetime']} "
+            f"since_receive={details['since_receive']} "
+            f"since_ping={details['since_ping']} "
+            f"since_pong={details['since_pong']} "
+            f"pong_validation={details['pong_validation']} "
+            f'error_type={_safe_label(type(exc).__name__)} '
+            f'error_label={self._error_label(exc)} '
+            f'errno={errno} winerror={winerror} '
+            f"close_code={details['close_code']} "
+            f"close_reason_hash={details['close_reason_hash']}"
+        )
+
+    def _enqueue_ws_message(self, raw_message, ws, generation):
+        if not self._connection_is_current(ws, generation):
+            message_type, _ = self._decode_message(raw_message)
+            logger.info(
+                'remote-control command filtered '
+                f'reason=stale_websocket_generation '
+                f'type={_message_type_label(message_type)}'
+            )
+            return False
+        message_type, _ = self._decode_message(raw_message)
+        message_type_label = _message_type_label(message_type)
+        try:
+            self._command_queue.put_nowait((raw_message, ws, generation))
+        except queue.Full:
+            logger.info(
+                'remote-control command filtered '
+                f'reason=command_queue_full type={message_type_label} '
+                f'generation={generation}'
+            )
+            return False
+        return True
+
+    def _consume_queued_command(self, item):
+        raw_message, ws, generation = item
+        if not self._connection_is_current(ws, generation):
+            message_type, _ = self._decode_message(raw_message)
+            logger.info(
+                'remote-control command filtered '
+                f'reason=stale_websocket_generation '
+                f'type={_message_type_label(message_type)}'
+            )
+            return False
+        self._in_command_worker = True
+        try:
+            return self.handle_message(
+                raw_message, _ws=ws, _generation=generation,
+            )
+        finally:
+            self._in_command_worker = False
+
+    def _command_run(self):
+        """Execute queued WebSocket commands outside the I/O worker."""
+
+        while not self._stop_event.is_set():
+            try:
+                command_item = self._command_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if self._stop_event.is_set():
+                self._command_queue.task_done()
+                continue
+            try:
+                self._consume_queued_command(command_item)
+            except Exception as exc:
+                logger.info(
+                    'remote-control command worker failed '
+                    f'error_type={_safe_label(type(exc).__name__)} '
+                    f'error_label={self._error_label(exc)}'
+                )
+            finally:
+                self._command_queue.task_done()
+
+    def _report_run(self):
+        """Poll mpv and report HTTP state without blocking WebSocket liveness."""
+
+        try:
+            try:
+                # Send Playing even when the WebSocket is unavailable; HTTP
+                # progress and remote commands are independent transports.
+                self._report_snapshot(force=True)
+            except Exception:
+                logger.info(
+                    'remote-control report method=report_playing '
+                    'status=failed retry=pending'
+                )
+            self._next_snapshot_at = self._clock() + self.snapshot_interval
+            while not self._stop_event.is_set():
+                now = self._clock()
+                if self._report_wakeup.is_set():
+                    self._report_wakeup.clear()
+                    if self._stop_report_requested.is_set():
+                        self._stop_report_requested.clear()
+                        self._report_stopped()
+                    else:
+                        try:
+                            self._report_snapshot(force=True)
+                        except Exception:
+                            logger.info(
+                                'remote-control report method=report_progress '
+                                'status=failed retry=pending'
+                            )
+                else:
+                    try:
+                        self._poll_snapshot_if_due(now)
+                    except Exception:
+                        logger.info(
+                            'remote-control report method=report_progress '
+                            'status=failed retry=pending'
+                        )
+                        self._next_snapshot_at = now + self.snapshot_interval
+                self._stop_event.wait(0.05)
+        finally:
+            # stop() normally sends this first; this branch covers report
+            # worker failures and callers that only set the event in a test.
+            self._report_stopped()
 
     def _run(self):
         ws = None
+        generation = None
         try:
-            # Send Playing even when the first WebSocket connection is
-            # temporarily unavailable; HTTP and WS failures are independent.
-            self._report_snapshot(force=True)
-            self._next_snapshot_at = self._clock() + self.snapshot_interval
             while not self._stop_event.is_set():
                 now = self._clock()
                 if ws is None and now >= self._next_connect_at:
                     try:
                         ws = self._connect_ws()
+                        _, generation = self._current_connection()
                     except Exception as exc:
                         logger.info(
                             'remote-control websocket status=connect_failed '
-                            f'error_type={_safe_label(type(exc).__name__)}'
+                            f'error_type={_safe_label(type(exc).__name__)} '
+                            f'error_label={self._error_label(exc)} '
+                            f'errno={self._error_number(exc, "errno")} '
+                            f'winerror={self._error_number(exc, "winerror", "win_errno")} '
+                            f'attempt={self._reconnect_attempt + 1} '
+                            f'backoff={self._backoff:.3f}'
                         )
-                        self._schedule_reconnect()
-                        ws = None
-                self._poll_snapshot_if_due(now)
+                        current_ws, current_generation = self._current_connection()
+                        if current_ws is not None:
+                            # A replacement connection won a concurrent
+                            # lifecycle race; leave its state untouched.
+                            ws, generation = current_ws, current_generation
+                        else:
+                            self._schedule_reconnect()
+                            ws = None
+                            generation = None
                 if ws is not None:
-                    self._declare_capabilities()
+                    if not self._connection_is_current(ws, generation):
+                        ws = None
+                        generation = None
+                        continue
+                    self._declare_capabilities(generation=generation)
                 if ws is not None:
                     try:
-                        message = self._recv_ws(ws)
-                        if message:
-                            self.handle_message(message)
-                        self._heartbeat(ws, now)
+                        message = self._recv_ws(ws, generation)
+                        if (
+                            message is not None
+                            and not self._stop_event.is_set()
+                            and self._connection_is_current(ws, generation)
+                        ):
+                            self._enqueue_ws_message(message, ws, generation)
+                        self._heartbeat(ws, self._clock(), generation)
                     except Exception as exc:
-                        logger.info(
-                            'remote-control websocket status=disconnected '
-                            f'error_type={_safe_label(type(exc).__name__)}'
-                        )
-                        self._schedule_reconnect()
+                        self._log_disconnect(exc, ws, generation)
+                        self._schedule_reconnect(ws, generation)
                         ws = None
+                        generation = None
                 self._stop_event.wait(0.05)
         finally:
-            # stop() normally sends this first; this branch covers worker
-            # failures and callers that only set the event in a test.
-            self._report_stopped()
-            self._close_ws()
+            if ws is not None:
+                self._close_ws(ws, generation)
 
     def _snapshot(self):
-        return get_mpv_snapshot(self.player)
+        with self._snapshot_lock:
+            return get_mpv_snapshot(self.player)
 
     def _poll_snapshot_if_due(self, now=None):
         """Poll mpv at a bounded cadence while keeping WS handling frequent."""
@@ -567,6 +1265,12 @@ class RemoteControlClient:
 
     def publish_snapshot(self, snapshot, *, force=False, now=None):
         """Publish one externally supplied snapshot (handy for tests)."""
+
+        with self._report_lock:
+            return self._publish_snapshot(snapshot, force=force, now=now)
+
+    def _publish_snapshot(self, snapshot, *, force=False, now=None):
+        """Apply one snapshot while the report/state lock is held."""
 
         if not snapshot:
             return False
@@ -796,27 +1500,33 @@ class RemoteControlClient:
             )
 
     def _finish_playstate_command(self, command, handled, snapshot=None):
-        """Report a successfully applied remote command immediately."""
+        """Acknowledge a command and request its report without blocking WS."""
 
         handled = bool(handled)
         if handled:
-            try:
-                if snapshot is None:
-                    reported = bool(self._report_snapshot(force=True))
-                else:
-                    reported = bool(
-                        self._report_snapshot(force=True, snapshot=snapshot)
-                    )
-            except Exception:
-                reported = False
-            if command == 'Stop' and not reported:
-                # A stopped player may no longer expose a snapshot.  Preserve
-                # the existing Stopped reporting path in that case.
+            if self._started and not self._in_command_worker:
+                # The WebSocket worker must never block on mpv IPC or HTTP.
+                # The report worker consumes this edge at its next wake-up.
+                if command == 'Stop':
+                    self._stop_report_requested.set()
+                self._report_wakeup.set()
+            else:
                 try:
-                    if self._snapshot() is None:
-                        self._report_stopped()
+                    if snapshot is None:
+                        reported = bool(self._report_snapshot(force=True))
+                    else:
+                        reported = bool(
+                            self._report_snapshot(force=True, snapshot=snapshot)
+                        )
                 except Exception:
-                    pass
+                    reported = False
+                if command == 'Stop' and not reported:
+                    # A stopped player may no longer expose a snapshot.
+                    try:
+                        if self._snapshot() is None:
+                            self._report_stopped()
+                    except Exception:
+                        pass
         logger.info(
             f'remote-control command={command} handled={str(handled).lower()}'
         )
@@ -881,7 +1591,8 @@ class RemoteControlClient:
             except Exception:
                 handled = False
             confirmed_snapshot = (
-                self._confirm_pause_state(target_paused) if handled else None
+                self._confirm_pause_state(target_paused)
+                if handled else None
             )
             handled = bool(handled and confirmed_snapshot is not None)
             return self._finish_playstate_command(
@@ -892,7 +1603,8 @@ class RemoteControlClient:
             try:
                 snapshot = self._snapshot()
                 paused = (
-                    snapshot.get('is_paused') if isinstance(snapshot, dict) else None
+                    snapshot.get('is_paused')
+                    if isinstance(snapshot, dict) else None
                 )
                 if not isinstance(paused, bool):
                     handled = False
@@ -992,8 +1704,31 @@ class RemoteControlClient:
         )
         return handled
 
-    def handle_message(self, raw_message):
+    def handle_message(self, raw_message, *, _ws=None, _generation=None):
         """Parse one Emby WebSocket message and apply supported commands."""
+
+        if _ws is not None and not self._connection_is_current(_ws, _generation):
+            message_type, _ = self._decode_message(raw_message)
+            logger.info(
+                'remote-control command filtered '
+                f'reason=stale_websocket_generation type={_message_type_label(message_type)}'
+            )
+            return False
+        if self._transport_state_required:
+            current_ws, current_generation = self._current_connection()
+            if (
+                current_ws is None
+                or (_ws is not None and (
+                    current_ws is not _ws or current_generation != _generation
+                ))
+            ):
+                message_type, _ = self._decode_message(raw_message)
+                command = _message_type_label(message_type)
+                logger.info(
+                    'remote-control command filtered '
+                    f'reason=websocket_unavailable type={command}'
+                )
+                return False
 
         message_type, payload = self._decode_message(raw_message)
         message_type_label = _message_type_label(message_type)
@@ -1006,7 +1741,12 @@ class RemoteControlClient:
             return self._handle_general_command(payload)
         if message_type_label == 'forcekeepalive':
             # The next loop iteration sends a ping/KeepAlive promptly.
-            self._last_heartbeat_at = 0
+            if _ws is None:
+                self._last_heartbeat_at = 0
+            else:
+                with self._ws_lock:
+                    if self._ws is _ws and self._ws_generation == _generation:
+                        self._last_heartbeat_at = 0
             return True
         logger.info(
             f'remote-control websocket message ignored type={message_type_label}'

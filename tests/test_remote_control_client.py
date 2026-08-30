@@ -1,6 +1,7 @@
 import hashlib
 import json
 import subprocess
+import socket
 import sys
 import threading
 import time
@@ -144,6 +145,27 @@ class FakeWebSocket:
 
     def close(self):
         self.closed = True
+
+
+class ControlFrameWebSocket(FakeWebSocket):
+    """Small websocket-client-compatible double exposing control frames."""
+
+    def __init__(self):
+        super().__init__()
+        self.frames = []
+        self.pings = []
+        self.pongs = []
+
+    def ping(self, payload=b''):
+        self.pings.append(payload)
+
+    def pong(self, payload=b''):
+        self.pongs.append(payload)
+
+    def recv_data(self, control_frame=False):
+        if self.frames:
+            return self.frames.pop(0)
+        raise socket.timeout()
 
 
 class EmbySessionApiTests(unittest.TestCase):
@@ -622,6 +644,402 @@ class RemoteControlClientTests(unittest.TestCase):
         self.assertEqual(self.api.sessions, 2)
         self.assertEqual(self.api.capabilities, [('server-session', True)])
 
+    def test_capability_failure_has_bounded_retry_and_sanitized_diagnostics(self):
+        class FailingCapabilitiesApi(FakeSessionApi):
+            def declare_capabilities(self, session_id=None, full=True):
+                self.calls.append(('declare_capabilities', session_id, full))
+                raise RuntimeError('token=https://secret.example/path')
+
+        now = [0.0]
+        api = FailingCapabilitiesApi()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=api, enabled=True,
+            clock=lambda: now[0],
+        )
+        client.publish_snapshot({'position_sec': 10, 'is_paused': False}, now=0)
+        client._ws = self.ws
+        client._ws_generation = 1
+        client._capabilities_generation = 1
+        with mock.patch.object(remote_control_client_module.logger, 'info') as info:
+            for attempt in range(3):
+                now[0] = float(attempt)
+                client._declare_capabilities(generation=1)
+            now[0] = 3.0
+            client._declare_capabilities(generation=1)
+        self.assertEqual(
+            len([call for call in api.calls if call[0] == 'declare_capabilities']),
+            3,
+        )
+        log_text = ' '.join(
+            ' '.join(str(arg) for arg in call.args)
+            for call in info.call_args_list
+        )
+        self.assertIn('attempt=1', log_text)
+        self.assertIn('attempt=3', log_text)
+        self.assertIn('duration_ms=', log_text)
+        self.assertNotIn('secret.example', log_text)
+
+    def test_control_frame_pong_is_matched_and_missing_pong_times_out(self):
+        now = [0.0]
+        ws = ControlFrameWebSocket()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+            heartbeat_interval=5, heartbeat_timeout=5,
+            clock=lambda: now[0],
+        )
+        client._ws = ws
+        client._ws_generation = 1
+        client._ws_started_at = 0.0
+        client._control_frame_supported = True
+        client._last_heartbeat_at = 0.0
+
+        now[0] = 5.0
+        self.assertTrue(client._heartbeat(ws, now[0], generation=1))
+        self.assertEqual(len(ws.pings), 1)
+        self.assertIsNotNone(client._pending_ping)
+
+        ws.frames.append((remote_control_client_module._WS_OPCODE_PONG, ws.pings[0]))
+        self.assertIsNone(client._recv_ws(ws, generation=1))
+        self.assertIsNone(client._pending_ping)
+
+        now[0] = 10.0
+        self.assertTrue(client._heartbeat(ws, now[0], generation=1))
+        self.assertIsNotNone(client._pending_ping)
+        now[0] = 15.0
+        with self.assertRaises(ConnectionError):
+            client._heartbeat(ws, now[0], generation=1)
+        self.assertEqual(
+            client._error_label(remote_control_client_module._HeartbeatTimeout()),
+            'heartbeat_timeout',
+        )
+
+    def test_ping_transport_error_is_propagated_and_sanitized(self):
+        class PingResetSocket(FakeWebSocket):
+            def ping(self, *_args):
+                raise ConnectionResetError(10054, 'reset secret')
+
+        ws = PingResetSocket()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+            heartbeat_interval=1,
+        )
+        client._ws = ws
+        client._ws_generation = 1
+        client._last_heartbeat_at = 0.0
+        with mock.patch.object(remote_control_client_module.logger, 'info') as info:
+            with self.assertRaises(ConnectionResetError) as raised:
+                client._heartbeat(ws, 1.0, generation=1)
+            client._log_disconnect(raised.exception, ws, 1, now=1.0)
+        log_text = ' '.join(
+            ' '.join(str(arg) for arg in call.args)
+            for call in info.call_args_list
+        )
+        self.assertIn('error_type=ConnectionResetError', log_text)
+        self.assertIn('errno=10054', log_text)
+        self.assertIn('error_label=connection_reset', log_text)
+        self.assertNotIn('reset secret', log_text)
+
+    def test_recv_data_control_path_does_not_send_duplicate_pong(self):
+        ws = ControlFrameWebSocket()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+        )
+        client._ws = ws
+        client._ws_generation = 1
+        ws.frames.append((remote_control_client_module._WS_OPCODE_PING, b'probe'))
+        self.assertIsNone(client._recv_ws(ws, generation=1))
+        self.assertEqual(ws.pongs, [])
+
+    def test_recv_only_wrapper_keeps_legacy_ping_fallback(self):
+        ws = FakeWebSocket()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+            heartbeat_interval=1, heartbeat_timeout=1,
+        )
+        client._ws = ws
+        client._ws_generation = 1
+        client._last_heartbeat_at = 0.0
+        self.assertTrue(client._heartbeat(ws, 1.0, generation=1))
+        self.assertIsNone(client._pending_ping)
+
+    def test_close_frame_is_recorded_before_socket_state_is_cleared(self):
+        ws = ControlFrameWebSocket()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+        )
+        client._ws = ws
+        client._ws_generation = 7
+        client._ws_started_at = 1.0
+        with mock.patch.object(client, '_clock', return_value=2.0):
+            ws.frames.append((
+                remote_control_client_module._WS_OPCODE_CLOSE,
+                b'\x03\xe8server shutdown token',
+            ))
+            with self.assertRaises(ConnectionError):
+                client._recv_ws(ws, generation=7)
+            self.assertEqual(client._last_close_code, 1000)
+            reason_hash = client._last_close_reason_hash
+            self.assertTrue(reason_hash)
+            self.assertNotIn('server shutdown', reason_hash)
+            client._close_ws(ws, 7)
+        self.assertIsNone(client._ws)
+        self.assertTrue(ws.closed)
+
+    def test_stale_generation_cannot_close_new_socket_or_clear_state(self):
+        old_ws = ControlFrameWebSocket()
+        new_ws = ControlFrameWebSocket()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+        )
+        client._ws = new_ws
+        client._ws_generation = 2
+        client._ws_started_at = 5.0
+        self.assertTrue(client._close_ws(old_ws, 1))
+        self.assertIs(client._ws, new_ws)
+        self.assertEqual(client.connection_generation, 2)
+        self.assertTrue(old_ws.closed)
+        self.assertFalse(new_ws.closed)
+        self.assertFalse(client._schedule_reconnect(old_ws, 1))
+        self.assertIs(client._ws, new_ws)
+
+    def test_stale_generation_cannot_close_reused_socket_object(self):
+        ws = ControlFrameWebSocket()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+        )
+        client._ws = ws
+        client._ws_generation = 2
+        self.assertFalse(client._close_ws(ws, 1))
+        self.assertIs(client._ws, ws)
+        self.assertEqual(client.connection_generation, 2)
+        self.assertFalse(ws.closed)
+
+    def test_current_generation_handles_pause_and_seek_once_after_reconnect(self):
+        old_ws = ControlFrameWebSocket()
+        new_ws = ControlFrameWebSocket()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+        )
+        client.publish_snapshot({'position_sec': 10, 'is_paused': False}, now=0)
+        client._transport_state_required = True
+        client._ws = new_ws
+        client._ws_generation = 2
+        client._close_ws(old_ws, 1)
+        pause = json.dumps({
+            'MessageType': 'Playstate',
+            'Data': json.dumps({'Command': 'Pause'}),
+        })
+        seek = json.dumps({
+            'MessageType': 'Playstate',
+            'Data': json.dumps({
+                'Command': 'Seek', 'SeekPositionSeconds': 50,
+            }),
+        })
+        self.assertFalse(client._consume_queued_command((pause, old_ws, 1)))
+        self.assertTrue(client.handle_message(
+            pause, _ws=new_ws, _generation=2,
+        ))
+        self.assertTrue(client.handle_message(
+            seek, _ws=new_ws, _generation=2,
+        ))
+        self.assertEqual(
+            [command for command in self.player.commands
+             if command[:2] == ('set_property', 'pause')],
+            [('set_property', 'pause', True)],
+        )
+        self.assertEqual(
+            [command for command in self.player.commands if command[0] == 'seek'],
+            [('seek', 50.0, 'absolute')],
+        )
+        self.assertFalse(client.handle_message(
+            pause, _ws=old_ws, _generation=1,
+        ))
+        self.assertFalse(client.handle_message(
+            seek, _ws=old_ws, _generation=1,
+        ))
+        self.assertEqual(
+            [command for command in self.player.commands
+             if command[:2] == ('set_property', 'pause')],
+            [('set_property', 'pause', True)],
+        )
+        self.assertEqual(
+            [command for command in self.player.commands if command[0] == 'seek'],
+            [('seek', 50.0, 'absolute')],
+        )
+
+    def test_reset_reconnect_keeps_http_progress_reporting_alive(self):
+        sockets = []
+
+        class ResetSocket(FakeWebSocket):
+            def recv(self):
+                raise ConnectionResetError(10054, 'reset secret')
+
+        class StableSocket(FakeWebSocket):
+            def recv(self):
+                raise socket.timeout()
+
+        def factory(*_args, **_kwargs):
+            ws = ResetSocket() if not sockets else StableSocket()
+            sockets.append(ws)
+            return ws
+
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=self.api, enabled=True,
+            ws_factory=factory, report_interval=0.1, snapshot_interval=0.05,
+            reconnect_min=0.01, reconnect_max=0.02, ws_timeout=0.05,
+            heartbeat_interval=100,
+        )
+        with mock.patch.object(remote_control_client_module.logger, 'info') as info:
+            self.assertTrue(client.start())
+            deadline = time.monotonic() + 1
+            while (
+                (len(sockets) < 2 or len(self.api.reports) < 2)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            client.stop(timeout=1)
+        log_text = ' '.join(
+            ' '.join(str(arg) for arg in call.args)
+            for call in info.call_args_list
+        )
+        self.assertGreaterEqual(len(sockets), 2)
+        self.assertGreaterEqual(len(self.api.reports), 2)
+        self.assertIn('playing', [report[0] for report in self.api.reports])
+        self.assertIn('progress', [report[0] for report in self.api.reports])
+        self.assertIn('error_type=ConnectionResetError', log_text)
+        self.assertIn('errno=10054', log_text)
+        self.assertIn('error_label=connection_reset', log_text)
+        self.assertNotIn('reset secret', log_text)
+        self.assertNotIn('command=Pause handled=true', log_text)
+
+    def test_half_open_ws_reconnects_while_snapshot_and_report_are_blocked(self):
+        sockets = []
+        snapshot_started = threading.Event()
+        release_snapshot = threading.Event()
+        report_started = threading.Event()
+        release_report = threading.Event()
+
+        class SlowReportApi(FakeSessionApi):
+            def report_playing(self, **kwargs):
+                report_started.set()
+                release_report.wait(2)
+                super().report_playing(**kwargs)
+
+        def blocked_snapshot():
+            snapshot_started.set()
+            release_snapshot.wait(2)
+            return {
+                'position_sec': 10.0,
+                'is_paused': False,
+                'media_title': 'episode.mkv',
+            }
+
+        def factory(*_args, **_kwargs):
+            ws = ControlFrameWebSocket()
+            sockets.append(ws)
+            return ws
+
+        api = SlowReportApi()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=api, enabled=True,
+            ws_factory=factory, heartbeat_interval=0.05,
+            heartbeat_timeout=0.05, ws_timeout=0.05,
+            reconnect_min=0.01, reconnect_max=0.02, snapshot_interval=0.05,
+        )
+        client._snapshot = blocked_snapshot
+        started_at = time.monotonic()
+        started = False
+        elapsed = None
+        try:
+            started = client.start()
+            self.assertTrue(started)
+            self.assertTrue(snapshot_started.wait(0.5))
+            release_snapshot.set()
+            self.assertTrue(report_started.wait(0.5))
+            reconnect_deadline = started_at + 1.0
+            while len(sockets) < 2 and time.monotonic() < reconnect_deadline:
+                time.sleep(0.005)
+            elapsed = time.monotonic() - started_at
+        finally:
+            release_snapshot.set()
+            release_report.set()
+            if started:
+                client.stop(timeout=1)
+        self.assertGreaterEqual(len(sockets), 2)
+        self.assertIsNotNone(elapsed)
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(all(ws.closed for ws in sockets))
+        self.assertTrue(any(report[0] == 'playing' for report in api.reports))
+
+    def test_started_client_rejects_commands_without_active_socket(self):
+        self.client._transport_state_required = True
+        with mock.patch.object(remote_control_client_module.logger, 'info') as info:
+            self.assertFalse(self.client.handle_message(json.dumps({
+                'MessageType': 'Playstate',
+                'Data': json.dumps({'Command': 'Pause'}),
+            })))
+        self.assertFalse(self.player.paused)
+        log_text = ' '.join(
+            ' '.join(str(arg) for arg in call.args)
+            for call in info.call_args_list
+        )
+        self.assertIn('websocket_unavailable', log_text)
+
+    def test_reconnect_identity_precedes_capability_for_each_generation(self):
+        events = []
+        sockets = [ControlFrameWebSocket(), ControlFrameWebSocket()]
+
+        api = FakeSessionApi()
+
+        def factory(*_args, **_kwargs):
+            return sockets.pop(0)
+
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=api, enabled=True,
+            ws_factory=factory,
+        )
+        client.publish_snapshot({'position_sec': 10, 'is_paused': False}, now=0)
+        original_send_identity = client._send_identity
+
+        def send_identity(socket, generation=None):
+            events.append(('identity', generation))
+            return original_send_identity(socket, generation)
+
+        client._send_identity = send_identity
+        original_declare_capabilities = api.declare_capabilities
+
+        def declare_capabilities(session_id=None, full=True):
+            events.append(('capability', client.connection_generation))
+            return original_declare_capabilities(session_id, full)
+
+        api.declare_capabilities = declare_capabilities
+        first = client._connect_ws()
+        first_generation = client.connection_generation
+        client._schedule_reconnect(first, first_generation)
+        second = client._connect_ws()
+        second_generation = client.connection_generation
+        self.assertEqual((first_generation, second_generation), (1, 2))
+        self.assertEqual(
+            events,
+            [
+                ('identity', 1), ('capability', 1),
+                ('identity', 2), ('capability', 2),
+            ],
+        )
+        self.assertIsNotNone(second)
+
     def test_playback_rate_is_reported_immediately(self):
         self.client.publish_snapshot(
             {'position_sec': 10, 'is_paused': False, 'playback_rate': 1.0}, now=0,
@@ -668,6 +1086,55 @@ class RemoteControlClientTests(unittest.TestCase):
         client.stop(timeout=1)
         self.assertIsNone(client.thread)
         self.assertTrue(all(socket.closed for socket in sockets))
+
+    def test_ws_command_queue_uses_command_worker_and_reports_confirmed_pause(self):
+        pause_message = json.dumps({
+            'MessageType': 'Playstate',
+            'Data': json.dumps({'Command': 'Pause'}),
+        })
+
+        class CommandSocket(FakeWebSocket):
+            def __init__(self):
+                super().__init__()
+                self.messages = [pause_message]
+
+            def recv(self):
+                if self.messages:
+                    return self.messages.pop(0)
+                raise socket.timeout()
+
+        class RecordingPausePlayer(DelayedPausePlayer):
+            def __init__(self):
+                super().__init__(pause_apply_after_reads=2)
+                self.pause_command_threads = []
+
+            def command(self, *args):
+                if args[:2] == ('set_property', 'pause'):
+                    self.pause_command_threads.append(threading.current_thread().name)
+                return super().command(*args)
+
+        player = RecordingPausePlayer()
+        api = FakeSessionApi()
+        ws = CommandSocket()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=player, session_api=api, enabled=True,
+            ws_factory=lambda *_args, **_kwargs: ws,
+            heartbeat_interval=100, snapshot_interval=0.05,
+        )
+        try:
+            self.assertTrue(client.start())
+            deadline = time.monotonic() + 1
+            while (
+                (not player.pause_command_threads or not player.paused)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            self.assertEqual(player.pause_command_threads, ['emby-remote-command'])
+            self.assertTrue(player.paused)
+            self.assertTrue(any(report[0] == 'progress' for report in api.reports))
+        finally:
+            client.stop(timeout=1)
 
     def test_missing_websocket_dependency_degrades_without_thread(self):
         client = RemoteControlClient(
@@ -851,6 +1318,59 @@ class RemoteControlClientTests(unittest.TestCase):
         ))
         self.assertEqual(self.api.reports[-1][1]['event_name'], 'TimeUpdate')
 
+    def test_concurrent_snapshot_reports_serialize_state_and_order(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingProgressApi(FakeSessionApi):
+            def __init__(self):
+                super().__init__()
+                self.block_once = True
+
+            def report_progress(self, **kwargs):
+                if self.block_once:
+                    self.block_once = False
+                    entered.set()
+                    release.wait(1)
+                return super().report_progress(**kwargs)
+
+        api = BlockingProgressApi()
+        client = RemoteControlClient(
+            {'server': 'emby', 'remote_control_enabled': True},
+            player=self.player, session_api=api, enabled=True,
+        )
+        client.publish_snapshot({'position_sec': 10, 'is_paused': False}, now=0)
+        errors = []
+
+        def publish(snapshot, now):
+            try:
+                client.publish_snapshot(snapshot, now=now)
+            except Exception as exc:
+                errors.append(exc)
+
+        first = threading.Thread(
+            target=publish,
+            args=({'position_sec': 20, 'is_paused': False}, 10),
+        )
+        second = threading.Thread(
+            target=publish,
+            args=({'position_sec': 30, 'is_paused': False}, 20),
+        )
+        first.start()
+        self.assertTrue(entered.wait(0.5))
+        second.start()
+        release.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [report[1]['position_sec'] for report in api.reports if report[0] == 'progress'],
+            [20.0, 30.0],
+        )
+        self.assertEqual(client._last_position, 30.0)
+
     def test_websocket_lifecycle_and_identity(self):
         self.assertTrue(self.client.start())
         deadline = time.time() + 1
@@ -860,8 +1380,13 @@ class RemoteControlClientTests(unittest.TestCase):
         self.assertEqual(self.ws.sent[0]['MessageType'], 'Identity')
         self.client.stop()
         self.assertFalse(self.client.thread)
+        self.assertFalse(self.client.report_thread)
+        self.assertFalse(self.client.command_thread)
         self.assertTrue(self.ws.closed)
-        self.assertEqual(self.api.reports[-1][0], 'stopped')
+        self.assertEqual(
+            len([report for report in self.api.reports if report[0] == 'stopped']),
+            1,
+        )
 
     def test_missing_player_or_disabled_is_safe(self):
         disabled = RemoteControlClient(
