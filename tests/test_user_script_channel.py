@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "user_script" / "embyToLocalPlayer.user.js"
 LAUNCHER = ROOT / "utils" / "others" / "embyToLocalPlayer_debug.bat"
 PACKAGER = ROOT / "scripts" / "package_release.ps1"
+PUBLISHER = ROOT / "scripts" / "release_publish.ps1"
 
 
 class UserScriptChannelTests(unittest.TestCase):
@@ -24,6 +25,9 @@ class UserScriptChannelTests(unittest.TestCase):
             metadata["updateURL"],
             "https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js",
         )
+        # GitCode's content API currently returns blob-specific links, so the
+        # browser script keeps the tested GitHub branch raw endpoint.
+        self.assertNotIn("gitcode.com", metadata["updateURL"])
         self.assertEqual(metadata["downloadURL"], metadata["updateURL"])
         self.assertEqual(
             metadata["homepageURL"],
@@ -93,6 +97,18 @@ class UserScriptChannelTests(unittest.TestCase):
         self.assertIn("must occur exactly once", packager)
         self.assertIn("$Channel/user_script/embyToLocalPlayer.user.js", packager)
         self.assertIn("tree/$Channel#faq", packager)
+
+    def test_release_publisher_lists_both_sources_and_scoped_cleanup(self):
+        publisher = PUBLISHER.read_text(encoding="utf-8")
+        self.assertIn("GitCode primary Release source", publisher)
+        self.assertIn("GitHub fallback Release source", publisher)
+        self.assertIn("gitcode release create", publisher)
+        self.assertIn("gitcode release upload", publisher)
+        self.assertIn("Remove-GitCodeReleaseAfterFailure", publisher)
+        self.assertIn("Remove-GitHubReleaseAfterFailure", publisher)
+        self.assertIn("gh release delete $Tag --repo $Repository --yes", publisher)
+        self.assertIn("gitcode release delete $Tag --repo $GitCodeRepository --yes", publisher)
+        self.assertNotIn("--cleanup-tag", publisher)
 
 
 if __name__ == "__main__":

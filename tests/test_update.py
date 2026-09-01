@@ -21,9 +21,15 @@ class UpdateArchiveTests(unittest.TestCase):
     def test_release_api_is_channel_scoped(self):
         self.assertEqual(
             update.RELEASES_API_URL,
-            "https://api.github.com/repos/hope140/embyToLocalPlayer/releases?per_page=100",
+            "https://api.gitcode.com/api/v5/repos/h0pe14o/embyToLocalPlayer/releases?per_page=100",
         )
         self.assertNotIn("releases/latest/download", update.RELEASES_API_URL)
+        self.assertEqual(
+            update.GITHUB_RELEASES_API_URL,
+            "https://api.github.com/repos/hope140/embyToLocalPlayer/releases?per_page=100",
+        )
+        self.assertEqual(update.DEFAULT_RELEASE_SOURCE, "gitcode")
+        self.assertEqual(update.RELEASE_SOURCE_ORDER, ("gitcode", "github"))
         self.assertEqual(
             update.CHANNEL_ASSETS,
             {
@@ -79,6 +85,116 @@ class UpdateArchiveTests(unittest.TestCase):
         self.assertNotIn("/latest/", beta["update_url"])
         self.assertIn("/2026.08.14.1-beta/", beta["update_url"])
         self.assertIn("/2026.08.14/", stable["update_url"])
+        self.assertEqual(beta["source"], "gitcode")
+
+    def test_gitcode_release_uses_attachment_url_from_api_when_available(self):
+        assets = update.CHANNEL_ASSETS["beta"]
+        tag = "2026.08.14.2-beta"
+        release = update.select_latest_release(
+            [{
+                "id": "12",
+                "tag_name": tag,
+                "created_at": "2026-08-14T12:00:00+08:00",
+                "release_status": "pre",
+                "assets": [
+                    {
+                        "name": assets["package"],
+                        "browser_download_url": "https://gitcode.com/download/package.zip",
+                    },
+                    {
+                        "name": assets["checksum"],
+                    },
+                    {
+                        "name": update.MANIFEST_ASSET,
+                        "browser_download_url": "https://gitcode.com/download/release-plan.json",
+                    },
+                ],
+            }],
+            "beta",
+        )
+
+        self.assertEqual(release["source"], "gitcode")
+        self.assertEqual(release["update_url"], "https://gitcode.com/download/package.zip")
+        self.assertEqual(
+            release["checksum_url"],
+            "https://api.gitcode.com/api/v5/repos/h0pe14o/embyToLocalPlayer/releases/"
+            "2026.08.14.2-beta/attach_files/etlp-remote-control-beta.zip.sha256/download",
+        )
+        self.assertEqual(release["manifest_url"], "https://gitcode.com/download/release-plan.json")
+
+    def test_resolve_update_urls_falls_back_to_github_on_gitcode_api_failure(self):
+        assets = update.CHANNEL_ASSETS["beta"]
+        releases = [{
+            "id": 1,
+            "tag_name": "2026.08.14.3-beta",
+            "published_at": "2026-08-14T13:00:00Z",
+            "assets": [
+                {"name": assets["package"]},
+                {"name": assets["checksum"]},
+            ],
+        }]
+        calls = []
+
+        def fake_requests(url, **kwargs):
+            calls.append(url)
+            if url == update.GITCODE_RELEASES_API_URL:
+                raise ConnectionError("GitCode unavailable")
+            if url == update.GITHUB_RELEASES_API_URL:
+                return releases
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+            resolved = update.resolve_update_urls("beta")
+
+        self.assertEqual(calls, [update.GITCODE_RELEASES_API_URL, update.GITHUB_RELEASES_API_URL])
+        self.assertEqual(resolved["source"], "github")
+        self.assertTrue(resolved["update_url"].startswith("https://github.com/"))
+
+    def test_resolve_update_urls_falls_back_when_gitcode_has_no_qualified_assets(self):
+        assets = update.CHANNEL_ASSETS["beta"]
+        releases = [{
+            "id": 2,
+            "tag_name": "2026.08.14.4-beta",
+            "published_at": "2026-08-14T14:00:00Z",
+            "assets": [{"name": assets["package"]}],
+        }]
+        calls = []
+
+        def fake_requests(url, **kwargs):
+            calls.append(url)
+            if url == update.GITCODE_RELEASES_API_URL:
+                return releases
+            if url == update.GITHUB_RELEASES_API_URL:
+                return [{
+                    "id": 3,
+                    "tag_name": "2026.08.14.5-beta",
+                    "published_at": "2026-08-14T15:00:00Z",
+                    "assets": [
+                        {"name": assets["package"]},
+                        {"name": assets["checksum"]},
+                    ],
+                }]
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+            resolved = update.resolve_update_urls("beta")
+
+        self.assertEqual(calls, [update.GITCODE_RELEASES_API_URL, update.GITHUB_RELEASES_API_URL])
+        self.assertEqual(resolved["source"], "github")
+        self.assertEqual(resolved["tag"], "2026.08.14.5-beta")
+
+    def test_resolve_update_urls_fails_closed_when_both_sources_fail(self):
+        calls = []
+
+        def fake_requests(url, **kwargs):
+            calls.append(url)
+            raise ConnectionError("source unavailable")
+
+        with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+            with self.assertRaisesRegex(ValueError, "GitCode primary or GitHub fallback"):
+                update.resolve_update_urls("beta")
+
+        self.assertEqual(calls, [update.GITCODE_RELEASES_API_URL, update.GITHUB_RELEASES_API_URL])
 
     def test_latest_release_selection_treats_manifest_as_optional(self):
         assets = update.CHANNEL_ASSETS["beta"]
@@ -290,15 +406,16 @@ class UpdateDownloadTests(unittest.TestCase):
             ],
         }]
         release = update.select_latest_release(releases, channel)
+        github_release = update.select_latest_release(releases, channel, source="github")
         calls = []
 
         def fake_requests(url, **kwargs):
             calls.append((url, kwargs))
-            if url == update.RELEASES_API_URL:
+            if url in (update.GITCODE_RELEASES_API_URL, update.GITHUB_RELEASES_API_URL):
                 return releases
-            if url == release["checksum_url"]:
+            if url in (release["checksum_url"], github_release["checksum_url"]):
                 return checksum_text
-            if url == release["update_url"]:
+            if url in (release["update_url"], github_release["update_url"]):
                 Path(kwargs["save_path"]).write_bytes(archive_payload)
                 return kwargs["save_path"]
             raise AssertionError(f"unexpected URL: {url}")
@@ -349,7 +466,11 @@ class UpdateDownloadTests(unittest.TestCase):
             self.assertTrue(marker.exists())
             self.assertEqual(
                 [url for url, _ in calls],
-                [update.RELEASES_API_URL, release["checksum_url"], release["update_url"]],
+                [
+                    update.RELEASES_API_URL,
+                    release["checksum_url"],
+                    release["update_url"],
+                ],
             )
             self.assertEqual(calls[2][1]["save_path"], str(root / "embyToLocalPlayer.zip.part"))
 
@@ -438,6 +559,8 @@ class UpdateDownloadTests(unittest.TestCase):
             calls.append((url, kwargs))
             if url == update.RELEASES_API_URL:
                 return releases
+            if url == update.GITHUB_RELEASES_API_URL:
+                raise ConnectionError("GitHub unavailable")
             if url == release["checksum_url"]:
                 return f"{digest}  {assets['package']}\n"
             if url == release["manifest_url"]:
@@ -472,7 +595,12 @@ class UpdateDownloadTests(unittest.TestCase):
 
         self.assertEqual(
             [url for url, _ in calls],
-            [update.RELEASES_API_URL, release["checksum_url"], release["manifest_url"]],
+            [
+                update.RELEASES_API_URL,
+                release["checksum_url"],
+                release["manifest_url"],
+                update.GITHUB_RELEASES_API_URL,
+            ],
         )
 
     def test_manifest_size_mismatch_keeps_live_archive_and_cleans_part(self):
@@ -497,6 +625,8 @@ class UpdateDownloadTests(unittest.TestCase):
             calls.append((url, kwargs))
             if url == update.RELEASES_API_URL:
                 return releases
+            if url == update.GITHUB_RELEASES_API_URL:
+                raise ConnectionError("GitHub unavailable")
             if url == release["checksum_url"]:
                 return f"{digest}  {assets['package']}\n"
             if url == release["manifest_url"]:
@@ -534,6 +664,7 @@ class UpdateDownloadTests(unittest.TestCase):
                 release["checksum_url"],
                 release["manifest_url"],
                 release["update_url"],
+                update.GITHUB_RELEASES_API_URL,
             ],
         )
 
@@ -563,7 +694,18 @@ class UpdateDownloadTests(unittest.TestCase):
             self.assertTrue(marker.exists())
             self.assertEqual(
                 [url for url, _ in calls],
-                [update.RELEASES_API_URL, release["checksum_url"], release["update_url"]],
+                [
+                    update.RELEASES_API_URL,
+                    release["checksum_url"],
+                    release["update_url"],
+                    update.GITHUB_RELEASES_API_URL,
+                    update._release_download_url(
+                        release["tag"], release["checksum_asset"], source="github"
+                    ),
+                    update._release_download_url(
+                        release["tag"], release["package_asset"], source="github"
+                    ),
+                ],
             )
 
     def test_malformed_checksum_does_not_download_or_change_live_files(self):
@@ -584,18 +726,27 @@ class UpdateDownloadTests(unittest.TestCase):
             self.assertFalse(part.exists())
             self.assertEqual(
                 [url for url, _ in calls],
-                [update.RELEASES_API_URL, update.select_latest_release(
-                    [{
-                        "id": 1,
-                        "tag_name": "2026.08.14.1-beta",
-                        "published_at": "2026-08-14T10:00:00Z",
-                        "assets": [
-                            {"name": update.CHANNEL_ASSETS["beta"]["package"]},
-                            {"name": update.CHANNEL_ASSETS["beta"]["checksum"]},
-                        ],
-                    }],
-                    "beta",
-                )["checksum_url"]],
+                [
+                    update.RELEASES_API_URL,
+                    update.select_latest_release(
+                        [{
+                            "id": 1,
+                            "tag_name": "2026.08.14.1-beta",
+                            "published_at": "2026-08-14T10:00:00Z",
+                            "assets": [
+                                {"name": update.CHANNEL_ASSETS["beta"]["package"]},
+                                {"name": update.CHANNEL_ASSETS["beta"]["checksum"]},
+                            ],
+                        }],
+                        "beta",
+                    )["checksum_url"],
+                    update.GITHUB_RELEASES_API_URL,
+                    update._release_download_url(
+                        "2026.08.14.1-beta",
+                        update.CHANNEL_ASSETS["beta"]["checksum"],
+                        source="github",
+                    ),
+                ],
             )
 
     def test_archive_download_exception_cleans_partial_file(self):
@@ -618,6 +769,8 @@ class UpdateDownloadTests(unittest.TestCase):
             calls.append((url, kwargs))
             if url == update.RELEASES_API_URL:
                 return releases
+            if url == update.GITHUB_RELEASES_API_URL:
+                raise ConnectionError("GitHub unavailable")
             if url == release["checksum_url"]:
                 return f"{checksum}  {update.PACKAGE_ASSET}\n"
             if url == release["update_url"]:
@@ -631,15 +784,80 @@ class UpdateDownloadTests(unittest.TestCase):
             live_archive.write_bytes(b"old archive")
 
             with mock.patch.object(update, "requests_urllib", side_effect=failing_requests):
-                with self.assertRaisesRegex(OSError, "simulated download failure"):
+                with self.assertRaisesRegex(ValueError, "simulated download failure"):
                     update.download_verified_update(root)
 
             self.assertEqual(live_archive.read_bytes(), b"old archive")
             self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
-            self.assertEqual(
-                [url for url, _ in calls],
-                [update.RELEASES_API_URL, release["checksum_url"], release["update_url"]],
-            )
+        self.assertEqual(
+            [url for url, _ in calls],
+            [
+                update.RELEASES_API_URL,
+                release["checksum_url"],
+                release["update_url"],
+                update.GITHUB_RELEASES_API_URL,
+            ],
+        )
+
+    def test_verified_download_falls_back_to_github_after_gitcode_hash_failure(self):
+        payload = b"valid GitHub fallback archive"
+        digest = hashlib.sha256(payload).hexdigest()
+        wrong_digest = hashlib.sha256(b"GitCode served a different archive").hexdigest()
+        assets = update.CHANNEL_ASSETS["beta"]
+        tag = "2026.08.14.6-beta"
+        releases = [{
+            "id": 1,
+            "tag_name": tag,
+            "published_at": "2026-08-14T16:00:00Z",
+            "assets": [
+                {"name": assets["package"]},
+                {"name": assets["checksum"]},
+            ],
+        }]
+        gitcode_release = update.select_latest_release(releases, "beta")
+        github_release = update.select_latest_release(releases, "beta", source="github")
+        calls = []
+
+        def fake_requests(url, **kwargs):
+            calls.append((url, kwargs))
+            if url == update.GITCODE_RELEASES_API_URL:
+                return releases
+            if url == gitcode_release["checksum_url"]:
+                return f"{wrong_digest}  {assets['package']}\n"
+            if url == gitcode_release["update_url"]:
+                Path(kwargs["save_path"]).write_bytes(payload)
+                return kwargs["save_path"]
+            if url == update.GITHUB_RELEASES_API_URL:
+                return releases
+            if url == github_release["checksum_url"]:
+                return f"{digest}  {assets['package']}\n"
+            if url == github_release["update_url"]:
+                Path(kwargs["save_path"]).write_bytes(payload)
+                return kwargs["save_path"]
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            live_archive = root / "embyToLocalPlayer.zip"
+            live_archive.write_bytes(b"old archive")
+
+            with mock.patch.object(update, "requests_urllib", side_effect=fake_requests):
+                result = update.download_verified_update(root)
+
+            self.assertEqual(Path(result).read_bytes(), payload)
+            self.assertFalse((root / "embyToLocalPlayer.zip.part").exists())
+
+        self.assertEqual(
+            [url for url, _ in calls],
+            [
+                update.GITCODE_RELEASES_API_URL,
+                gitcode_release["checksum_url"],
+                gitcode_release["update_url"],
+                update.GITHUB_RELEASES_API_URL,
+                github_release["checksum_url"],
+                github_release["update_url"],
+            ],
+        )
 
     def test_stable_download_uses_stable_assets(self):
         payload = b"verified stable archive"

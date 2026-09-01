@@ -10,12 +10,25 @@
 | `beta` | 测试版 | `scripts/package_beta.ps1`；tag 以 `-beta` 结尾；资产为 `etlp-remote-control-beta.zip` 和对应 `.sha256` | [beta 用户脚本](https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js) |
 | `main` | 上游同步 | 只用于同步上游，不从此分支打包或发布 | 不作为安装入口 |
 
-beta 和 stable 保留相同的 Tampermonkey 脚本身份，安装时只选择一个频道，不要同时安装两份。更新器读取安装包内的频道元数据，只查找对应频道的 Release 资产，不使用跨频道的 `Latest` 下载地址。
+beta 和 stable 保留相同的 Tampermonkey 脚本身份，安装时只选择一个频道，不要同时安装两份。更新器读取安装包内的频道元数据，只查找对应频道的 Release 资产，不使用跨频道的 `Latest` 下载地址。Release 查询默认使用 GitCode；GitCode API、附件下载或校验失败时，才回退 GitHub。
 
 GitHub 页面上，stable Release 作为 `Latest` 展示，beta Release 标记为 `Prerelease`；这只影响网页展示，不改变更新器按频道查询资产的规则。
 
-为兼容尚未升级的旧 beta 安装，当前 stable 的 Latest Release 暂时额外保留旧版更新器请求的
+为兼容尚未升级的旧 beta 安装，当前 GitHub stable 的 Latest Release 暂时额外保留旧版更新器请求的
 `etlp-remote-control-beta.zip` 和对应 `.sha256` 兼容资产。这两个文件内容仍是 beta 包；新更新器不会跨频道使用它们。
+
+### 下载源与校验
+
+更新器按 `GitCode -> GitHub` 的顺序查询对应频道的 Release。GitCode 使用公开 Release API
+和附件下载地址；GitHub 是明确的失败回退源。两个来源都必须提供频道对应的 ZIP 和
+`.sha256`，若有 `release-plan.json` 还必须通过频道、版本、分支、SHA-256 和包大小校验。
+下载的 ZIP 仍会在替换前执行 SHA-256、清单和安全解压校验；GitCode 的附件下载、sidecar、
+manifest、ZIP 大小或 SHA-256 校验失败时，会重新选择 GitHub 同频道 Release 并完整重复校验。
+两个来源都不可用或校验失败时保持原安装不变并报告失败。
+
+用户脚本继续使用经过实测的 GitHub branch raw 地址。GitCode 内容 API 返回的
+`download_url` 包含不可预测的 blob SHA，常见的 branch raw 地址会返回网页内容，当前不作为
+Tampermonkey 的 `@updateURL` 或 `@downloadURL`。
 
 ### 维护者本地准备 Release
 
@@ -45,9 +58,12 @@ pwsh -File .\scripts\release_prepare.ps1 -Version <版本> `
 pwsh -File .\scripts\release_publish.ps1 -PlanPath .\publish\release-plan.json
 ```
 
-预览会重新校验 ZIP、sidecar、包内频道元数据、当前分支和 commit；只有在 tag 已存在、
-并且明确获得远端发布授权后，才使用 `-Execute` 执行 GitHub Release 创建。该入口不会
-自动创建 tag 或 push 分支，也不会覆盖同名 Release。
+预览会重新校验 ZIP、sidecar、包内频道元数据、当前分支和 commit；只有在两个平台的 tag
+均已存在、并且明确获得远端发布授权后，才使用 `-Execute` 创建 GitHub Release 并同步
+GitCode Release。GitCode 认证使用已登录的 `gitcode` CLI，或由 `GC_TOKEN`/
+`GITCODE_TOKEN` 环境变量注入；凭据不会写入源码、配置或日志。该入口不会自动创建 tag
+或 push 分支，也不会覆盖同名 Release。若第二个平台创建或上传失败，脚本会只清理本次
+已经成功创建的 Release，保留 tag，并报告清理结果；预存 Release 不会被删除。
 
 ## 开源许可与致谢
 
@@ -79,7 +95,7 @@ pwsh -File .\scripts\release_publish.ps1 -PlanPath .\publish\release-plan.json
 
 1. 安装 Tampermonkey 或 Violentmonkey。
 2. 按需安装一个频道的 [stable 用户脚本](https://raw.githubusercontent.com/hope140/embyToLocalPlayer/stable/user_script/embyToLocalPlayer.user.js) 或 [beta 用户脚本](https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js)，刷新 Emby/Jellyfin 页面。两者不要同时安装。
-3. 从 [hope140 Releases](https://github.com/hope140/embyToLocalPlayer/releases) 选择对应频道的 Release，下载 `etlp-remote-control-stable.zip` 或 `etlp-remote-control-beta.zip` 及其 `.sha256`，解压到英文路径。发布包包含 `python_embed` 的 Windows Python 3.9 x86 运行时、`third_party/*.whl` 依赖、`embyToLocalPlayer_config.ini` 和 Windows 启动脚本；首次启动只会从包内本地准备依赖，不会联网下载。
+3. 从 [GitCode Releases](https://gitcode.com/h0pe14o/embyToLocalPlayer/releases) 选择对应频道的 Release，下载 `etlp-remote-control-stable.zip` 或 `etlp-remote-control-beta.zip` 及其 `.sha256`，解压到英文路径；GitCode 不可用时可从 [GitHub Releases](https://github.com/hope140/embyToLocalPlayer/releases) 获取。发布包包含 `python_embed` 的 Windows Python 3.9 x86 运行时、`third_party/*.whl` 依赖、`embyToLocalPlayer_config.ini` 和 Windows 启动脚本；首次启动只会从包内本地准备依赖，不会联网下载。
 
 ### 2. Windows
 

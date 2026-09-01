@@ -49,11 +49,16 @@ flowchart LR
 5. STRM 本地预热和 CloudDrive2 解析均是 best-effort：超时或不可用时保留原有
    路径判断和回退路径，不能阻塞播放启动。
 6. `stable` 是默认分支，`beta` 是测试分支，`main` 只同步上游。打包脚本要求当前
-   分支与频道一致；更新器按安装包内的频道从 GitHub Releases API 选择同时包含对应
-   ZIP 与 SHA-256 sidecar 的已发布 tag，不使用跨频道的 `Latest` 资产。新 Release 若
-   额外提供 `release-plan.json`，更新器在下载并替换前校验其 schema、频道、tag、分支、
-   资产名、SHA-256 和包大小；没有该清单的历史 Release 继续使用 sidecar-only 兼容路径。
-   配置文件不由更新包直接覆盖，ZIP 成员必须先经过安全校验。
+   分支与频道一致；更新器按安装包内的频道先从 GitCode Releases API 选择同时包含对应
+   ZIP 与 SHA-256 sidecar 的已发布 tag，GitCode API、附件下载或校验失败时才回退 GitHub
+   Releases API，并对 GitHub 结果完整重复校验，不使用跨频道的 `Latest` 资产。GitCode
+   Release 附件优先使用 API 返回的 `browser_download_url`，缺失时使用官方 attachment
+   download endpoint。新 Release 若额外提供 `release-plan.json`，更新器在下载并替换前
+   校验其 schema、频道、tag、分支、资产名、SHA-256 和包大小；没有该清单的历史 Release
+   继续使用 sidecar-only 兼容路径。
+   配置文件不由更新包直接覆盖，ZIP 成员必须先经过安全校验。用户脚本仍使用经过验证的
+   GitHub branch raw 地址，因为 GitCode 内容 API 的下载链接带 blob SHA，不能作为稳定的
+   Tampermonkey 更新入口。
 
 ## 生命周期与数据存放
 

@@ -129,7 +129,11 @@ if (([regex]::Matches($releaseInfoText, [regex]::Escape($releaseValue))).Count -
 $utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
 [System.IO.File]::WriteAllText($releaseInfoPath, $releaseInfoText, $utf8NoBom)
 
-# The browser userscript is runtime input; keep JavaScript only.
+# The browser userscript is runtime input; keep JavaScript only. GitCode's
+# content API currently returns a blob-specific raw URL rather than a stable
+# branch URL, so the packaged channel metadata intentionally keeps the tested
+# GitHub branch raw endpoint for Tampermonkey updates. Release ZIP downloads
+# use GitCode separately through utils/update.py.
 $userScriptSource = Join-Path $root 'user_script'
 $userScriptTarget = Join-Path $staging 'user_script'
 $channelMetadata = @(

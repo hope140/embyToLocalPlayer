@@ -22,8 +22,18 @@ except (ImportError, AttributeError):
         return 'beta'
 
 
-REPOSITORY = 'hope140/embyToLocalPlayer'
-RELEASES_API_URL = f'https://api.github.com/repos/{REPOSITORY}/releases?per_page=100'
+GITHUB_REPOSITORY = 'hope140/embyToLocalPlayer'
+GITCODE_REPOSITORY = 'h0pe14o/embyToLocalPlayer'
+GITHUB_RELEASES_API_URL = f'https://api.github.com/repos/{GITHUB_REPOSITORY}/releases?per_page=100'
+GITCODE_RELEASES_API_URL = (
+    f'https://api.gitcode.com/api/v5/repos/{GITCODE_REPOSITORY}/releases?per_page=100'
+)
+# Keep the historical names available to callers while making GitCode the
+# first source used by the updater. GitHub remains an explicit fallback.
+REPOSITORY = GITHUB_REPOSITORY
+RELEASES_API_URL = GITCODE_RELEASES_API_URL
+DEFAULT_RELEASE_SOURCE = 'gitcode'
+RELEASE_SOURCE_ORDER = ('gitcode', 'github')
 CHANNEL_ASSETS = {
     'beta': {
         'package': 'etlp-remote-control-beta.zip',
@@ -47,6 +57,18 @@ _RELEASE_TAG = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+/\-]{0,127}$')
 _UPDATE_CDN_PLACEHOLDER = '{url}'
 
 
+_RELEASE_SOURCES = {
+    'gitcode': {
+        'api_url': GITCODE_RELEASES_API_URL,
+        'headers': {'Accept': 'application/json'},
+    },
+    'github': {
+        'api_url': GITHUB_RELEASES_API_URL,
+        'headers': {'Accept': 'application/vnd.github+json'},
+    },
+}
+
+
 def _normalise_channel(channel):
     if channel is None:
         channel = load_release_channel()
@@ -55,10 +77,51 @@ def _normalise_channel(channel):
     return channel
 
 
-def _release_download_url(tag, asset_name):
+def _normalise_source(source):
+    if source is None:
+        source = DEFAULT_RELEASE_SOURCE
+    if not isinstance(source, str) or source not in _RELEASE_SOURCES:
+        raise ValueError(f'unsupported release source: {source!r}')
+    return source
+
+
+def _release_download_url(tag, asset_name, source='github'):
+    source = _normalise_source(source)
     if not isinstance(tag, str) or _RELEASE_TAG.fullmatch(tag) is None:
-        raise ValueError(f'unsupported GitHub release tag: {tag!r}')
-    return f'https://github.com/{REPOSITORY}/releases/download/{quote(tag, safe="")}/{quote(asset_name, safe="")}'
+        raise ValueError(f'unsupported release tag: {tag!r}')
+    if source == 'github':
+        return (
+            f'https://github.com/{GITHUB_REPOSITORY}/releases/download/'
+            f'{quote(tag, safe="")}/{quote(asset_name, safe="")}'
+        )
+    return (
+        f'https://api.gitcode.com/api/v5/repos/{GITCODE_REPOSITORY}/releases/'
+        f'{quote(tag, safe="")}/attach_files/{quote(asset_name, safe="")}/download'
+    )
+
+
+def _asset_download_url(source, tag, asset_name, asset=None):
+    """Resolve a release asset URL for the selected provider.
+
+    GitCode returns an attachment's ``browser_download_url`` in its Release
+    response. Older or minimal responses may omit it, so use GitCode's stable
+    attachment endpoint as a fallback. URLs are restricted to HTTPS before
+    they are handed to the downloader; the checksum and manifest remain the
+    final content trust boundary.
+    """
+    source = _normalise_source(source)
+    if source == 'gitcode' and isinstance(asset, dict):
+        for field in ('browser_download_url', 'download_url'):
+            candidate = asset.get(field)
+            if not isinstance(candidate, str) or not candidate:
+                continue
+            try:
+                parsed = urlsplit(candidate)
+            except ValueError:
+                continue
+            if parsed.scheme.casefold() == 'https' and parsed.netloc:
+                return candidate
+    return _release_download_url(tag, asset_name, source=source)
 
 
 def _validate_update_cdn_url(update_cdn_url):
@@ -95,33 +158,44 @@ def _apply_update_cdn_url(url, update_cdn_url=None):
     return update_cdn_url.replace(_UPDATE_CDN_PLACEHOLDER, url)
 
 
-def select_latest_release(releases, channel):
+def select_latest_release(releases, channel, source=DEFAULT_RELEASE_SOURCE):
     """Select the newest published release carrying the channel assets."""
     channel = _normalise_channel(channel)
+    source = _normalise_source(source)
     if not isinstance(releases, list):
-        raise ValueError('GitHub releases response must be a JSON array')
+        raise ValueError(f'{source} releases response must be a JSON array')
 
     assets = CHANNEL_ASSETS[channel]
     candidates = []
     for release in releases:
         if not isinstance(release, dict) or release.get('draft') is True:
             continue
+        release_status = release.get('release_status')
+        if isinstance(release_status, str) and release_status.casefold() in {
+            'draft', 'unreleased', 'deleted'
+        }:
+            continue
         tag = release.get('tag_name')
         if not isinstance(tag, str) or _RELEASE_TAG.fullmatch(tag) is None:
             continue
         if channel == 'beta' and not tag.endswith('-beta'):
             continue
-        if channel == 'stable' and (tag.endswith('-beta') or release.get('prerelease') is True):
+        if channel == 'stable' and (
+            tag.endswith('-beta')
+            or release.get('prerelease') is True
+            or (isinstance(release_status, str) and release_status.casefold() in {'pre', 'prerelease'})
+        ):
             continue
 
         release_assets = release.get('assets')
         if not isinstance(release_assets, list):
             continue
-        asset_names = {
-            asset.get('name')
+        asset_by_name = {
+            asset.get('name'): asset
             for asset in release_assets
             if isinstance(asset, dict) and isinstance(asset.get('name'), str)
         }
+        asset_names = set(asset_by_name)
         if assets['package'] not in asset_names or assets['checksum'] not in asset_names:
             continue
 
@@ -129,59 +203,83 @@ def select_latest_release(releases, channel):
         if not isinstance(published_at, str):
             published_at = ''
         release_id = release.get('id')
-        if not isinstance(release_id, int):
+        if isinstance(release_id, bool):
             release_id = 0
-        candidates.append((published_at, release_id, tag, asset_names))
+        elif isinstance(release_id, int):
+            pass
+        elif isinstance(release_id, str) and release_id.isdigit():
+            release_id = int(release_id)
+        else:
+            release_id = 0
+        candidates.append((published_at, release_id, tag, asset_names, asset_by_name))
 
     if not candidates:
         raise ValueError(f'no published {channel} release with matching assets was found')
 
-    _, _, tag, asset_names = max(candidates, key=lambda candidate: candidate[:3])
+    _, _, tag, asset_names, asset_by_name = max(candidates, key=lambda candidate: candidate[:3])
     selected = {
+        'source': source,
         'channel': channel,
         'tag': tag,
         'package_asset': assets['package'],
         'checksum_asset': assets['checksum'],
-        'update_url': _release_download_url(tag, assets['package']),
-        'checksum_url': _release_download_url(tag, assets['checksum']),
+        'update_url': _asset_download_url(
+            source, tag, assets['package'], asset_by_name.get(assets['package'])
+        ),
+        'checksum_url': _asset_download_url(
+            source, tag, assets['checksum'], asset_by_name.get(assets['checksum'])
+        ),
     }
     if MANIFEST_ASSET in asset_names:
         selected.update(
             {
                 'manifest_asset': MANIFEST_ASSET,
-                'manifest_url': _release_download_url(tag, MANIFEST_ASSET),
+                'manifest_url': _asset_download_url(
+                    source, tag, MANIFEST_ASSET, asset_by_name.get(MANIFEST_ASSET)
+                ),
             }
         )
     return selected
 
 
-def resolve_update_urls(channel=None, update_cdn_url=None):
-    """Resolve package URLs for the installed channel, optionally via a CDN."""
-    channel = _normalise_channel(channel)
-    update_cdn_url = _validate_update_cdn_url(update_cdn_url)
-    releases = requests_urllib(
-        _apply_update_cdn_url(RELEASES_API_URL, update_cdn_url),
-        get_json=True,
-        headers={'Accept': 'application/vnd.github+json'},
-        timeout=10,
-        retry=3,
-    )
+def _decode_release_response(releases, source):
     if isinstance(releases, str):
         try:
             releases = json.loads(releases)
         except json.JSONDecodeError as exc:
-            raise ValueError('GitHub releases response is not valid JSON') from exc
-    release = select_latest_release(releases, channel)
-    if update_cdn_url is None:
-        return release
-    resolved = {
-        **release,
-        'update_url': _apply_update_cdn_url(release['update_url'], update_cdn_url),
-        'checksum_url': _apply_update_cdn_url(release['checksum_url'], update_cdn_url),
-    }
-    if 'manifest_url' in release:
-        resolved['manifest_url'] = _apply_update_cdn_url(release['manifest_url'], update_cdn_url)
-    return resolved
+            raise ValueError(f'{source} releases response is not valid JSON') from exc
+    return releases
+
+
+def _resolve_update_source(channel, source, update_cdn_url=None):
+    source = _normalise_source(source)
+    source_config = _RELEASE_SOURCES[source]
+    releases = requests_urllib(
+        _apply_update_cdn_url(source_config['api_url'], update_cdn_url),
+        get_json=True,
+        headers=source_config['headers'],
+        timeout=10,
+        retry=3,
+    )
+    releases = _decode_release_response(releases, source)
+    return select_latest_release(releases, channel, source=source)
+
+
+def resolve_update_urls(channel=None, update_cdn_url=None):
+    """Resolve package URLs using GitCode first and GitHub as a fallback."""
+    channel = _normalise_channel(channel)
+    update_cdn_url = _validate_update_cdn_url(update_cdn_url)
+    last_error = None
+    for source in RELEASE_SOURCE_ORDER:
+        try:
+            release = _resolve_update_source(channel, source, update_cdn_url)
+            return _resolved_release_urls(release, update_cdn_url)
+        except Exception as exc:
+            last_error = exc
+
+    raise ValueError(
+        f'no usable {channel} release found from GitCode primary or GitHub fallback'
+    ) from last_error
 
 
 def parse_checksum(checksum_text, expected_asset=PACKAGE_ASSET):
@@ -274,49 +372,97 @@ def _validate_release_manifest(
     }
 
 
+def _resolved_release_urls(release, update_cdn_url=None):
+    """Apply the optional CDN template to every URL in a selected Release."""
+    resolved = {
+        **release,
+        'update_url': _apply_update_cdn_url(release['update_url'], update_cdn_url),
+        'checksum_url': _apply_update_cdn_url(release['checksum_url'], update_cdn_url),
+    }
+    if 'manifest_url' in release:
+        resolved['manifest_url'] = _apply_update_cdn_url(
+            release['manifest_url'], update_cdn_url
+        )
+    return resolved
+
+
+def _download_verified_release(zip_part_path, release):
+    """Download and verify one selected Release without replacing live files."""
+    checksum_text = requests_urllib(release['checksum_url'], decode=True)
+    expected_digest = parse_checksum(checksum_text, release['package_asset'])
+    manifest = None
+    if release.get('manifest_url'):
+        manifest_text = requests_urllib(release['manifest_url'], decode=True)
+        manifest = _validate_release_manifest(
+            manifest_text,
+            channel=release['channel'],
+            tag=release['tag'],
+            package_asset=release['package_asset'],
+            checksum_asset=release['checksum_asset'],
+            expected_digest=expected_digest,
+        )
+
+    requests_urllib(release['update_url'], save_path=str(zip_part_path))
+    if not zip_part_path.is_file():
+        raise FileNotFoundError('update archive download did not produce a file')
+    if manifest is not None:
+        actual_size = zip_part_path.stat().st_size
+        if actual_size != manifest['package_size']:
+            raise ValueError(
+                'update archive size mismatch: '
+                f"expected {manifest['package_size']}, got {actual_size}"
+            )
+    actual_digest = calculate_sha256(zip_part_path)
+    if actual_digest != expected_digest:
+        raise ValueError(
+            f'update archive SHA256 mismatch: expected {expected_digest}, got {actual_digest}')
+
+
+def _remove_partial_update(zip_part_path):
+    try:
+        zip_part_path.unlink()
+    except OSError:
+        pass
+
+
 def download_verified_update(cwd, channel=None, update_cdn_url=None):
-    """Download and verify the update archive, returning its live archive path."""
+    """Download and verify an update, falling back from GitCode to GitHub.
+
+    A fallback is attempted only after a GitCode-selected Release fails during
+    checksum, manifest, archive download, or archive hash/size verification.
+    Every source is independently verified before the live archive is changed;
+    a failure from both sources remains fail-closed.
+    """
     cwd = Path(cwd)
     zip_path = cwd / 'embyToLocalPlayer.zip'
     zip_part_path = Path(f'{zip_path}.part')
+    release = None
     try:
         release = resolve_update_urls(channel, update_cdn_url=update_cdn_url)
-        checksum_text = requests_urllib(release['checksum_url'], decode=True)
-        expected_digest = parse_checksum(checksum_text, release['package_asset'])
-        manifest = None
-        if release.get('manifest_url'):
-            manifest_text = requests_urllib(release['manifest_url'], decode=True)
-            manifest = _validate_release_manifest(
-                manifest_text,
-                channel=release['channel'],
-                tag=release['tag'],
-                package_asset=release['package_asset'],
-                checksum_asset=release['checksum_asset'],
-                expected_digest=expected_digest,
-            )
+        try:
+            _download_verified_release(zip_part_path, release)
+        except Exception as first_error:
+            if release.get('source') != 'gitcode':
+                raise
 
-        requests_urllib(release['update_url'], save_path=str(zip_part_path))
-        if not zip_part_path.is_file():
-            raise FileNotFoundError('update archive download did not produce a file')
-        if manifest is not None:
-            actual_size = zip_part_path.stat().st_size
-            if actual_size != manifest['package_size']:
-                raise ValueError(
-                    'update archive size mismatch: '
-                    f"expected {manifest['package_size']}, got {actual_size}"
+            _remove_partial_update(zip_part_path)
+            try:
+                fallback_channel = release.get('channel', channel)
+                fallback = _resolve_update_source(
+                    fallback_channel, 'github', update_cdn_url=update_cdn_url
                 )
-        actual_digest = calculate_sha256(zip_part_path)
-        if actual_digest != expected_digest:
-            raise ValueError(
-                f'update archive SHA256 mismatch: expected {expected_digest}, got {actual_digest}')
+                fallback = _resolved_release_urls(fallback, update_cdn_url)
+                _download_verified_release(zip_part_path, fallback)
+            except Exception as fallback_error:
+                raise ValueError(
+                    f'GitCode update failed: {first_error}; '
+                    f'GitHub fallback failed: {fallback_error}'
+                ) from fallback_error
 
         os.replace(str(zip_part_path), str(zip_path))
         return str(zip_path)
     except Exception:
-        try:
-            zip_part_path.unlink()
-        except OSError:
-            pass
+        _remove_partial_update(zip_part_path)
         raise
 
 # Keep the updater in lockstep with scripts/package_release.ps1. The release
