@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$PlanPath,
     [switch]$Execute,
-    [string]$Repository = 'hope140/embyToLocalPlayer'
+    [string]$Repository = 'hope140/embyToLocalPlayer',
+    [string]$GitCodeRepository = 'h0pe14o/embyToLocalPlayer'
 )
 
 Set-StrictMode -Version Latest
@@ -29,6 +30,101 @@ function Invoke-GitText {
         Fail "无法$Description。"
     }
     return (($result -join "`n").Trim())
+}
+
+function Invoke-GitCodeText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    if (-not (Get-Command gitcode -ErrorAction SilentlyContinue)) {
+        Fail '找不到 gitcode CLI，无法准备 GitCode Release。请先完成 GitCode CLI 安装和登录。'
+    }
+    $result = @(& gitcode @Arguments '--no-update-check' '--no-interactive' 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Fail "无法$Description。"
+    }
+    return (($result -join "`n").Trim())
+}
+
+function Assert-GitCodeAuth {
+    if (-not (Get-Command gitcode -ErrorAction SilentlyContinue)) {
+        Fail '找不到 gitcode CLI，无法发布 GitCode Release。请先完成 GitCode CLI 安装和登录。'
+    }
+    $null = @(& gitcode auth status '--no-update-check' '--no-interactive' 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Fail 'GitCode CLI 未登录或认证不可用；请使用已登录 CLI，或通过 GC_TOKEN/GITCODE_TOKEN 注入凭据。'
+    }
+}
+
+function Assert-GitCodeTag {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Tag
+    )
+
+    $json = Invoke-GitCodeText -Arguments @(
+        'api', "repos/$GitCodeRepository/tags?per_page=100"
+    ) -Description '读取 GitCode 标签列表'
+    try {
+        $tags = $json | ConvertFrom-Json
+    }
+    catch {
+        Fail 'GitCode 标签列表不是有效 JSON，已停止发布。'
+    }
+    $matchingTags = @($tags | Where-Object { [string]$_.name -eq $Tag })
+    if ($null -eq $tags -or $matchingTags.Count -eq 0) {
+        Fail "GitCode 远端不存在标签 $Tag；脚本不会自动创建 tag。"
+    }
+}
+
+function Get-GitCodeReleaseTags {
+    $json = Invoke-GitCodeText -Arguments @(
+        'release', 'list', '--repo', $GitCodeRepository, '--limit', '100', '--json'
+    ) -Description '读取 GitCode Release 列表'
+    try {
+        $releases = $json | ConvertFrom-Json
+    }
+    catch {
+        Fail 'GitCode Release 列表不是有效 JSON，已停止发布。'
+    }
+    if ($null -eq $releases) {
+        return @()
+    }
+    return @($releases | ForEach-Object { [string]$_.tag_name })
+}
+
+function Remove-GitHubReleaseAfterFailure {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Tag
+    )
+
+    $null = @(& gh release delete $Tag --repo $Repository --yes 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "GitHub Release $Tag 清理失败；tag 未被脚本删除，请人工核对。"
+        return $false
+    }
+    Write-Warning "已清理本次创建的 GitHub Release $Tag；tag 保留。"
+    return $true
+}
+
+function Remove-GitCodeReleaseAfterFailure {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Tag
+    )
+
+    $null = @(& gitcode release delete $Tag --repo $GitCodeRepository --yes '--no-update-check' '--no-interactive' 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "GitCode Release $Tag 清理失败；tag 未被脚本删除，请人工核对。"
+        return $false
+    }
+    Write-Warning "已清理本次创建的 GitCode Release $Tag；tag 保留。"
+    return $true
 }
 
 function Read-ZipEntryText {
@@ -242,6 +338,7 @@ foreach ($forbiddenPhrase in @('发布说明草稿', '仅供审核', '请在此�
 
 $title = "etlp $channel $version"
 $publishFlags = if ($channel -eq 'beta') { '--prerelease' } else { '--latest' }
+$gitCodePublishFlag = if ($channel -eq 'beta') { '--prerelease' } else { '' }
 $displayAssets = @($expectedPackage, $expectedChecksum, 'release-plan.json')
 Write-Output '==> Release plan validated'
 Write-Output "==> channel: $channel"
@@ -249,15 +346,29 @@ Write-Output "==> version: $version"
 Write-Output "==> commit: $plannedCommit"
 Write-Output "==> package SHA256: $actualHash"
 Write-Output "==> assets: $($displayAssets -join ', ')"
+Write-Output "==> GitCode primary Release source: $GitCodeRepository"
+Write-Output "==> GitHub fallback Release source: $Repository"
 
 if (-not $Execute) {
-    Write-Output '==> DRY-RUN: no gh command, tag, push, or remote Release mutation was performed'
-    Write-Output "==> execute command: gh release create $version $expectedPackage $expectedChecksum release-plan.json --repo $Repository --verify-tag --title `"$title`" --notes-file release-notes.md $publishFlags"
+    Write-Output '==> DRY-RUN: no gh command or gitcode command, tag, push, or remote Release mutation was performed'
+    Write-Output "==> execute command (GitHub): gh release create $version $expectedPackage $expectedChecksum release-plan.json --repo $Repository --verify-tag --title `"$title`" --notes-file release-notes.md $publishFlags"
+    Write-Output "==> execute command (GitCode): gitcode release create $version --repo $GitCodeRepository --title `"$title`" --notes-file release-notes.md $gitCodePublishFlag"
+    Write-Output "==> execute command (GitCode assets): gitcode release upload $version $expectedPackage $expectedChecksum release-plan.json --repo $GitCodeRepository"
     exit 0
 }
 
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     Fail '找不到 gh CLI，无法执行远端发布。'
+}
+
+# Validate both destinations before creating either Release. GitCode's CLI can
+# create a tag when one is absent if a target is supplied; this script never
+# supplies a target and explicitly requires the mirrored tag to exist first.
+Assert-GitCodeAuth
+Assert-GitCodeTag -Tag $version
+$gitCodeTags = @(Get-GitCodeReleaseTags)
+if ($gitCodeTags -contains $version) {
+    Fail "GitCode 远端已存在 Release $version，拒绝覆盖。"
 }
 
 $remoteTags = @(& gh api "repos/$Repository/releases" --paginate --jq '.[].tag_name' 2>$null)
@@ -268,20 +379,66 @@ if ($remoteTags -contains $version) {
     Fail "远端已存在 Release $version，拒绝覆盖。"
 }
 
-$ghArguments = @(
-    'release', 'create', $version,
-    $packagePath,
-    $checksumPath,
-    $planPath,
-    '--repo', $Repository,
-    '--verify-tag',
-    '--title', $title,
-    '--notes-file', $notesPath,
-    $publishFlags
-)
-Write-Output "==> executing gh release create for $Repository/$version"
-& gh @ghArguments
-if ($LASTEXITCODE -ne 0) {
-    Fail "gh release create 失败，退出码：$LASTEXITCODE"
+$githubReleaseCreated = $false
+$gitCodeReleaseCreated = $false
+try {
+    $ghArguments = @(
+        'release', 'create', $version,
+        $packagePath,
+        $checksumPath,
+        $planPath,
+        '--repo', $Repository,
+        '--verify-tag',
+        '--title', $title,
+        '--notes-file', $notesPath,
+        $publishFlags
+    )
+    Write-Output "==> executing gh release create for $Repository/$version"
+    & gh @ghArguments
+    if ($LASTEXITCODE -ne 0) {
+        Fail "gh release create 失败，退出码：$LASTEXITCODE"
+    }
+    $githubReleaseCreated = $true
+
+    $gitCodeCreateArguments = @(
+        'release', 'create', $version,
+        '--repo', $GitCodeRepository,
+        '--title', $title,
+        '--notes-file', $notesPath
+    )
+    if ($channel -eq 'beta') {
+        $gitCodeCreateArguments += '--prerelease'
+    }
+    Write-Output "==> executing GitCode Release create for $GitCodeRepository/$version"
+    $null = @(& gitcode @gitCodeCreateArguments '--no-update-check' '--no-interactive' 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Fail "GitCode release create 失败，退出码：$LASTEXITCODE"
+    }
+    $gitCodeReleaseCreated = $true
+
+    $gitCodeUploadArguments = @(
+        'release', 'upload', $version,
+        $packagePath,
+        $checksumPath,
+        $planPath,
+        '--repo', $GitCodeRepository
+    )
+    Write-Output "==> uploading GitCode Release assets for $GitCodeRepository/$version"
+    $null = @(& gitcode @gitCodeUploadArguments '--no-update-check' '--no-interactive' 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Fail "GitCode release asset upload 失败，退出码：$LASTEXITCODE"
+    }
 }
-Write-Output '==> remote Release created; tag and branches were not created or pushed by this script'
+catch {
+    # Only delete Releases whose create command completed successfully in this
+    # invocation. The preflight above rejects existing tags, and the delete
+    # commands deliberately keep tags so no pre-existing release/tag is touched.
+    if ($gitCodeReleaseCreated) {
+        Remove-GitCodeReleaseAfterFailure -Tag $version | Out-Null
+    }
+    if ($githubReleaseCreated) {
+        Remove-GitHubReleaseAfterFailure -Tag $version | Out-Null
+    }
+    throw
+}
+Write-Output '==> GitHub and GitCode Releases created; tag and branches were not created or pushed by this script'
