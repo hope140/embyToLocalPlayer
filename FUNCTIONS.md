@@ -14,6 +14,7 @@
 | --- | --- |
 | 上游关系 | `main` 只同步 [kjtsune/embyToLocalPlayer](https://github.com/kjtsune/embyToLocalPlayer)；`beta` 和 `stable` 在本仓库独立维护。 |
 | CloudDrive2 | `[clouddrive2]` 启用后，使用本地 CloudDrive2 gRPC API、`path_map` 和 ETLP 短期本地 gateway 解析 STRM；失败回退原挂载文件。 |
+| mpv 连播章节 | Emby/Jellyfin 条目请求同时获取 `Chapters`，每集独立传递完整章节；mpv/mpv.net 加载后按实际媒体路径补齐空章节列表，保留已有内嵌章节。Emby 与媒体均无章节时保持为空。 |
 | 独立远程控制 | `[remote_control]` 为当前 mpv/IINA 建立独立 Emby 会话控制通道，支持暂停/继续、seek、停止和消息显示；只作用于当前机器。 |
 | 实时反馈 | `[dev] playing_feedback_*` 面向 mpv/IINA 回传播放位置和暂停状态；最终回传仍由 `[emby] update_progress` 控制。 |
 | 明确排除 | 本项目不实现同步观看房间；该能力请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。同时不对豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 联动等旁线能力提供支持承诺。 |

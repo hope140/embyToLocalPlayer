@@ -1,5 +1,7 @@
+import math
 import os
 import platform
+import re
 import threading
 import time
 import typing
@@ -241,6 +243,159 @@ class Downloader:
         return done
 
 
+_PREFETCH_TIMEOUT = 10
+_PREFETCH_RETRY = 1
+_PREFETCH_READ_SIZE = 64 * 1024
+
+
+def _prefetch_header(response, name):
+    """Return a response header for urllib responses and test doubles."""
+    try:
+        value = response.getheader(name)
+    except (AttributeError, KeyError, TypeError):
+        value = None
+    if value is not None:
+        return value
+    headers = getattr(response, 'headers', None)
+    if headers is None:
+        return None
+    try:
+        return headers.get(name) or headers.get(name.lower())
+    except (AttributeError, KeyError, TypeError):
+        return None
+
+
+def _prefetch_status(response):
+    status = getattr(response, 'status', None)
+    return status if status is not None else getattr(response, 'code', None)
+
+
+def _prefetch_size(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed <= 0:
+        return None
+    if isinstance(value, float) and (not math.isfinite(value) or parsed != value):
+        return None
+    return parsed
+
+
+def _prefetch_content_range(value):
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r'\s*bytes\s+(\d+)-(\d+)/(\d+)\s*', value, re.IGNORECASE)
+    if not match:
+        return None
+    start, end, total = (int(group) for group in match.groups())
+    if end < start or total <= end:
+        return None
+    return start, end, total
+
+
+def _prefetch_read(response, byte_count):
+    read_count = 0
+    while read_count < byte_count:
+        remaining = byte_count - read_count
+        chunk = response.read(min(_PREFETCH_READ_SIZE, remaining))
+        if not chunk:
+            break
+        read_count += min(len(chunk), remaining)
+    return read_count == byte_count
+
+
+def prefetch_http_range(url, start_percent, end_percent, size=None):
+    """Best-effort HTTP range prefetch that never creates local state.
+
+    This is intentionally separate from :class:`Downloader`: discard prefetches
+    must not create cache files, task files, locks, or sparse files.  A failure
+    only skips this hint and must not affect playback.
+    """
+    try:
+        start_percent = float(start_percent)
+        end_percent = float(end_percent)
+    except (TypeError, ValueError, OverflowError):
+        logger.info('discard prefetch skipped: invalid range')
+        return False
+    if (not math.isfinite(start_percent) or not math.isfinite(end_percent)
+            or start_percent < 0 or end_percent > 1 or end_percent <= start_percent):
+        logger.info('discard prefetch skipped: invalid range')
+        return False
+
+    media_size = _prefetch_size(size)
+    if media_size is None and size is not None:
+        logger.info('discard prefetch skipped: invalid size')
+        return False
+    if media_size is None:
+        response = None
+        try:
+            response = requests_urllib(
+                url, method='HEAD', http_proxy=configs.dl_proxy,
+                res_only=True, timeout=_PREFETCH_TIMEOUT, retry=_PREFETCH_RETRY,
+                silence=True)
+            status = _prefetch_status(response)
+            if status is None or not 200 <= status < 300:
+                logger.info('discard prefetch skipped: size request failed')
+                return False
+            media_size = _prefetch_size(_prefetch_header(response, 'Content-Length'))
+        except Exception as exc:
+            logger.info(f'discard prefetch skipped: size request {type(exc).__name__}')
+            return False
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+        if media_size is None:
+            logger.info('discard prefetch skipped: missing size')
+            return False
+
+    start = int(media_size * start_percent)
+    end = int(media_size * end_percent) - 1
+    end = min(end, media_size - 1)
+    if start >= media_size or end < start:
+        logger.info('discard prefetch skipped: empty range')
+        return False
+    byte_count = end - start + 1
+    if byte_count >= media_size:
+        logger.info('discard prefetch skipped: full range')
+        return False
+
+    response = None
+    try:
+        response = requests_urllib(
+            url, headers={'Range': f'bytes={start}-{end}'},
+            http_proxy=configs.dl_proxy, res_only=True,
+            timeout=_PREFETCH_TIMEOUT, retry=_PREFETCH_RETRY, silence=True)
+        status = _prefetch_status(response)
+        if status == 206:
+            content_range = _prefetch_content_range(_prefetch_header(response, 'Content-Range'))
+            if not content_range or content_range != (start, end, media_size):
+                logger.info('discard prefetch skipped: invalid content range')
+                return False
+        elif status == 200 and start == 0:
+            # A server may ignore a first-byte Range.  Only consume the requested
+            # prefix; a non-zero request must never be treated as a tail hit.
+            pass
+        else:
+            logger.info('discard prefetch skipped: unsupported response')
+            return False
+        return _prefetch_read(response, byte_count)
+    except Exception as exc:
+        logger.info(f'discard prefetch skipped: {type(exc).__name__}')
+        return False
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
 class DownloadManager:
     def __init__(self, cache_path, speed_limit=0, max_concurrent=3, per_domain_limit=2):
         self.cache_path = cache_path
@@ -447,7 +602,6 @@ def prefetch_resume_tv():
 
 def _prefetch_resume_tv(emby_thin: EmbyApiThin, startswith, fetch_type=''):
     startswith = tuple(startswith)
-    null_file = 'NUL' if os.name == 'nt' else '/dev/null'
 
     if configs.raw.getboolean('tg_notify', 'get_chat_id', fallback=False):
         tg_notify('_get_chat_id')
@@ -554,12 +708,10 @@ def _prefetch_resume_tv(emby_thin: EmbyApiThin, startswith, fetch_type=''):
                         continue
                     try:
                         logger.info(f'prefetch {relative_path} \n{stream_url[:100]}')
-                        dl = Downloader(url=stream_url, _id=os.path.basename(file_path), save_path=null_file,
-                                        size=ep.get('size'))
-                        dl.percent_download(0, 0.05)
-                        dl.percent_download(0.98, 1)
-                    except Exception:
-                        logger.error(f'prefetch error on download connection, skip\n{stream_url}')
+                        prefetch_http_range(stream_url, 0, 0.05, size=ep.get('size'))
+                        prefetch_http_range(stream_url, 0.98, 1, size=ep.get('size'))
+                    except Exception as exc:
+                        logger.error(f'prefetch error on download connection, skip ({type(exc).__name__})')
                     print()
                 if item_id in notify_item_list:
                     tg_notify(notify_msg)

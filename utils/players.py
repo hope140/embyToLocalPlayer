@@ -1,5 +1,6 @@
 import base64
 import json
+import math
 import os.path
 import platform
 import re
@@ -8,11 +9,12 @@ import threading
 import time
 import urllib.parse
 from html.parser import HTMLParser
+from numbers import Real
 
 from utils.configs import configs, MyLogger
 from utils.data_parser import list_episodes
 from utils.net_tools import cache_sub_file, requests_urllib, save_sub_file
-from utils.python_mpv_jsonipc import MPV
+from utils.python_mpv_jsonipc import MPV, MPVError
 from utils.tools import activate_window_by_pid
 
 logger = MyLogger()
@@ -254,6 +256,170 @@ def mpv_display_message(mpv, message, duration_ms=5000):
         return False
 
 
+def _mpv_path_key(path):
+    """Return the identity key used by the per-mpv chapter registry."""
+
+    if not isinstance(path, (str, os.PathLike)):
+        return None
+    try:
+        path = os.fspath(path)
+    except TypeError:
+        return None
+    if not path or isinstance(path, bytes):
+        return None
+    # Gateway URLs are opaque and must remain byte-for-byte keys.  Normalizing
+    # them could change a nonce or its query string; local paths need the
+    # canonical form mpv reports through its ``path`` property.
+    if path.casefold().startswith(('http://', 'https://')):
+        return path
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _valid_chapter_time(value):
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def _chapters_for_mpv_data(data):
+    """Return safe chapter-list data, including the legacy intro fallback."""
+
+    if not isinstance(data, dict):
+        return []
+
+    raw_chapters = data.get('chapters')
+    result = []
+    if isinstance(raw_chapters, (list, tuple)):
+        for index, chapter in enumerate(raw_chapters, 1):
+            if not isinstance(chapter, dict):
+                continue
+            chapter_time = _valid_chapter_time(chapter.get('time'))
+            if chapter_time is None:
+                continue
+            title = chapter.get('title')
+            title = title.strip() if isinstance(title, str) else ''
+            result.append({'title': title or f'Chapter {index}', 'time': chapter_time})
+        result.sort(key=lambda chapter: chapter['time'])
+    if result:
+        return result
+
+    intro_start = _valid_chapter_time(data.get('intro_start'))
+    intro_end = _valid_chapter_time(data.get('intro_end'))
+    if intro_start is not None and intro_end is not None and intro_end > intro_start:
+        return [
+            {'title': 'Opening', 'time': intro_start},
+            {'title': 'Main', 'time': intro_end},
+        ]
+    return []
+
+
+def _mpv_chapter_state(mpv):
+    """Get lazily-created per-instance chapter state without global keys."""
+
+    registry = getattr(mpv, '_etlp_chapters_by_path', None)
+    if not isinstance(registry, dict):
+        registry = {}
+        setattr(mpv, '_etlp_chapters_by_path', registry)
+    lock = getattr(mpv, '_etlp_chapters_lock', None)
+    if lock is None:
+        lock = threading.RLock()
+        setattr(mpv, '_etlp_chapters_lock', lock)
+    return registry, lock
+
+
+def _register_mpv_chapter_data(mpv, data, *paths):
+    """Register one episode by every path that may be sent to mpv."""
+
+    if not mpv or not isinstance(data, dict):
+        return
+    chapter_list = _chapters_for_mpv_data(data)
+    item_id = data.get('item_id')
+    item_id = str(item_id) if item_id is not None else ''
+    candidates = list(paths)
+    candidates.append(data.get('media_path'))
+    registry, lock = _mpv_chapter_state(mpv)
+    with lock:
+        for path in candidates:
+            key = _mpv_path_key(path)
+            if key is None:
+                continue
+            registry[key] = {
+                'item_id': item_id,
+                'chapters': [chapter.copy() for chapter in chapter_list],
+            }
+
+
+def _lookup_mpv_chapter_data(mpv, path):
+    key = _mpv_path_key(path)
+    if key is None:
+        return []
+    registry, lock = _mpv_chapter_state(mpv)
+    with lock:
+        entry = registry.get(key) or {}
+        return [chapter.copy() for chapter in entry.get('chapters', [])]
+
+
+def _inject_mpv_chapters(mpv, path=None):
+    """Inject registered chapters only when the loaded file has none."""
+
+    if not mpv:
+        return False
+    try:
+        if path is None:
+            path = mpv.command('get_property', 'path')
+        chapters = _lookup_mpv_chapter_data(mpv, path)
+        if not chapters:
+            return False
+        native_chapters = mpv.command('get_property', 'chapter-list')
+        if native_chapters:
+            return False
+        # A fast playlist transition can happen between the path lookup and
+        # the write.  Verify the identity again immediately before mutating
+        # mpv so a stale file-loaded callback cannot decorate another item.
+        checked_path = mpv.command('get_property', 'path')
+        checked_key = _mpv_path_key(checked_path)
+        path_key = _mpv_path_key(path)
+        if checked_key is None or path_key is None or checked_key != path_key:
+            return False
+        mpv.command('set_property', 'chapter-list', chapters)
+        return True
+    except Exception:
+        # MPVError, BrokenPipeError and a closed IPC socket all mean that this
+        # best-effort decoration should stop quietly with a fixed diagnostic.
+        logger.info('mpv chapter injection skipped: IPC unavailable')
+        return False
+
+
+def _ensure_mpv_chapter_listener(mpv):
+    """Bind one file-loaded listener to this IPC instance."""
+
+    if not mpv:
+        return
+    if getattr(mpv, '_etlp_chapters_listener_bound', False) is True:
+        return
+    # An event can arrive as soon as the callback is bound.  Create the shared
+    # registry first so it cannot race with startup/playlist registration.
+    _mpv_chapter_state(mpv)
+
+    def on_file_loaded(_event_data):
+        _inject_mpv_chapters(mpv)
+
+    try:
+        mpv.on_event('file-loaded')(on_file_loaded)
+    except Exception:
+        return
+    setattr(mpv, '_etlp_chapters_listener_bound', True)
+
+
 # *_player_start 返回获取播放时间等操作所需参数字典
 # stop_sec_* 接收字典参数
 
@@ -287,7 +453,9 @@ def mpv_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_s
     sub_file = prepare_subtitle(sub_file, data)
     if sub_file and data and data.get('use_strm_local_path'):
         data['sub_file'] = sub_file
-    intro_start, intro_end = data.get('intro_start'), data.get('intro_end')
+    # Keep the exact startup path: list_episodes may later derive a fresh
+    # gateway nonce for the same item, while mpv is still opening this one.
+    startup_media_path = cmd[1] if isinstance(cmd, (list, tuple)) and len(cmd) > 1 else None
     is_darwin = True if platform.system() == 'Darwin' else False
     is_iina = True if 'iina-cli' in cmd[0] else False
     is_mpvnet = True if 'mpvnet' in cmd[0] else False
@@ -361,27 +529,17 @@ def mpv_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_s
     if sub_file and is_mpvnet and mpv:
         _cmd = ['sub-add', sub_file]
         mpv.command(*_cmd)
-    if mpv and intro_end:
-        chapter_list = [{'title': 'Opening', 'time': intro_start}, {'title': 'Main', 'time': intro_end}]
-        event_name = 'file-loaded'
-        mpv.command('set_property', 'chapter-list', chapter_list)  # 'file-loaded' 事件在起播快时会失效，此时本行则生效。
-
-        @mpv.on_event(event_name)
-        def fist_ep_intro_adder(_event_data):
-            has_chapters = mpv.command('get_property', 'chapter-list')
-            if not has_chapters:
-                if media_title != mpv.command('get_property', 'media-title'):
-                    logger.info('skip add opening scene chapters, cuz media_title not match')
-                    return
-                mpv.command('set_property', 'chapter-list', chapter_list)
-                logger.info('opening scene found, add to chapters')
-            else:
-                callbacks = mpv.event_bindings[event_name]
-                if len(callbacks) == 1:
-                    del mpv.event_bindings[event_name]
-                else:
-                    callbacks = {i for i in callbacks if 'fist_ep_intro_adder' not in str(i)}
-                    mpv.event_bindings[event_name] = callbacks
+    if mpv:
+        # Persist the path passed on the startup command.  The playlist parser
+        # may create a fresh gateway/cache path for the same first item while
+        # the already-started mpv instance is still opening this one.
+        setattr(mpv, '_etlp_startup_media_path', startup_media_path)
+        _ensure_mpv_chapter_listener(mpv)
+        _register_mpv_chapter_data(mpv, data, startup_media_path)
+        # The file-loaded event can be emitted before the listener is bound;
+        # this immediate best-effort attempt covers an already-loaded first
+        # item, while the listener remains active for every later transition.
+        _inject_mpv_chapters(mpv, startup_media_path)
 
     if speed := mpv_play_speed.get(media_title):
         mpv.command('set_property', 'speed', speed)
@@ -422,6 +580,12 @@ def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
         logger.error('mpv not found skip playlist_add_mpv')
         return {}
     episodes = eps_data or list_episodes(data)
+    _ensure_mpv_chapter_listener(mpv)
+    # ``data`` is the parser result used to launch mpv.  Register it first so
+    # its exact startup gateway path remains available even if list_episodes
+    # obtains a different short-lived URL for the same item.
+    _register_mpv_chapter_data(
+        mpv, data, getattr(mpv, '_etlp_startup_media_path', None), data.get('media_path'))
     is_iina = getattr(mpv, 'is_iina')
     mount_disk_mode = data['mount_disk_mode']
     # 检查是否是新版loadfile命令
@@ -444,9 +608,20 @@ def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
             basename = ep['basename']
             media_title = ep['media_title']
             if basename == data['basename']:
-                if intro_end := ep.get('intro_end'):
-                    chap_path = mpv_intro_chapters_maker(start=ep['intro_start'], end=intro_end, file_name=basename)
-                    mpv.command('set_property', 'chapters-file', chap_path)
+                # This entry is already loaded.  Keep both the parsed startup
+                # path and the row's path registered for callbacks/replay;
+                # chapter injection itself is done by the shared listener.
+                current_paths = [ep.get('media_path')]
+                if (ep.get('item_id') is not None
+                        and data.get('item_id') is not None
+                        and str(ep.get('item_id')) == str(data.get('item_id'))):
+                    current_paths[0:0] = [
+                        getattr(mpv, '_etlp_startup_media_path', None), data.get('media_path')]
+                _register_mpv_chapter_data(mpv, ep, *current_paths)
+                # list_episodes may have supplied the first item's chapters
+                # only after startup.  Re-check the actual loaded path now;
+                # the listener remains authoritative for later transitions.
+                _inject_mpv_chapters(mpv)
                 continue
             if is_iina:
                 continue
@@ -463,34 +638,34 @@ def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
                 else:
                     sub_cmd = f',sub-file={sub_file}'
 
-            if intro_end := ep.get('intro_end'):
-                chap_path = mpv_intro_chapters_maker(start=ep['intro_start'], end=intro_end, file_name=basename)
-                chap_cmd = f',chapters-file="{chap_path}"'
+            options = (f'force-media-title="{media_title}"'
+                       f',osd-playing-msg="{media_title}",start=0{sub_cmd}')
+            if sub_inner_idx := ep.get('sub_inner_idx'):
+                options += f',sid={sub_inner_idx}'
+            if insert:
+                mpv_cmd = ['loadfile', ep['media_path'], 'insert-at', '0', options]
             else:
-                chap_cmd = ''
-
-            try:
-                options = (f'force-media-title="{media_title}"'
-                           f',osd-playing-msg="{media_title}",start=0{sub_cmd}{chap_cmd}')
-                if sub_inner_idx := ep.get('sub_inner_idx'):
-                    options += f',sid={sub_inner_idx}'
+                mpv_cmd = ['loadfile', ep['media_path'], 'append', '-1', options]
+                if gui_without_confirm:
+                    mpv_cmd[1] = os.path.join(configs.cache_path, ep['fake_name'])
+            logger.debug(options)
+            if not new_loadfile_cmd:
+                del mpv_cmd[-2]
                 if insert:
-                    mpv_cmd = ['loadfile', ep['media_path'], 'insert-at', '0', options]
-                else:
-                    mpv_cmd = ['loadfile', ep['media_path'], 'append', '-1', options]
-                    if gui_without_confirm:
-                        mpv_cmd[1] = os.path.join(configs.cache_path, ep['fake_name'])
-                logger.debug(options)
-                if not new_loadfile_cmd:
-                    del mpv_cmd[-2]
-                    if insert:
-                        logger.info('playlist insert disabled, require mpv version >= 0.38')
-                        break
+                    logger.info('playlist insert disabled, require mpv version >= 0.38')
+                    break
+            # Use the path actually passed to loadfile.  In GUI-confirm
+            # mode this is a cache path, and with insert/append it can
+            # differ from the parser's current gateway URL.
+            _register_mpv_chapter_data(mpv, ep, mpv_cmd[1])
+            try:
                 mpv.command(*mpv_cmd)
-                ep['mpv_cmd'] = mpv_cmd
-            except OSError:
-                logger.error('mpv exit: by playlist_add_mpv: except OSError')
+            except (OSError, MPVError):
+                # MPVError is not an OSError; both it and a closed IPC socket
+                # are expected during player shutdown and must be harmless.
+                logger.error('mpv exit: playlist IPC unavailable')
                 return {}
+            ep['mpv_cmd'] = mpv_cmd
 
     cur_index = None
     for _index, _ep in enumerate(episodes):

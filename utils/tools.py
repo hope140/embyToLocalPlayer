@@ -1,4 +1,5 @@
 import json
+import math
 import os.path
 import re
 import signal
@@ -7,6 +8,7 @@ import threading
 import time
 import urllib.parse
 from collections import defaultdict
+from numbers import Real
 from typing import Union
 
 import unicodedata
@@ -571,21 +573,111 @@ def main_ep_to_title(main_ep_info):
            f":E{main_ep_info['IndexNumber']}-{main_ep_info['IndexNumberEnd']} - {main_ep_info['Name']}"
 
 
+def _chapter_ticks_to_seconds(chapter):
+    """Return a valid chapter timestamp, or ``None`` for malformed input."""
+
+    if not isinstance(chapter, dict):
+        return None
+    ticks = chapter.get('StartPositionTicks')
+    # ``bool`` is an ``int`` subclass, but it is never a meaningful Emby
+    # timestamp.  Restricting this to real numbers also avoids silently
+    # accepting arbitrary strings supplied by a malformed response.
+    if isinstance(ticks, bool) or not isinstance(ticks, Real):
+        return None
+    try:
+        ticks = float(ticks)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(ticks) or ticks < 0:
+        return None
+    seconds = ticks / (10 ** 7)
+    return seconds if math.isfinite(seconds) else None
+
+
+def main_ep_chapters(item):
+    """Normalize an Emby item's chapters for mpv's ``chapter-list``.
+
+    Emby returns chapter positions as 100-nanosecond ticks while mpv expects
+    seconds.  Keep every valid entry (including marker chapters), retain
+    fractional seconds, and make malformed responses harmless.  This helper
+    deliberately has no side effects and never mutates the source item.
+    """
+
+    raw_chapters = item.get('Chapters') if isinstance(item, dict) else None
+    if not isinstance(raw_chapters, (list, tuple)):
+        return []
+
+    marker_names = {
+        'introstart': 'Opening',
+        'introend': 'Main',
+        'creditsstart': 'Credits',
+        'creditsend': 'Credits',
+    }
+    valid = []
+    for ordinal, chapter in enumerate(raw_chapters):
+        seconds = _chapter_ticks_to_seconds(chapter)
+        if seconds is None:
+            continue
+        name = chapter.get('Name')
+        if isinstance(name, str):
+            name = name.strip()
+        else:
+            # Do not stringify arbitrary malformed containers into the OSD.
+            # Marker names and the deterministic Chapter N fallback below are
+            # sufficient when Emby supplies a non-text Name.
+            name = ''
+        if not name:
+            marker = chapter.get('MarkerType')
+            marker_key = marker.casefold() if isinstance(marker, str) else ''
+            name = marker_names.get(marker_key)
+        valid.append((seconds, ordinal, name))
+
+    # Sorting is stable for equal timestamps because the original ordinal is
+    # retained explicitly.  Assign fallback names after sorting so the names
+    # are deterministic even when Emby returns chapters out of order.
+    valid.sort(key=lambda value: (value[0], value[1]))
+    result = []
+    for index, (seconds, _ordinal, name) in enumerate(valid, 1):
+        result.append({'title': name or f'Chapter {index}', 'time': seconds})
+    return result
+
+
 def main_ep_intro_time(main_ep_info):
-    res = {}
-    if not main_ep_info.get('Chapters'):
-        return res
-    chapters = [i for i in main_ep_info['Chapters'][:5] if i.get('MarkerType')
-                and not str(i['StartPositionTicks']).endswith('000000000')
-                and not (i['StartPositionTicks'] == 0 and i['MarkerType'] == 'Chapter')]
-    if not chapters or len(chapters) > 2:
-        return res
-    for i in chapters:
-        if i['MarkerType'] == 'IntroStart':
-            res['intro_start'] = i['StartPositionTicks'] // (10 ** 7)
-        elif i['MarkerType'] == 'IntroEnd':
-            res['intro_end'] = i['StartPositionTicks'] // (10 ** 7)
-    return res
+    """Extract one valid explicit IntroStart/IntroEnd pair.
+
+    Marker chapters are authoritative here: ordinary chapter timestamps,
+    their position in the list, and decimal/round-number heuristics must not
+    affect intro detection.  A zero-second start is valid.
+    """
+
+    raw_chapters = main_ep_info.get('Chapters') if isinstance(main_ep_info, dict) else None
+    if not isinstance(raw_chapters, (list, tuple)):
+        return {}
+
+    starts = []
+    ends = []
+    for chapter in raw_chapters:
+        if not isinstance(chapter, dict):
+            continue
+        marker = chapter.get('MarkerType')
+        if not isinstance(marker, str):
+            continue
+        seconds = _chapter_ticks_to_seconds(chapter)
+        if seconds is None:
+            continue
+        marker = marker.casefold()
+        if marker == 'introstart':
+            starts.append(seconds)
+        elif marker == 'introend':
+            ends.append(seconds)
+
+    starts.sort()
+    ends.sort()
+    for start in starts:
+        end = next((candidate for candidate in ends if candidate > start), None)
+        if end is not None:
+            return {'intro_start': start, 'intro_end': end}
+    return {}
 
 
 def show_version_info(extra_data=None):
