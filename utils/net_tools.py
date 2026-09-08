@@ -69,7 +69,7 @@ def safe_url(url):
 
 def requests_urllib(host, params=None, _json=None, decode=False, timeout=5.0, headers=None, req_only=False,
                     http_proxy='', get_json=False, save_path='', retry=5, silence=False, res_only=False,
-                    method=None):
+                    method=None, return_http_error=False):
     _json = json.dumps(_json).encode('utf-8') if _json is not None else None
     params = urllib.parse.urlencode(params) if params else None
     host = host + '?' + params if params else host
@@ -105,11 +105,21 @@ def requests_urllib(host, params=None, _json=None, decode=False, timeout=5.0, he
             if try_times == retry:
                 raise TimeoutError(f'{try_times=} host={log_host}') from None
         except urllib.error.HTTPError as e:
+            if res_only and return_http_error and try_times == retry:
+                return e
             if e.code == 304 and res_only:
                 return e
             logger.error(f'urllib {try_times=} host={log_host}\n{str(e)[:100]}', silence=silence)
             if try_times == retry:
+                try:
+                    e.close()
+                except Exception:
+                    pass
                 raise ConnectionError(f'{try_times=} host={log_host} \n{str(e)[:100]}') from None
+            try:
+                e.close()
+            except Exception:
+                pass
         except urllib.error.URLError as e:
             logger.error(f'urllib {try_times=} host={log_host}\n{str(e)[:100]}', silence=silence)
             if try_times == retry:
