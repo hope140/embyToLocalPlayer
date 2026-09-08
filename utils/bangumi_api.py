@@ -176,8 +176,9 @@ class BangumiApi:
         ep_num_list = target_ep if isinstance(target_ep, list) else None
         target_ep = ep_num_list[0] if isinstance(target_ep, list) else target_ep
 
-        if target_season > 5 or (target_ep and target_ep > 99):
+        if target_season > 8 or (target_ep and target_ep > 300):
             return None, None if target_ep else None
+        loop_limit = 10
         platform_allow = ['TV']
         if not subject_platform:
             subject_platform = self.get_subject(subject_id)['platform']
@@ -189,7 +190,7 @@ class BangumiApi:
             if not target_ep:
                 return current_id
             fist_part = True
-            while True:
+            for _ in range(loop_limit):
                 # if not fist_part:
                 #     current_info = self.get_subject(current_id)
                 #     if current_info['platform'] not in platform_allow: # TV 的续集可能是 OVA，导致匹配失败
@@ -216,11 +217,11 @@ class BangumiApi:
                 fist_part = False
             return None, None if target_ep else None
 
-        while True:
+        for _ in range(loop_limit):
             related = self.get_related_subjects(current_id)
             next_id = [i for i in related if i['relation'] == '续集']
             remake = [i for i in related if i['relation'] == '不同演绎']
-            next_id = next_id or remake
+            next_id = next_id or remake  # 最终季有不同演绎时会死循环。
             if not next_id:
                 break
             current_id = next_id[0]['id']

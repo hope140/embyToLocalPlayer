@@ -6,7 +6,7 @@ etlp - Emby/Jellyfin 调用 PotPlayer mpv IINA MPC VLC 播放，并回传播放�
 
 * 在首页也可以播放。点击原来的播放按钮就可以。可配置版本优先级（若视频多版本）。
 * 播放列表（连续播放）支持，下一集保持相同版本。
-* bangumi.tv bgm.tv simkl.tv trakt.tv 单向标记已观看支持。
+* bgm.tv bangumi.tv simkl.com trakt.tv 单向标记已观看支持。
 * 本地挂载用户：可跳转到路径对应文件夹。（按钮在网页显示文件路径的上面）
 * 未适配的播放器一般也能用，只是不会回传进度。
 * 可在 qBittorrent WebUI 里直接播放或者跳转到路径对应挂载文件夹。
@@ -373,7 +373,7 @@ https://github.com/kjtsune/embyToLocalPlayer#faq
 </details>
 
 <details>
-<summary>bgm.tv / trakt.tv 存储记录</summary>
+<summary>bgm.tv / simkl / trakt.tv 存储记录</summary>
 
 ### bgm.tv / simkl / trakt.tv 存储记录
 
@@ -400,7 +400,7 @@ https://github.com/kjtsune/embyToLocalPlayer#faq
     2. ini 配置文件 `[bangumi]` 填写 `enable_host` `user_name` 这两项。
     3. 启动脚本，播放一集动漫，拖到最后，关闭播放器。看日志是否同步成功。
 * 常见问题：
-    1. 5季或者90集以上的条目暂不支持。
+    1. 8季或者300集以上的条目暂不支持。同时最多查找10次续集。
     2. 日志提示 `Unauthorized` 一般是令牌过期或者没填对，Windows 会自动弹出令牌生成页面。
   3. 集上映日期匹配方案：在常规搜索失败后采用，此时无视季和集数对应，只要 Emby bgm 集上映日期相差两天(含)内就匹配成功。
   4. 由于 `bgm.tv` 的 `续集` 不一定是下一季，导致第几季可能关联错误（经下面处理后概率低）。  
