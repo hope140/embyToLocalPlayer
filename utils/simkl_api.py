@@ -60,7 +60,6 @@ class SimklApi:
         res = self.req.post(url, json=_json if _json is not None else {}, params=_params)
         self._last_post_ts = time.time()
         if res.status_code == 401 and path != 'oauth/token':
-            # access_token 失效/被用户撤销，且 simkl 无 refresh_token，只能提示重新走浏览器授权
             try:
                 os.remove(self.token_file)
             except Exception:
@@ -71,17 +70,15 @@ class SimklApi:
         except Exception:
             raise PermissionError(f'error found, {res.status_code=} {url=}') from None
 
-    def add_ep_or_movie_to_history(self, movies: list = None, shows: list = None):
-        # https://api.simkl.org/api-reference/simkl/add-to-history
-        # movies: [{'ids': {...}, 'title':.., 'year':..}, ..]
-        # shows: [{'ids': {...}, 'title':.., 'year':.., 'seasons': [{'number':N, 'episodes':[{'number':N},..]}],
-        #          'use_tvdb_anime_seasons': True}, ..]
-        # simkl 对重复标记会自动跳过 (no-op by default unless ?allow_rewatch=yes)，不需要预先查重。
+    def add_ep_or_movie_to_history(self, movies: list = None, shows: list = None, episodes=None):
+        # simkl 对重复标记会自动跳过，不需要预先查重。
         body = {}
         if movies:
             body['movies'] = movies
         if shows:
             body['shows'] = shows
+        if episodes:
+            body['episodes'] = episodes
         if not body:
             return
         res = self.post('sync/history', _json=body)

@@ -175,7 +175,7 @@ def search_and_sync(bgm, title, ori_title, premiere_date, season_num, ep_nums, e
     bgm_check_ep_miss_mark(bgm=bgm, emby=emby, eps_data=eps_data, bgm_sea_id=bgm_sea_id)
 
 
-def get_emby_season_watched_ep_key(emby, eps_data, get_date=False):
+def get_emby_season_watched_ep_key(emby, eps_data, get_date=False, full_data=False):
     if not emby.user_id:  # sync_via_stream_url 没有 user_id
         user_id = configs.get_server_api_by_ini(specify_host=emby.host).user_id
         if not user_id:
@@ -189,12 +189,13 @@ def get_emby_season_watched_ep_key(emby, eps_data, get_date=False):
     if not sea_id:
         return
     try:
-        eps_data = emby.get_episodes(item_id=ser_id, season_id=sea_id, get_user_data=True)['Items']
+        eps_data = emby.get_episodes(item_id=ser_id, season_id=sea_id, get_user_data=True, get_sources=True)['Items']
     except ValueError as e:
         logger.error(f'skip get_emby_season_watched_ep_key: {str(e)[:50]}')
         return
     watched = []
     dates = []
+    f_data = []
     for ep in eps_data:
         if not ep['UserData']['Played']:
             continue
@@ -204,7 +205,11 @@ def get_emby_season_watched_ep_key(emby, eps_data, get_date=False):
         key = f'{sea_num}-{ep_num}'
         if get_date:
             dates.append(ep.get('PremiereDate'))
+        if full_data:
+            f_data.append(ep)
         watched.append(key)
+    if full_data:
+        return watched, dates, f_data
     return (watched, dates) if get_date else watched
 
 
@@ -212,7 +217,9 @@ def bgm_check_ep_miss_mark(bgm, emby, eps_data, bgm_sea_id):
     # 不支持 Plex。
     if not emby:
         return
-    em_keys, em_dates = get_emby_season_watched_ep_key(emby=emby, eps_data=eps_data, get_date=True)
+    em_keys, em_dates = None, None
+    if _res := get_emby_season_watched_ep_key(emby=emby, eps_data=eps_data, get_date=True):
+        em_keys, em_dates = _res
     if not em_keys:
         return
     sea_num = int(em_keys[0].split('-')[0])

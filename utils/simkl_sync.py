@@ -48,43 +48,47 @@ def build_show_item_with_eps(emby, eps_data):
         logger.info(f'simkl: series not have {PROVIDERS} id, skip')
         return
 
-    ep_keys = set()
+    if cloud_eps := get_emby_season_watched_ep_key(emby=emby, eps_data=eps_data, full_data=True):
+        eps_data[:0] = cloud_eps[2][-20:]
+    watched_keys = []
+    ep_ids = []
     for ep in eps_data:
         ep_index = ep.get('index') or ep.get('IndexNumber')  # sync via stream 不是 index
         season_num = ep.get('ParentIndexNumber')
         if ep_index is None or season_num is None:
             continue
-        ep_keys.add(f'{season_num}-{ep_index}')
-
-    em_keys = get_emby_season_watched_ep_key(emby=emby, eps_data=eps_data) or []
-    ep_keys |= set(em_keys)
-
-    if not ep_keys:
+        ep_key = (season_num, ep_index)
+        if ep_key in watched_keys:
+            continue
+        pvd_ids = {k.lower(): v for k, v in ep['ProviderIds'].items() if k.lower() in PROVIDERS}
+        watched_keys.append(ep_key)
+        if pvd_ids:
+            ep_ids.append({'ids': pvd_ids})
+    if not watched_keys:
         logger.info('simkl: no watched episode key found, skip')
         return
+
     seasons_map = {}
-    for key in ep_keys:
-        try:
-            sea_str, ep_str = key.split('-', 1)
-            sea_num, ep_num = int(sea_str), int(ep_str)
-        except ValueError:
-            continue
-        seasons_map.setdefault(sea_num, set()).add(ep_num)
+    for (season_num, ep_index) in watched_keys:
+        ep_obj = {'number': ep_index}
+        seasons_map.setdefault(season_num, []).append(ep_obj)
 
-    seasons = [{'number': sea_num, 'episodes': [{'number': n} for n in sorted(ep_nums)]}
-               for sea_num, ep_nums in sorted(seasons_map.items())]
-    if not seasons:
-        return
-
-    item = {'ids': ids, 'seasons': seasons,
+    seasons = [
+        {
+            'number': season_num,
+            # 单集回传倒是可以附带 pvd_ids，但是不知道为什么多集同时附带就失败。
+            'episodes': sorted(episodes, key=lambda e: e['number']),
+        }
+        for season_num, episodes in sorted(seasons_map.items())
+    ]
+    show = {'ids': ids, 'seasons': seasons,
             # 动漫需要这个标记才能正确映射到 simkl 的 anidb 记录。
-            # 非动漫是安全的 no-op。
             'use_tvdb_anime_seasons': True}
     if title:
-        item['title'] = title
+        show['title'] = title
     if year:
-        item['year'] = year
-    return item
+        show['year'] = year
+    return show, ep_ids
 
 
 def sync_ep_or_movie_to_simkl(simkl, eps_data, emby):
@@ -95,7 +99,7 @@ def sync_ep_or_movie_to_simkl(simkl, eps_data, emby):
     if _type not in allow:
         raise ValueError(f'type not in {allow}')
 
-    movies, shows = [], []
+    movies, shows, ep_ids = [], [], []
 
     if _type == 'movie':
         item = build_movie_item(fist_ep)
@@ -103,17 +107,25 @@ def sync_ep_or_movie_to_simkl(simkl, eps_data, emby):
             movies.append(item)
         else:
             logger.info(f'simkl: not any {PROVIDERS} id, skip | {fist_ep.get("Name")}')
-    else:
-        item = build_show_item_with_eps(emby, eps_data)
-        if item:
-            shows.append(item)
+    elif item := build_show_item_with_eps(emby, eps_data):
+        shows.append(item[0])
+        ep_ids = item[1]
 
     if not movies and not shows:
         logger.info('simkl: nothing to sync')
         return
 
     res = simkl.add_ep_or_movie_to_history(movies=movies, shows=shows)
-    logger.info(f'simkl: sync result {res}')
+    success_count = sum(res['added'][key] for key in ('movies', 'shows', 'episodes'))
+    del res['added']['statuses']
+    logger.info(f'simkl: sync {success_count} item {res}')
+
+    if not success_count and ep_ids:
+        res = simkl.add_ep_or_movie_to_history(episodes=ep_ids)
+        success_count = sum(res['added'][key] for key in ('movies', 'shows', 'episodes'))
+        del res['added']['statuses']
+        # 效果一般，疑似 simkl 的单集 tvdb id 等并不齐全。
+        logger.info(f'simkl: sync {success_count} item via {len(ep_ids)} pvd_ids {res}')
     return res
 
 
