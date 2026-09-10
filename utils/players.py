@@ -257,13 +257,17 @@ def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
     suf_list = episodes[cur_index:cur_index + limit]
 
     def adding_thread():
-        suf_thread = threading.Thread(target=loop_episodes, args=(suf_list,))
-        pre_thread = threading.Thread(target=loop_episodes, args=(reversed(pre_list), True))
-        _ = [suf_thread.start(), pre_thread.start()]
-        if configs.raw.getboolean('dev', 'mpv_ipc_playlist_data', fallback=False):
-            mpv.command('script-message', 'etlp-playlist-data', json.dumps(playlist_data, ensure_ascii=False))
-        _ = [suf_thread.join(), pre_thread.join()]
-        mpv.command('script-message', 'etlp-playlist-done')
+        try:
+            if configs.raw.getboolean('dev', 'mpv_ipc_playlist_data', fallback=False):
+                mpv.command('script-message', 'etlp-playlist-data', json.dumps(playlist_data, ensure_ascii=False))
+            mpv.wait_for_property('time-pos')  # 太早添加可能会导致播放第一个文件，而不是命令行指定文件。#193
+            suf_thread = threading.Thread(target=loop_episodes, args=(suf_list,))
+            pre_thread = threading.Thread(target=loop_episodes, args=(reversed(pre_list), True))
+            _ = [suf_thread.start(), pre_thread.start()]
+            _ = [suf_thread.join(), pre_thread.join()]
+            mpv.command('script-message', 'etlp-playlist-done')
+        except OSError:
+            logger.info('mpv adding_thread OSError found, exit')
 
     threading.Thread(target=adding_thread, daemon=True).start()
     # loop_episodes -> ep['mpv_cmd'] = mpv_cmd 貌似没被多线程运行影响
