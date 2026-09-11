@@ -5,7 +5,7 @@ import time
 import urllib.parse
 
 from utils.configs import configs, MyLogger
-from utils.downloader import Downloader
+from utils.downloader import prefetch_http_range
 from utils.emby_api_thin import EmbyApiThin
 from utils.net_tools import (get_redirect_url, requests_urllib, realtime_playing_request_sender,
                              update_server_playback_progress, check_miss_runtime_start_sec)
@@ -560,10 +560,14 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
                     # ep['stream_url'] = get_redirect_url(ep['stream_url'], follow_redirect=True)
                     requests_urllib('http://127.0.0.1:58000/pl', _json=ep)
                 else:
-                    null_file = 'NUL' if os.name == 'nt' else '/dev/null'
-                    dl = Downloader(ep['stream_url'], ep['basename'], save_path=null_file, size=ep.get('size'))
-                    threading.Thread(target=dl.percent_download, args=(0, 0.08), daemon=True).start()
-                    threading.Thread(target=dl.percent_download, args=(0.98, 1), daemon=True).start()
+                    threading.Thread(
+                        target=prefetch_http_range,
+                        args=(ep['stream_url'], 0, 0.08),
+                        kwargs={'size': ep.get('size')}, daemon=True).start()
+                    threading.Thread(
+                        target=prefetch_http_range,
+                        args=(ep['stream_url'], 0.98, 1),
+                        kwargs={'size': ep.get('size')}, daemon=True).start()
                 done_list.append(key)
             time.sleep(5)
         logger.info('prefetch_next_ep_loop: exit')

@@ -8,7 +8,7 @@ from utils.configs import configs, MyLogger
 from utils.emby_session_api import derive_control_device_id
 from utils.clouddrive2_gateway import maybe_register_strm_cd2_url
 from utils.net_tools import multi_thread_requests, requests_urllib, get_redirect_url
-from utils.tools import (show_version_info, main_ep_to_title, main_ep_intro_time, logger_setup, version_prefer_emby,
+from utils.tools import (show_version_info, main_ep_to_title, main_ep_chapters, main_ep_intro_time, logger_setup, version_prefer_emby,
                          match_version_range, sub_via_other_media_version, force_disk_mode_by_path,
                          translate_path_by_ini, debug_beep_win32, version_prefer_for_playlist)
 
@@ -140,6 +140,7 @@ def parse_received_data_emby(received_data):
     playlist_info = extra_data.get('playlistInfo') or []
     # 随机播放剧集媒体库时，油猴没获取其他集的 Emby 标题，导致第一集回传数据失败，暂不处理。
     emby_title = main_ep_to_title(main_ep_info) if not playlist_info else None
+    chapters = main_ep_chapters(main_ep_info)
     intro_time = main_ep_intro_time(main_ep_info)
     api_client = received_data['ApiClient']
     auth_identity = _extract_auth_identity(api_client)
@@ -375,6 +376,7 @@ def parse_received_data_emby(received_data):
         main_ep_info=main_ep_info,
         episodes_info=episodes_info,
         playlist_info=playlist_info,
+        chapters=chapters,
         intro_start=intro_time.get('intro_start'),
         intro_end=intro_time.get('intro_end'),
         server_version=server_version,
@@ -548,7 +550,7 @@ def list_playlist_or_mix_s0(data):
     headers.update(data['headers'])
 
     ids = [ep['Id'] for ep in playlist_info]
-    params.update({'Fields': 'MediaSources,Path,ProviderIds',
+    params.update({'Fields': 'MediaSources,Path,ProviderIds,Chapters',
                    'Ids': ','.join(ids), })
     playlist_data = requests_urllib(
         f'{scheme}://{netloc}{extra_str}/Users/{user_id}/Items',
@@ -579,6 +581,10 @@ def list_episodes(data: dict):
 
     def fill_data_type_provider_ids(): # sync trakt required
         data.update(main_ep_info)
+        data['chapters'] = main_ep_chapters(main_ep_info)
+        intro_time = main_ep_intro_time(main_ep_info)
+        data['intro_start'] = intro_time.get('intro_start')
+        data['intro_end'] = intro_time.get('intro_end')
         return data
 
     # if video is movie
@@ -593,6 +599,38 @@ def list_episodes(data: dict):
     strm_direct = data['strm_direct']
     is_http_direct_strm = data['is_http_direct_strm']
     strm_local_by_file_path = data.get('strm_local_by_file_path', False)
+
+    # Browser-captured episode metadata is a useful fallback on servers that
+    # omit fields from their season response.  Only an exact Emby item ID is
+    # eligible; season/episode numbers are deliberately not identity keys
+    # because multiple media versions can share them.
+    chapter_info_by_item_id = {}
+
+    def chapter_item_id(candidate):
+        if not isinstance(candidate, dict):
+            return None
+        candidate_id = candidate.get('Id')
+        return candidate_id if candidate_id is not None else candidate.get('ItemId')
+
+    for candidate in [main_ep_info, *(data.get('episodes_info') or [])]:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = chapter_item_id(candidate)
+        if candidate_id is None:
+            continue
+        candidate_id = str(candidate_id)
+        if candidate_id in chapter_info_by_item_id:
+            continue
+        if 'Chapters' in candidate and candidate.get('Chapters') is not None:
+            chapter_info_by_item_id[candidate_id] = candidate
+
+    def item_chapters_and_intro(item):
+        source = item
+        if not isinstance(item, dict) or item.get('Chapters') is None:
+            item_id = chapter_item_id(item)
+            source = chapter_info_by_item_id.get(str(item_id)) if item_id is not None else None
+        source = source if isinstance(source, dict) else {}
+        return main_ep_chapters(source), main_ep_intro_time(source)
 
     def strm_file_name_sync(file_path, episodes_data):
         if is_strm and not is_http_source:
@@ -771,9 +809,9 @@ def list_episodes(data: dict):
 
     def title_intro_index_map():
         nonlocal title_intro_map_fail
-        _res = _title_map, _start_map, _end_map = {}, {}, {}
+        _title_map = {}
         if playlist_info:
-            return _res
+            return _title_map
         episodes_info = data.get('episodes_info') or []
         title_intro_map_fail = not episodes_info
 
@@ -783,7 +821,7 @@ def list_episodes(data: dict):
             if 'ParentIndexNumber' not in ep or 'IndexNumber' not in ep:
                 title_intro_map_fail = True
                 logger.info('disable title_intro_index_map, cuz season or ep index num error found')
-                return _res
+                return _title_map
             if 'IndexNumberEnd' in ep:
                 _t = f"{ep['SeriesName']} S{ep['ParentIndexNumber']}" \
                      f":E{ep['IndexNumber']}-{ep['IndexNumberEnd']} - {ep['Name']}"
@@ -792,22 +830,9 @@ def list_episodes(data: dict):
             _key = f"{ep['ParentIndexNumber']}-{ep['IndexNumber']}"
             _title_map[_key] = _t
 
-            if not ep.get('Chapters'):
-                continue
-            chapters = [i for i in ep['Chapters'][:5] if i.get('MarkerType')
-                        and not str(i['StartPositionTicks']).endswith('000000000')
-                        and not (i['StartPositionTicks'] == 0 and i['MarkerType'] == 'Chapter')]
-            if not chapters or len(chapters) > 2:
-                continue
-            for i in chapters:
-                if i['MarkerType'] == 'IntroStart':
-                    _start_map[_key] = i['StartPositionTicks'] // (10 ** 7)
-                elif i['MarkerType'] == 'IntroEnd':
-                    _end_map[_key] = i['StartPositionTicks'] // (10 ** 7)
+        return _title_map
 
-        return _res
-
-    title_data, start_data, end_data = title_intro_index_map()
+    title_data = title_intro_index_map()
     pretty_title = configs.raw.getboolean('dev', 'pretty_title', fallback=True)
     need_check_inner_sub = {True: -1, False: -3}[bool(data.get('sub_inner_idx'))]
 
@@ -828,6 +853,7 @@ def list_episodes(data: dict):
         )
         fake_name = os.path.splitdrive(file_path)[1].replace('/', '__').replace('\\', '__')
         item_id = item['Id']
+        item_chapters, item_intro = item_chapters_and_intro(item)
         container = os.path.splitext(file_path)[-1]
         stream_url = f'{scheme}://{netloc}{extra_str}/videos/{item_id}/{stream_name}{container}' \
                      f'?DeviceId={device_id}&MediaSourceId={media_source_id}' \
@@ -896,6 +922,12 @@ def list_episodes(data: dict):
                        f'?api_key={api_key}'
 
         result = data.copy()
+        # ``data`` describes the first item.  Never let its chapter metadata
+        # leak into another episode; each result receives its own normalized
+        # values below, including an explicit empty list.
+        result.pop('chapters', None)
+        result.pop('intro_start', None)
+        result.pop('intro_end', None)
         result['Type'] = item['Type']
         result['ProviderIds'] = item['ProviderIds']
         result['ParentIndexNumber'] = item.get('ParentIndexNumber')
@@ -923,8 +955,9 @@ def list_episodes(data: dict):
             index=index,
             size=size,  # Jellyfin strm 没有这个键
             media_title=media_title,
-            intro_start=start_data.get(unique_key),
-            intro_end=end_data.get(unique_key),
+            chapters=item_chapters,
+            intro_start=item_intro.get('intro_start'),
+            intro_end=item_intro.get('intro_end'),
             order=order,
             sub_inner_idx=sub_inner_idx,
             source_path=source_path,
@@ -944,7 +977,7 @@ def list_episodes(data: dict):
         ids = [ep['Id'] for ep in playlist_info][:200]
         _eps_parts = []
         for _ids in chunk_list(ids, 200):
-            params.update({'Fields': 'MediaSources,Path,ProviderIds',
+            params.update({'Fields': 'MediaSources,Path,ProviderIds,Chapters',
                            'Ids': ','.join(_ids), })
             _episodes = requests_urllib(
                 f'{scheme}://{netloc}{extra_str}/Users/{user_id}/Items',
@@ -957,7 +990,7 @@ def list_episodes(data: dict):
             logger.info(f'playlist_info items count: {len(ids)}, may too large')
 
     else:
-        params.update({'Fields': 'MediaSources,Path,ProviderIds',
+        params.update({'Fields': 'MediaSources,Path,ProviderIds,Chapters',
                        'SeasonId': season_id, })
         series_id = main_ep_info['SeriesId']
         if not season_id:  # Jellyfin 10.10.7 未知季: mainEpInfo 缺失季 id，导致请求失败。10.9.11 10.11.1 正常。

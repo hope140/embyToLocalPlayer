@@ -1,5 +1,7 @@
+import math
 import os
 import platform
+import re
 import threading
 import time
 import typing
@@ -13,6 +15,79 @@ from utils.tools import (load_json_file, dump_json_file, scan_cache_dir, safe_de
                          load_dict_jsons_in_folder, create_sparse_file)
 
 logger = MyLogger()
+
+_RANGE_MAX_ATTEMPTS = 4
+_RANGE_RETRY_DELAY = 0.1
+_RANGE_RETRY_DELAY_MAX = 4.0
+
+
+class _RangeRequestError(Exception):
+    def __init__(self, message, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _response_status(response):
+    status = getattr(response, 'status', None)
+    return status if status is not None else getattr(response, 'code', None)
+
+
+def _response_header(response, name):
+    try:
+        value = response.getheader(name)
+    except (AttributeError, KeyError, TypeError):
+        value = None
+    if value is not None:
+        return value
+    headers = getattr(response, 'headers', None)
+    if headers is None:
+        return None
+    try:
+        return headers.get(name) or headers.get(name.lower())
+    except (AttributeError, KeyError, TypeError):
+        return None
+
+
+def _close_response(response):
+    if response is None:
+        return
+    try:
+        response.close()
+    except Exception:
+        pass
+
+
+def _parse_content_range(value):
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r'\s*bytes\s+(\d+)-(\d+)/(\d+)\s*', value, re.IGNORECASE)
+    if not match:
+        return None
+    start, end, total = (int(group) for group in match.groups())
+    if end < start or total <= end:
+        return None
+    return start, end, total
+
+
+def _is_retryable_download_error(exc):
+    return isinstance(exc, (ConnectionError, TimeoutError, OSError)) or getattr(exc, 'retryable', False)
+
+
+def _wait_download(delay, downloader, maximum=None):
+    remaining = float(delay)
+    if maximum is not None:
+        remaining = min(remaining, maximum)
+    while remaining > 0:
+        if downloader.cancel or downloader.pause:
+            return False
+        sleep_for = min(_RANGE_RETRY_DELAY, remaining)
+        time.sleep(sleep_for)
+        remaining -= sleep_for
+    return not downloader.cancel and not downloader.pause
+
+
+def _wait_download_retry(delay, downloader):
+    return _wait_download(delay, downloader, maximum=_RANGE_RETRY_DELAY_MAX)
 
 if platform.system() == 'Windows':
     import msvcrt
@@ -72,6 +147,9 @@ class Downloader:
         self.chunk_size = 1024 * 1024
         self.progress = 0
         self.is_done = False
+        self._range_error = None
+        self._range_retryable = False
+        self._last_success_position = 0
         if not save_path:
             os.path.exists(cache_path) or os.mkdir(cache_path)
 
@@ -116,113 +194,261 @@ class Downloader:
     def get_size(self):
         if self.size:
             return self.size
-        resp = requests_urllib(self.url, http_proxy=configs.dl_proxy, res_only=True, method='HEAD', timeout=10)
-        length = resp.getheader('Content-Length')
-        if not length:
-            print(resp.headers)
-        self.size = int(length)
-        return self.size
+        last_error = None
+        for attempt in range(_RANGE_MAX_ATTEMPTS):
+            resp = None
+            try:
+                resp = requests_urllib(
+                    self.url, http_proxy=configs.dl_proxy, method='HEAD',
+                    headers={'Accept-Encoding': 'identity'}, res_only=True, timeout=10,
+                    retry=1, silence=True, return_http_error=True)
+                status = _response_status(resp)
+                if status is not None and not 200 <= status < 300:
+                    raise _RangeRequestError(f'HEAD failed with HTTP {status}', retryable=status >= 500)
+                content_encoding = _response_header(resp, 'Content-Encoding')
+                if content_encoding and content_encoding.strip().lower() != 'identity':
+                    raise _RangeRequestError('HEAD response has unsupported Content-Encoding')
+                length = _response_header(resp, 'Content-Length')
+                if length is None:
+                    raise _RangeRequestError('HEAD response has no Content-Length')
+                try:
+                    size = int(length)
+                except (TypeError, ValueError, OverflowError):
+                    raise _RangeRequestError('HEAD response has invalid Content-Length') from None
+                if size <= 0:
+                    raise _RangeRequestError('HEAD response has non-positive Content-Length')
+                self.size = size
+                return self.size
+            except Exception as exc:
+                last_error = exc
+                if (not _is_retryable_download_error(exc)
+                        or attempt + 1 >= _RANGE_MAX_ATTEMPTS
+                        or not _wait_download_retry(_RANGE_RETRY_DELAY * (2 ** attempt), self)):
+                    raise
+            finally:
+                _close_response(resp)
+        raise last_error
 
     def range_download(self, start: int, end: int, speed=0, update=False) -> int:
-        self.get_size()
-        sleep = 1 / speed if speed else 0
-        if start == 0:
-            if safe_deleter(self.file):
-                logger.info(f'delete by start 0, {self.file}')
-        open_mode = 'r+b' if os.path.exists(self.file) else 'wb'
-        if open_mode == 'wb' and configs.raw.getboolean('gui', 'sparse_file_by_server', fallback=False):
-            if server_href := configs.raw.get('dev', 'server_side_href', fallback=''):
-                headers = {}
-                if not is_local_http_server_url(server_href):
-                    token = configs.raw.get('dev', 'http_server_token', fallback='').strip()
-                    if token:
-                        headers['Authorization'] = bearer_header(token)
-                _res = requests_urllib(f'{server_href}/action/sparse_file',
-                                       _json={'name': self.id, 'size': self.size},
-                                       headers=headers, get_json=True)
-                if not _res.get('sparse_file'):
-                    raise Exception('server sparse_file fail, check it.')
-                for _ in range(10):
-                    if os.path.exists(self.file):
-                        open_mode = 'r+b'
-                        break
-                    else:
-                        print('.', end='')
-                        time.sleep(0.3)
-        if open_mode == 'wb':
-            create_sparse_file(self.file, size=self.size)
-            open_mode = 'r+b'
-        headers = {'Range': f'bytes={start}-{end}'}
+        """Download the half-open byte interval ``[start, end)``.
+
+        The HTTP request uses the inclusive end byte ``end - 1``.  The return
+        value is the next byte that still needs to be written, so callers can
+        resume a short or interrupted response without rewriting the prefix.
+        """
+        self._range_error = None
+        self._range_retryable = False
         try:
-            resp = requests_urllib(self.url, headers=headers, http_proxy=configs.dl_proxy, res_only=True, timeout=10)
-        except Exception as e:
-            logger.error(f'dl: range_download error {self.id} {str(e)[:50]}')
-            return start
-        logger.trace(headers)
-        h_size = resp.getheader('Content-Length', resp.getheader('Content-Range'))
-        if h_size.isdigit():
-            h_size = int(h_size)
-        else:
-            _s, _e = h_size.split(' ')[1].split('/')[0].split('-')
-            h_size = int(_e) - int(_s) + 1
-        logger.trace('total_size', self.size, 'size', h_size, 'size_mb', h_size // 1024 // 1024, f'{open_mode=}')
-        downloaded_size = 0
-        with open(self.file, open_mode) as f:
-            f.seek(start)
-            logger.trace(f'seek {start=}')
             try:
-                while chunk := resp.read(self.chunk_size):
-                    if self.cancel or self.pause:
-                        return start
-                    f.write(chunk)
-                    downloaded_size += len(chunk)
-                    if start < self.size * 0.1:
-                        f.flush()
-                    start += len(chunk)
-                    if update:
-                        tmp_progress = start * 100 // self.size / 100
-                        if tmp_progress >= self.progress:
-                            self.progress = tmp_progress
-                    if start > end:
-                        break
-                    sleep and time.sleep(sleep)
-            except Exception as e:
-                logger.error(f'dl: retry: {self.id} {str(e)[:50]}')
+                read_only = configs.raw.getboolean('gui', 'read_only', fallback=False)
+            except Exception as exc:
+                self._range_error = _RangeRequestError('read_only configuration unavailable')
+                logger.error(f'dl: write mode check failed {type(exc).__name__}')
                 return start
-        if start > end + 1:
-            raise ConnectionError(f'dl: {start=} is greater than {end=}, something wrong, check it')
-        if downloaded_size < h_size:
-            logger.error(f'dl: retry: range download failed. Expected {h_size}, got {downloaded_size}. {self.id}')
+            try:
+                has_lock = bool(self.file_lock.has_lock)
+            except Exception as exc:
+                self._range_error = _RangeRequestError('task lock unavailable')
+                logger.error(f'dl: lock check failed {type(exc).__name__}')
+                return start
+            if read_only or not has_lock:
+                self._range_error = _RangeRequestError('download requires the task lock and write mode')
+                return start
+            if self.cancel or self.pause:
+                self._range_error = _RangeRequestError('download paused or cancelled')
+                return start
+            self.get_size()
+            if (isinstance(start, bool) or isinstance(end, bool) or start < 0 or end < start
+                    or end > self.size):
+                self._range_error = _RangeRequestError(f'invalid range {start=}, {end=}')
+                return start
+            if start == end:
+                self._last_success_position = end
+                return end
+
+            request_end = end - 1
+            headers = {
+                'Range': f'bytes={start}-{request_end}',
+                'Accept-Encoding': 'identity',
+            }
+            response = None
+            try:
+                response = requests_urllib(
+                    self.url, headers=headers, http_proxy=configs.dl_proxy, res_only=True,
+                    timeout=10, retry=1, silence=True, return_http_error=True)
+                status = _response_status(response)
+                if status != 206:
+                    retryable = status is not None and 500 <= status <= 599
+                    self._range_error = _RangeRequestError(
+                        f'range request returned HTTP {status}', retryable=retryable)
+                    self._range_retryable = retryable
+                    return start
+
+                content_range = _parse_content_range(_response_header(response, 'Content-Range'))
+                if content_range != (start, request_end, self.size):
+                    self._range_error = _RangeRequestError('range response has invalid Content-Range')
+                    return start
+                content_length = _response_header(response, 'Content-Length')
+                if content_length is not None:
+                    try:
+                        if int(content_length) != end - start:
+                            raise ValueError
+                    except (TypeError, ValueError, OverflowError):
+                        self._range_error = _RangeRequestError('range response has invalid Content-Length')
+                        return start
+                content_encoding = _response_header(response, 'Content-Encoding')
+                if content_encoding and content_encoding.strip().lower() != 'identity':
+                    self._range_error = _RangeRequestError('range response has unsupported Content-Encoding')
+                    return start
+
+                if start == 0:
+                    safe_deleter(self.file)
+                open_mode = 'r+b' if os.path.exists(self.file) else 'wb'
+                if open_mode == 'wb' and configs.raw.getboolean('gui', 'sparse_file_by_server', fallback=False):
+                    if server_href := configs.raw.get('dev', 'server_side_href', fallback=''):
+                        sparse_headers = {}
+                        if not is_local_http_server_url(server_href):
+                            token = configs.raw.get('dev', 'http_server_token', fallback='').strip()
+                            if token:
+                                sparse_headers['Authorization'] = bearer_header(token)
+                        _res = requests_urllib(
+                            f'{server_href}/action/sparse_file',
+                            _json={'name': self.id, 'size': self.size}, headers=sparse_headers,
+                            get_json=True)
+                        if not _res.get('sparse_file'):
+                            raise _RangeRequestError('server sparse_file fail, check it.')
+                        for _ in range(10):
+                            if os.path.exists(self.file):
+                                open_mode = 'r+b'
+                                break
+                            print('.', end='')
+                            time.sleep(0.3)
+                if open_mode == 'wb':
+                    create_sparse_file(self.file, size=self.size)
+                    open_mode = 'r+b'
+
+                sleep = 1 / speed if speed else 0
+                next_position = start
+                remaining = end - start
+                with open(self.file, open_mode) as file_obj:
+                    file_obj.seek(start)
+                    logger.trace(f'seek {start=}')
+                    try:
+                        while remaining > 0:
+                            if self.cancel or self.pause:
+                                return next_position
+                            chunk = response.read(min(self.chunk_size, remaining))
+                            if not chunk:
+                                self._range_error = _RangeRequestError(
+                                    'range response ended before Content-Range')
+                                self._range_retryable = True
+                                return next_position
+                            if len(chunk) > remaining:
+                                chunk = chunk[:remaining]
+                            written = file_obj.write(chunk)
+                            if written != len(chunk):
+                                self._range_error = _RangeRequestError('short local file write', retryable=True)
+                                self._range_retryable = True
+                                next_position += max(0, written or 0)
+                                return next_position
+                            file_obj.flush()
+                            next_position += written
+                            remaining -= written
+                            if update and self.size:
+                                self.progress = min(end / self.size, next_position / self.size)
+                            if sleep and not _wait_download(sleep, self):
+                                return next_position
+                    except Exception as exc:
+                        self._range_error = exc
+                        self._range_retryable = _is_retryable_download_error(exc)
+                        logger.error(f'dl: retry: {self.id} {str(exc)[:50]}')
+                        return next_position
+                    self._last_success_position = next_position
+                    return next_position
+            except Exception as exc:
+                if self._range_error is None:
+                    self._range_error = exc
+                self._range_retryable = _is_retryable_download_error(exc)
+                logger.error(f'dl: range_download error {self.id} {str(exc)[:50]}')
+                return start
+            finally:
+                _close_response(response)
+        except Exception as exc:
+            self._range_error = exc
+            self._range_retryable = _is_retryable_download_error(exc)
+            logger.error(f'dl: range_download error {self.id} {str(exc)[:50]}')
             return start
-        return end
 
     def percent_download(self, start, end, speed=0, update=True):
-        self.get_size()
         self.file_is_busy = True
-        logger.info(f'dl: start {int(start * 100)}% end {int(end * 100)}% \n{self.id}')
-        _start = int(float(self.size * start))
-        _end = int(float(self.size * end))
-        end_with = self.range_download(_start, _end, speed=speed, update=update)
-        error_sleep = 1
-        while end_with != _end:
+        try:
             if self.cancel or self.pause:
-                self.file_is_busy = False
-                return
-            error_sleep *= 2
-            logger.info(f'dl: percent download error found, sleep {error_sleep}')
-            time.sleep(error_sleep)
-            _start = end_with
-            end_with = self.range_download(_start, _end, speed=speed, update=update)
-        if update:
-            self.progress = end
-            logger.trace(self.id, end, 'done')
-        self.file_is_busy = False
-        return True
+                return False
+            try:
+                read_only = configs.raw.getboolean('gui', 'read_only', fallback=False)
+            except Exception as exc:
+                logger.error(f'dl: write mode check failed {type(exc).__name__}')
+                return False
+            try:
+                has_lock = bool(self.file_lock.has_lock)
+            except Exception as exc:
+                logger.error(f'dl: lock check failed {type(exc).__name__}')
+                return False
+            if read_only or not has_lock:
+                return False
+            if (isinstance(start, bool) or isinstance(end, bool)
+                    or not isinstance(start, (int, float)) or not isinstance(end, (int, float))
+                    or not math.isfinite(start) or not math.isfinite(end)
+                    or start < 0 or end > 1 or end < start):
+                return False
+            self.get_size()
+            logger.info(f'dl: start {int(start * 100)}% end {int(end * 100)}% \n{self.id}')
+            _start = math.floor(float(self.size * start))
+            _end = math.floor(float(self.size * end))
+            _start = max(0, min(self.size, _start))
+            _end = max(0, min(self.size, _end))
+            if _end < _start:
+                return False
+            if _start == _end:
+                self._last_success_position = _end
+                return True
+
+            next_position = _start
+            for attempt in range(_RANGE_MAX_ATTEMPTS):
+                if self.cancel or self.pause:
+                    return False
+                next_position = self.range_download(next_position, _end, speed=speed, update=update)
+                if (next_position >= _end and self._range_error is None
+                        and not self.cancel and not self.pause):
+                    if update:
+                        self.progress = end
+                        logger.trace(self.id, end, 'done')
+                    return True
+                if not self._range_retryable or attempt + 1 >= _RANGE_MAX_ATTEMPTS:
+                    return False
+                delay = min(_RANGE_RETRY_DELAY_MAX, _RANGE_RETRY_DELAY * (2 ** attempt))
+                logger.info(f'dl: percent download error found, sleep {delay}')
+                if not _wait_download_retry(delay, self):
+                    return False
+            return False
+        except Exception as exc:
+            logger.error(f'dl: percent_download error {self.id} {str(exc)[:50]}')
+            return False
+        finally:
+            self.file_is_busy = False
 
     def download_fist_last(self):
-        self.percent_download(0, 0.01, update=False)
-        self.percent_download(0.99, 1, update=False)
-        self.progress = 0.01
+        previous_progress = self.progress
+        prefix_ready = self.percent_download(0, 0.01, update=False)
+        if not prefix_ready:
+            return False
+        tail_ready = self.percent_download(0.99, 1, update=False)
+        if not tail_ready:
+            self.progress = previous_progress
+            return False
+        prefix_end = math.floor(self.size * 0.01)
+        self.progress = max(previous_progress, prefix_end / self.size if self.size else 0)
+        return True
 
     def cancel_download(self, silence=False):
         self.cancel = True
@@ -239,6 +465,159 @@ class Downloader:
                 done = True
         done and not silence and logger.info(f'dl: delete done {self.id}')
         return done
+
+
+_PREFETCH_TIMEOUT = 10
+_PREFETCH_RETRY = 1
+_PREFETCH_READ_SIZE = 64 * 1024
+
+
+def _prefetch_header(response, name):
+    """Return a response header for urllib responses and test doubles."""
+    try:
+        value = response.getheader(name)
+    except (AttributeError, KeyError, TypeError):
+        value = None
+    if value is not None:
+        return value
+    headers = getattr(response, 'headers', None)
+    if headers is None:
+        return None
+    try:
+        return headers.get(name) or headers.get(name.lower())
+    except (AttributeError, KeyError, TypeError):
+        return None
+
+
+def _prefetch_status(response):
+    status = getattr(response, 'status', None)
+    return status if status is not None else getattr(response, 'code', None)
+
+
+def _prefetch_size(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed <= 0:
+        return None
+    if isinstance(value, float) and (not math.isfinite(value) or parsed != value):
+        return None
+    return parsed
+
+
+def _prefetch_content_range(value):
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r'\s*bytes\s+(\d+)-(\d+)/(\d+)\s*', value, re.IGNORECASE)
+    if not match:
+        return None
+    start, end, total = (int(group) for group in match.groups())
+    if end < start or total <= end:
+        return None
+    return start, end, total
+
+
+def _prefetch_read(response, byte_count):
+    read_count = 0
+    while read_count < byte_count:
+        remaining = byte_count - read_count
+        chunk = response.read(min(_PREFETCH_READ_SIZE, remaining))
+        if not chunk:
+            break
+        read_count += min(len(chunk), remaining)
+    return read_count == byte_count
+
+
+def prefetch_http_range(url, start_percent, end_percent, size=None):
+    """Best-effort HTTP range prefetch that never creates local state.
+
+    This is intentionally separate from :class:`Downloader`: discard prefetches
+    must not create cache files, task files, locks, or sparse files.  A failure
+    only skips this hint and must not affect playback.
+    """
+    try:
+        start_percent = float(start_percent)
+        end_percent = float(end_percent)
+    except (TypeError, ValueError, OverflowError):
+        logger.info('discard prefetch skipped: invalid range')
+        return False
+    if (not math.isfinite(start_percent) or not math.isfinite(end_percent)
+            or start_percent < 0 or end_percent > 1 or end_percent <= start_percent):
+        logger.info('discard prefetch skipped: invalid range')
+        return False
+
+    media_size = _prefetch_size(size)
+    if media_size is None and size is not None:
+        logger.info('discard prefetch skipped: invalid size')
+        return False
+    if media_size is None:
+        response = None
+        try:
+            response = requests_urllib(
+                url, method='HEAD', http_proxy=configs.dl_proxy,
+                res_only=True, timeout=_PREFETCH_TIMEOUT, retry=_PREFETCH_RETRY,
+                silence=True)
+            status = _prefetch_status(response)
+            if status is None or not 200 <= status < 300:
+                logger.info('discard prefetch skipped: size request failed')
+                return False
+            media_size = _prefetch_size(_prefetch_header(response, 'Content-Length'))
+        except Exception as exc:
+            logger.info(f'discard prefetch skipped: size request {type(exc).__name__}')
+            return False
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+        if media_size is None:
+            logger.info('discard prefetch skipped: missing size')
+            return False
+
+    start = int(media_size * start_percent)
+    end = int(media_size * end_percent) - 1
+    end = min(end, media_size - 1)
+    if start >= media_size or end < start:
+        logger.info('discard prefetch skipped: empty range')
+        return False
+    byte_count = end - start + 1
+    if byte_count >= media_size:
+        logger.info('discard prefetch skipped: full range')
+        return False
+
+    response = None
+    try:
+        response = requests_urllib(
+            url, headers={'Range': f'bytes={start}-{end}'},
+            http_proxy=configs.dl_proxy, res_only=True,
+            timeout=_PREFETCH_TIMEOUT, retry=_PREFETCH_RETRY, silence=True)
+        status = _prefetch_status(response)
+        if status == 206:
+            content_range = _prefetch_content_range(_prefetch_header(response, 'Content-Range'))
+            if not content_range or content_range != (start, end, media_size):
+                logger.info('discard prefetch skipped: invalid content range')
+                return False
+        elif status == 200 and start == 0:
+            # A server may ignore a first-byte Range.  Only consume the requested
+            # prefix; a non-zero request must never be treated as a tail hit.
+            pass
+        else:
+            logger.info('discard prefetch skipped: unsupported response')
+            return False
+        return _prefetch_read(response, byte_count)
+    except Exception as exc:
+        logger.info(f'discard prefetch skipped: {type(exc).__name__}')
+        return False
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 class DownloadManager:
@@ -447,7 +826,6 @@ def prefetch_resume_tv():
 
 def _prefetch_resume_tv(emby_thin: EmbyApiThin, startswith, fetch_type=''):
     startswith = tuple(startswith)
-    null_file = 'NUL' if os.name == 'nt' else '/dev/null'
 
     if configs.raw.getboolean('tg_notify', 'get_chat_id', fallback=False):
         tg_notify('_get_chat_id')
@@ -554,12 +932,10 @@ def _prefetch_resume_tv(emby_thin: EmbyApiThin, startswith, fetch_type=''):
                         continue
                     try:
                         logger.info(f'prefetch {relative_path} \n{stream_url[:100]}')
-                        dl = Downloader(url=stream_url, _id=os.path.basename(file_path), save_path=null_file,
-                                        size=ep.get('size'))
-                        dl.percent_download(0, 0.05)
-                        dl.percent_download(0.98, 1)
-                    except Exception:
-                        logger.error(f'prefetch error on download connection, skip\n{stream_url}')
+                        prefetch_http_range(stream_url, 0, 0.05, size=ep.get('size'))
+                        prefetch_http_range(stream_url, 0.98, 1, size=ep.get('size'))
+                    except Exception as exc:
+                        logger.error(f'prefetch error on download connection, skip ({type(exc).__name__})')
                     print()
                 if item_id in notify_item_list:
                     tg_notify(notify_msg)

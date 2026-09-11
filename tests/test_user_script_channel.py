@@ -18,6 +18,8 @@ class UserScriptChannelTests(unittest.TestCase):
             matches = re.findall(rf"^// @{name}[ \t]+([^\r\n]+)$", source, re.MULTILINE)
             self.assertEqual(len(matches), 1, name)
             metadata[name] = matches[0].strip()
+        version_matches = re.findall(r"^// @version[ \t]+([^\r\n]+)$", source, re.MULTILINE)
+        self.assertEqual(version_matches, ["2026.09.11"])
         self.assertEqual(
             metadata["updateURL"],
             "https://raw.githubusercontent.com/hope140/embyToLocalPlayer/stable/user_script/embyToLocalPlayer.user.js",

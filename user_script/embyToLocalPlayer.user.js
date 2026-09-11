@@ -3,7 +3,7 @@
 // @name:zh-CN   embyToLocalPlayer
 // @name:en      embyToLocalPlayer
 // @namespace    https://github.com/hope140/embyToLocalPlayer
-// @version      2026.08.15
+// @version      2026.09.11
 // @updateURL    https://raw.githubusercontent.com/hope140/embyToLocalPlayer/stable/user_script/embyToLocalPlayer.user.js
 // @downloadURL  https://raw.githubusercontent.com/hope140/embyToLocalPlayer/stable/user_script/embyToLocalPlayer.user.js
 // @homepageURL  https://github.com/hope140/embyToLocalPlayer/tree/stable
@@ -57,20 +57,234 @@
 
     const originFetch = fetch;
 
+    const LOG_REDACTED = '[REDACTED]';
+    const LOG_UNSERIALIZABLE = '[UNSERIALIZABLE]';
+    const LOG_CIRCULAR = '[Circular]';
+    const LOG_MAX_DEPTH = '[MaxDepth]';
+    const LOG_MAX_DEPTH_LEVEL = 8;
+
+    function decodeLogText(value) {
+        let decoded = String(value);
+        for (let index = 0; index < 3; index += 1) {
+            let next;
+            try {
+                next = decodeURIComponent(decoded);
+            } catch (_error) {
+                break;
+            }
+            if (next === decoded) break;
+            decoded = next;
+        }
+        return decoded;
+    }
+
+    function normalizeLogKey(key) {
+        return decodeLogText(key).toLowerCase().replace(/[\s._-]+/g, '');
+    }
+
+    function isSensitiveLogKey(key) {
+        const normalized = normalizeLogKey(key);
+        if (!normalized) return false;
+        if ([
+            'apikey',
+            'accesstoken',
+            'token',
+            'password',
+            'authorization',
+            'proxyauthorization',
+            'cookie',
+            'setcookie',
+            'xembytoken',
+            'xplextoken',
+        ].includes(normalized)) {
+            return true;
+        }
+        if (normalized.endsWith('token') || normalized.includes('session')) {
+            return true;
+        }
+        return normalized.includes('secret') || normalized.includes('credential');
+    }
+
+    const sensitiveLogAssignment = /((?:api[\s_.-]*key|access[\s_.-]*token|x[\s_.-]*(?:emby|plex)[\s_.-]*token|proxy[\s_.-]*authorization|authorization|cookie|set[\s_.-]*cookie|password|token|session(?:[\s_.-]*(?:id|token|key|secret|auth|credential|password|cookie))?)[ \t]*(?:[:=]|%3a|%3d)[ \t]*)(?:bearer[ \t]+)?([^&;,\s]+)/gi;
+
+    function redactLogAssignments(text) {
+        return text.replace(sensitiveLogAssignment, '$1' + LOG_REDACTED);
+    }
+
+    function containsSensitiveLogText(text) {
+        return /(?:api[\s_.-]*key|access[\s_.-]*token|x[\s_.-]*(?:emby|plex)[\s_.-]*token|authorization|cookie|password|token|session)/i.test(text);
+    }
+
+    function redactLogUrl(urlText, depth) {
+        if (typeof URL !== 'function') return redactLogAssignments(urlText);
+        try {
+            const parsed = new URL(urlText);
+            if (parsed.username || parsed.password) {
+                parsed.username = LOG_REDACTED;
+                parsed.password = LOG_REDACTED;
+            }
+            for (const [key, value] of parsed.searchParams.entries()) {
+                if (isSensitiveLogKey(key)) {
+                    parsed.searchParams.set(key, LOG_REDACTED);
+                } else {
+                    const redactedValue = redactLogString(value, depth + 1);
+                    if (redactedValue !== value) parsed.searchParams.set(key, redactedValue);
+                }
+            }
+            return parsed.toString();
+        } catch (_error) {
+            return redactLogAssignments(urlText);
+        }
+    }
+
+    function redactLogString(value, depth = 0) {
+        if (depth > LOG_MAX_DEPTH_LEVEL) return LOG_MAX_DEPTH;
+        let text;
+        try {
+            text = String(value);
+        } catch (_error) {
+            return LOG_UNSERIALIZABLE;
+        }
+        text = redactLogAssignments(text);
+        text = text.replace(/https?:\/\/[^\s<>"'`]+/gi, match => {
+            let suffix = '';
+            while (/[.,!?;\]}\)]$/.test(match)) {
+                suffix = match.slice(-1) + suffix;
+                match = match.slice(0, -1);
+            }
+            return redactLogUrl(match, depth) + suffix;
+        });
+        const decoded = decodeLogText(text);
+        if (decoded !== text && containsSensitiveLogText(decoded)) {
+            text = redactLogAssignments(decoded).replace(/https?:\/\/[^\s<>"'`]+/gi, match => redactLogUrl(match, depth));
+        }
+        return text;
+    }
+
+    function safeLogObjectTag(value) {
+        try {
+            return Object.prototype.toString.call(value);
+        } catch (_error) {
+            return '';
+        }
+    }
+
+    function safeLogRead(value, key) {
+        try {
+            return { ok: true, value: value[key] };
+        } catch (_error) {
+            return { ok: false };
+        }
+    }
+
+    function isLogError(value) {
+        try {
+            return safeLogObjectTag(value) === '[object Error]' || value instanceof Error;
+        } catch (_error) {
+            return safeLogObjectTag(value) === '[object Error]';
+        }
+    }
+
+    function isLogUrl(value) {
+        return safeLogObjectTag(value) === '[object URL]';
+    }
+
+    function snapshotLogValue(value, seen, depth) {
+        if (depth > LOG_MAX_DEPTH_LEVEL) return LOG_MAX_DEPTH;
+        if (value === null || value === undefined) return value;
+        if (typeof value === 'string') return redactLogString(value, depth);
+        if (typeof value === 'number' || typeof value === 'boolean') return value;
+        if (typeof value === 'bigint') return `${value}n`;
+        if (typeof value === 'symbol') return String(value);
+        if (typeof value === 'function') return '[Function]';
+        if (isLogUrl(value)) return redactLogString(String(value), depth);
+        if (isLogError(value)) {
+            if (seen.has(value)) return LOG_CIRCULAR;
+            seen.add(value);
+            const result = {};
+            for (const key of ['name', 'message', 'stack']) {
+                const read = safeLogRead(value, key);
+                if (read.ok) result[key] = snapshotLogValue(read.value, seen, depth + 1);
+            }
+            let keys;
+            try {
+                keys = Object.keys(value);
+            } catch (_error) {
+                seen.delete(value);
+                return result;
+            }
+            for (const key of keys) {
+                if (key in result) continue;
+                if (isSensitiveLogKey(key)) {
+                    result[key] = LOG_REDACTED;
+                    continue;
+                }
+                const read = safeLogRead(value, key);
+                if (read.ok) result[key] = snapshotLogValue(read.value, seen, depth + 1);
+            }
+            seen.delete(value);
+            return result;
+        }
+        if (typeof value !== 'object') return LOG_UNSERIALIZABLE;
+        if (seen.has(value)) return LOG_CIRCULAR;
+        seen.add(value);
+        try {
+            if (Array.isArray(value)) {
+                return value.map(item => snapshotLogValue(item, seen, depth + 1));
+            }
+            const tag = safeLogObjectTag(value);
+            if (tag === '[object URLSearchParams]') return redactLogString(String(value), depth);
+            let keys;
+            try {
+                keys = Object.keys(value);
+            } catch (_error) {
+                return LOG_UNSERIALIZABLE;
+            }
+            const result = {};
+            for (const key of keys) {
+                if (isSensitiveLogKey(key)) {
+                    result[key] = LOG_REDACTED;
+                    continue;
+                }
+                const read = safeLogRead(value, key);
+                if (read.ok) result[key] = snapshotLogValue(read.value, seen, depth + 1);
+            }
+            return result;
+        } finally {
+            seen.delete(value);
+        }
+    }
+
+    function snapshotLogValueSafely(value) {
+        try {
+            return snapshotLogValue(value, new WeakSet(), 0);
+        } catch (_error) {
+            return LOG_UNSERIALIZABLE;
+        }
+    }
+
+    function snapshotLogArgs(args) {
+        try {
+            return args.map(snapshotLogValueSafely);
+        } catch (_error) {
+            return [LOG_UNSERIALIZABLE];
+        }
+    }
+
     let logger = {
         error: function (...args) {
             if (config.logLevel >= 1) {
-                console.log('%cERROR', 'color: #fff; background: #d32f2f; font-weight: bold; padding: 2px 6px; border-radius: 3px;', ...args);
+                console.log('%cERROR', 'color: #fff; background: #d32f2f; font-weight: bold; padding: 2px 6px; border-radius: 3px;', ...snapshotLogArgs(args));
             }
         },
         info: function (...args) {
             if (config.logLevel >= 2) {
-                console.log('%cINFO', 'color: #fff; background: #1976d2; font-weight: bold; padding: 2px 6px; border-radius: 3px;', ...args);
+                console.log('%cINFO', 'color: #fff; background: #1976d2; font-weight: bold; padding: 2px 6px; border-radius: 3px;', ...snapshotLogArgs(args));
             }
         },
         debug: function (...args) {
             if (config.logLevel >= 3) {
-                console.log('%cDEBUG', 'color: #333; background: #ffeb3b; font-weight: bold; padding: 2px 6px; border-radius: 3px;', ...args);
+                console.log('%cDEBUG', 'color: #333; background: #ffeb3b; font-weight: bold; padding: 2px 6px; border-radius: 3px;', ...snapshotLogArgs(args));
             }
         },
     };
@@ -142,11 +356,17 @@
                 <circle cx="12" cy="12" r="10" stroke="white" stroke-width="2" fill="none" opacity="0.3"/>
                 <path d="M9 8L17 12L9 16V8Z" fill="white"/>
             </svg>
-            <div>
-                <div style="font-weight: 600; font-size: 16px;">${title}</div>
-                <div style="font-size: 13px; opacity: 0.9;">${subtitle}</div>
-            </div>
         `;
+        const textContainer = document.createElement('div');
+        const titleElement = document.createElement('div');
+        titleElement.style.cssText = 'font-weight: 600; font-size: 16px;';
+        titleElement.textContent = title ?? '';
+        const subtitleElement = document.createElement('div');
+        subtitleElement.style.cssText = 'font-size: 13px; opacity: 0.9;';
+        subtitleElement.textContent = subtitle ?? '';
+        textContainer.appendChild(titleElement);
+        textContainer.appendChild(subtitleElement);
+        notification.appendChild(textContainer);
 
         notification.style.cssText = `
             position: fixed; bottom: 30px; right: 30px; z-index: 999999;
@@ -322,7 +542,7 @@
             },
             onerror: function (error) {
                 alert(`${url}\n请求错误，本地服务未运行，请查看使用说明。\nhttps://github.com/hope140/embyToLocalPlayer/tree/stable#faq`);
-                console.error('请求错误:', error);
+                logger.error('请求错误:', error);
             }
         });
         logger.info(path, data);
@@ -366,6 +586,17 @@
 
     let addOpenFolderElement = throttle(_addOpenFolderElement, 100);
 
+    function createFileNameElement(fileName, filePath, includePath) {
+        const fileElement = document.createElement('div');
+        fileElement.id = 'addFileNameElement';
+        fileElement.textContent = fileName ?? '';
+        if (includePath) {
+            fileElement.appendChild(document.createElement('br'));
+            fileElement.appendChild(document.createTextNode(String(filePath ?? '')));
+        }
+        return fileElement;
+    }
+
     async function _addOpenFolderElement(itemId) {
         if (config.disableOpenFolder) return;
         let mediaSources = null;
@@ -389,7 +620,8 @@
         pathDiv.insertAdjacentHTML('beforebegin', openButtonHtml);
         let btn = mediaSources.querySelector('a#openFolderButton');
         if (strmFile) {
-            pathDiv.innerHTML = pathDiv.innerHTML + '<br>' + strmFile;
+            pathDiv.appendChild(document.createElement('br'));
+            pathDiv.appendChild(document.createTextNode(String(strmFile)));
             full_path = strmFile; // emby 会把 strm 内的链接当路径展示
         }
         btn.addEventListener('click', () => {
@@ -429,11 +661,14 @@
                 fileName = filePath.split('\\').pop().split('/').pop();
                 fileName = (config.crackFullPath && !isAdmin) ? filePath : fileName;
             }
-            let fileDiv = `<div id="addFileNameElement">${fileName}</div> `
-            if (strmFile && (!isAdmin && config.crackFullPath)) {
-                fileDiv = `<div id="addFileNameElement">${fileName}<br>${filePath}</div> `
+            const fileElement = createFileNameElement(
+                fileName,
+                filePath,
+                strmFile && (!isAdmin && config.crackFullPath),
+            );
+            if (pathDiv.parentNode) {
+                pathDiv.parentNode.insertBefore(fileElement, pathDiv);
             }
-            pathDiv.insertAdjacentHTML('beforebegin', fileDiv);
         }
     }
 
@@ -751,7 +986,7 @@
                         return _resp;
                     }
                 }).catch(error => {
-                    console.error('Error occurred: ', error);
+                    logger.error('Error occurred: ', error);
                 });
             }
 

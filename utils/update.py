@@ -658,6 +658,7 @@ def check_ini_diff(old_path, new_path, diff_path):
         new_se_d = new_conf[new_sect]
         if not old_conf.has_section(new_sect):
             diff_conf[new_sect] = new_se_d
+            have_diff = True
             continue
 
         old_se_d = old_conf[new_sect]
