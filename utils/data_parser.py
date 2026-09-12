@@ -57,14 +57,28 @@ def _extract_auth_identity(api_client):
 
 def strm_local_media_path(file_path, source_path):
     """Build the real media path from a .strm file path and its source path."""
-    source_url = urllib.parse.urlparse(source_path)
+    # Only known video suffixes are evidence of a filename. An opaque ID or
+    # endpoint such as index.php must not become a mounted media extension.
+    media_extensions = {
+        '.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v',
+        '.ts', '.m2ts', '.mts', '.mpg', '.mpeg', '.vob', '.iso', '.rm',
+        '.rmvb', '.asf', '.ogv', '.3gp', '.3g2', '.mxf',
+    }
+    stem, suffix = os.path.splitext(file_path)
+    if suffix.lower() != '.strm':
+        return file_path
+    if os.path.splitext(stem)[1].lower() in media_extensions:
+        return stem
+    try:
+        source_url = urllib.parse.urlparse(source_path or '')
+    except ValueError:
+        source_url = urllib.parse.urlparse('')
     decoded_url_path = urllib.parse.unquote(source_url.path)
     media_ext = os.path.splitext(decoded_url_path)[1]
 
     def valid_media_ext(ext):
         return (
-            bool(re.fullmatch(r'\.[A-Za-z0-9]{1,10}', ext))
-            and ext.lower() != '.strm'
+            ext.lower() in media_extensions
         )
 
     # Older CMS links put the real file name in a path-like query:
@@ -77,6 +91,17 @@ def strm_local_media_path(file_path, source_path):
             if valid_media_ext(query_media_ext):
                 media_ext = query_media_ext
 
+    # pickcode+name links may carry the filename as a named query value.
+    # Never inspect pickcode itself or arbitrary query values for a suffix.
+    if not valid_media_ext(media_ext):
+        for key, value in urllib.parse.parse_qsl(source_url.query):
+            if key.lower() not in ('name', 'filename', 'file_name'):
+                continue
+            query_media_ext = os.path.splitext(value)[1]
+            if valid_media_ext(query_media_ext):
+                media_ext = query_media_ext
+                break
+
     if not valid_media_ext(media_ext):
         media_ext = configs.raw.get('dev', 'strm_local_fallback_ext', fallback='').strip()
         if media_ext and not media_ext.startswith('.'):
@@ -86,7 +111,7 @@ def strm_local_media_path(file_path, source_path):
 
     if not media_ext:
         return file_path
-    return f'{os.path.splitext(file_path)[0]}{media_ext}'
+    return f'{stem}{media_ext}'
 
 
 def _get_sub_order_by_ini(_sub_list):

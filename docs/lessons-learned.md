@@ -208,6 +208,13 @@
 - 验证：`tests/test_clouddrive2_gateway.py` 覆盖路径型 `MediaSource.Path` 的主播放、
   播放列表、CD2 本地路径登记和旧 HTTP/未知扩展名回退。真实 Emby、CloudDrive2 和
   客户端播放仍需使用测试包单独验收。
+- 本地映射前缀必须匹配 STRM 的 `Item.Path`，不能根据内部 `MediaSource.Path` 更换。
+  用户验证恢复匹配 sidecar 的映射后可播放；此前把该失败归因于应改用内部路径的
+  诊断不成立。内部目标可以只有 pickcode，也可以附带文件名。
+- 后缀派生先识别 `Film.mkv.strm` 中已有的媒体后缀，再检查源路径、旧路径式查询和
+  `name`/`filename`/`file_name` 查询值，最后使用配置备用后缀。只接受已知视频后缀，
+  纯 pickcode、接口后缀和任意查询值均不能作为格式依据；目录及基名始终来自 sidecar。
+  `tests/test_strm_media_path.py` 覆盖这些形式、编码文件名、格式冲突和未知格式回退。
 
 ## 不应直接沉淀的内容
 
