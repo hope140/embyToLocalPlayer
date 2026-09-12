@@ -56,7 +56,7 @@ def _extract_auth_identity(api_client):
 
 
 def strm_local_media_path(file_path, source_path):
-    """Build the real media path from a .strm file path and its HTTP URL."""
+    """Build the real media path from a .strm file path and its source path."""
     source_url = urllib.parse.urlparse(source_path)
     decoded_url_path = urllib.parse.unquote(source_url.path)
     media_ext = os.path.splitext(decoded_url_path)[1]
@@ -172,14 +172,21 @@ def parse_received_data_emby(received_data):
         media_source_info = version_prefer_emby(media_sources) \
             if len(media_sources) > 1 and is_emby else media_sources[0]
         media_source_id = media_source_info['Id']
-    # strm 多版本似乎找不到其他版本服务器文件路径，需要额外请求分集数据。不过不需要读盘模式，还好。
-    # 因此 strm 多版本 且 is_http_source 时，正确播放，但文件标题只有一种，先不处理。
-    source_path = media_source_info['Path']  # strm 的时候和 file_path 不一致，是 strm 里的地址文本
-    file_path = source_path if main_ep_info.get('Type') == 'TvChannel' else  main_ep_info['Path']  # 多版本时候有误，直播源时没有。
-    is_strm = file_path != source_path and file_path.endswith('.strm') or media_source_info.get('Container') == 'strm'
-    is_http_source =  source_path.startswith('http')
+    # STRM 多版本可能找不到其他版本的 sidecar 路径，需要额外请求分集数据；
+    # HTTP 源仍沿用现有的多版本路径选择逻辑。
+    source_path = media_source_info['Path']  # strm 内的地址文本，可能是 URL，也可能是服务器路径
+    file_path = source_path if main_ep_info.get('Type') == 'TvChannel' else main_ep_info['Path']  # 多版本时候有误，直播源时没有。
+    is_strm = (
+        isinstance(file_path, str) and file_path.lower().endswith('.strm')
+    ) or media_source_info.get('Container') == 'strm'
+    is_http_source = (
+        isinstance(source_path, str)
+        and source_path.lower().startswith(('http://', 'https://'))
+    )
     strm_direct = configs.check_str_match(netloc, 'dev', 'strm_direct_host', log_by=True)
-    if not is_strm or (is_strm and not is_http_source):
+    # Keep Item.Path as the STRM sidecar identity.  Since Emby 4.10, a STRM
+    # MediaSource.Path may be the path written inside the pointer file.
+    if not is_strm:
         file_path = source_path
 
     if is_strm and is_http_source and len(media_sources) > 1 and media_source_info['Name'] not in file_path:
@@ -200,7 +207,10 @@ def parse_received_data_emby(received_data):
 
     # stream_url = f'{scheme}://{netloc}{media_source_info["DirectStreamUrl"]}' # 可能为转码后的链接
     basename = os.path.basename(file_path)
-    container = os.path.splitext(file_path)[-1]
+    # Keep the STRM sidecar for identity, but retain the inner source suffix
+    # for the fallback Emby stream URL when MediaSource.Path is path-like.
+    stream_file_path = source_path if is_strm and not is_http_source else file_path
+    container = os.path.splitext(stream_file_path)[-1]
     extra_str = '/emby' if is_emby else ''
     server_version = api_client['_serverVersion']
     _a, _b, _c, *_d = [int(i) for i in server_version.split('.')]
@@ -224,7 +234,7 @@ def parse_received_data_emby(received_data):
         'dev', 'strm_local_by_file_path', fallback=False)
     use_strm_local_path = (
         mount_disk_mode and is_strm and strm_local_by_file_path
-        and source_path.lower().startswith(('http://', 'https://'))
+        and isinstance(source_path, str) and bool(source_path.strip())
     )
     if not mount_disk_mode or (is_http_direct_strm and not use_strm_local_path):
         stream_url = configs.string_replace_by_ini_pair(stream_url, 'dev', 'stream_redirect')
@@ -632,11 +642,10 @@ def list_episodes(data: dict):
         source = source if isinstance(source, dict) else {}
         return main_ep_chapters(source), main_ep_intro_time(source)
 
-    def strm_file_name_sync(file_path, episodes_data):
-        if is_strm and not is_http_source:
-            for i in episodes_data:
-                i['Path'] = i['MediaSources'][0]['Path']
-
+    def strm_file_name_sync(_file_path, episodes_data):
+        # Keep each episode's Item.Path as the STRM sidecar identity.  A
+        # MediaSource.Path can be the inner media path on newer Emby
+        # versions, so copying it here would lose the local sidecar anchor.
         return episodes_data
 
 
@@ -843,18 +852,24 @@ def list_episodes(data: dict):
         file_path = item['Path']
         source_path = source_info['Path']
         item_is_strm = (
-            file_path.lower().endswith('.strm')
+            isinstance(file_path, str) and file_path.lower().endswith('.strm')
             or source_info.get('Container') == 'strm'
         )
-        item_is_http_source = source_path.lower().startswith(('http://', 'https://'))
+        item_is_http_source = (
+            isinstance(source_path, str)
+            and source_path.lower().startswith(('http://', 'https://'))
+        )
         use_strm_local_path = (
-            item_mount_disk_mode and item_is_strm and item_is_http_source
-            and strm_local_by_file_path
+            item_mount_disk_mode and item_is_strm and strm_local_by_file_path
+            and isinstance(source_path, str) and bool(source_path.strip())
         )
         fake_name = os.path.splitdrive(file_path)[1].replace('/', '__').replace('\\', '__')
         item_id = item['Id']
         item_chapters, item_intro = item_chapters_and_intro(item)
-        container = os.path.splitext(file_path)[-1]
+        # Keep the STRM sidecar for identity, but retain the inner source
+        # suffix for the fallback Emby stream URL when it is path-like.
+        stream_file_path = source_path if item_is_strm and not item_is_http_source else file_path
+        container = os.path.splitext(stream_file_path)[-1]
         stream_url = f'{scheme}://{netloc}{extra_str}/videos/{item_id}/{stream_name}{container}' \
                      f'?DeviceId={device_id}&MediaSourceId={media_source_id}' \
                      f'&PlaySessionId={play_session_id}&api_key={api_key}&Static=true'

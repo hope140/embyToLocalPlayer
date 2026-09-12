@@ -67,6 +67,11 @@ flowchart LR
    `X-ETLP-Protocol: 1`。处理器先返回 `{"shutdown": true}`，再由独立 daemon 线程调用
    `HTTPServer.shutdown()`；`run_server()` 在服务循环退出后调用 `server_close()`，主进程
    随后释放实例锁。该入口不主动关闭外部播放器窗口。
+9. Emby 的 STRM 解析以浏览器条目的 `Item.Path`/`mainEpInfo.Path` 作为 `.strm` sidecar
+   锚点；`MediaSource.Path` 只作为指针内部媒体源和扩展名来源，既可能是 URL，也可能是
+   服务器返回的路径型媒体文件名。读盘模式先由 sidecar 路径派生真实媒体路径，再进行
+   本地映射和可选 CloudDrive2 gateway 登记；无法派生出合法媒体扩展名时必须回退，不能
+   把远程 `MediaSource.Path` 当作本地可写目标。
 
 ## 生命周期与数据存放
 

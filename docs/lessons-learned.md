@@ -196,6 +196,19 @@
   `tests/test_http_server_security.py` 和 `tests/test_stop_instance.py`；实例锁释放路径
   继续由 `tests/test_process_cleanup.py` 覆盖。
 
+## 18. Emby 4.10 的 STRM 源路径与 sidecar 路径必须分开
+
+- 现象：运行日志中的 Emby `4.10.0.40` 请求把 `.strm` 内部媒体文件名放在
+  `MediaSource.Path`，它可能是服务器路径而不是 HTTP URL。旧判断用该字段覆盖了
+  浏览器条目的 `.strm` 路径，并且只允许 HTTP 源进入本地定位，因此读盘开关在解析后
+  被降为网络模式。
+- 结论：`Item.Path`/`mainEpInfo.Path` 保留为 STRM sidecar 锚点，用它判断 STRM 身份、
+  标识和本地派生基名；`MediaSource.Path` 单独保留，用于读取内部媒体扩展名和生成网络
+  fallback URL。主播放与播放列表必须使用相同规则，扩展名未知时继续安全回退。
+- 验证：`tests/test_clouddrive2_gateway.py` 覆盖路径型 `MediaSource.Path` 的主播放、
+  播放列表、CD2 本地路径登记和旧 HTTP/未知扩展名回退。真实 Emby、CloudDrive2 和
+  客户端播放仍需使用测试包单独验收。
+
 ## 不应直接沉淀的内容
 
 - 未能由当前 ETLP 代码、测试或运行结果确认的另一项目规则。

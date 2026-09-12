@@ -765,6 +765,62 @@ class DataParserGatewayTests(unittest.TestCase):
         register.assert_called_once_with(
             r'C:\Media\Movie.mkv', fallback_url=result['stream_url'])
 
+    def test_emby_parser_keeps_strm_anchor_for_path_like_media_source(self):
+        strm_path = r'/CloudNAS/CloudDrive/115open/115/Show/S01E07.strm'
+        source_path = r'/CloudNAS/CloudDrive/115open/115/Show/S01E07.mkv'
+        local_media_path = r'X:\115\Show\S01E07.mkv'
+        received_data = {
+            'extraData': {
+                'mainEpInfo': {'Path': strm_path, 'Type': 'Episode'},
+            },
+            'ApiClient': {
+                '_serverAddress': 'http://emby.example',
+                '_serverVersion': '4.10.0.40',
+            },
+            'playbackUrl': (
+                'http://emby.example/emby/Items/item-1/stream.mkv?'
+                'X-Emby-Token=token&X-Emby-Device-Id=device&'
+                'StartTimeTicks=0&UserId=user'
+            ),
+            'request': {'headers': {}},
+            'playbackData': {
+                'PlaySessionId': 'session',
+                'MediaSources': [{
+                    'Id': 'source',
+                    'Path': source_path,
+                    'Container': 'strm',
+                    'MediaStreams': [],
+                    'RunTimeTicks': 10 ** 7,
+                    'Size': 10,
+                }],
+            },
+            'mountDiskEnable': 'true',
+        }
+
+        with mock.patch.object(data_parser, 'show_version_info'), \
+                mock.patch.object(data_parser, 'main_ep_to_title', return_value='Episode'), \
+                mock.patch.object(data_parser, 'main_ep_intro_time', return_value={}), \
+                mock.patch.object(data_parser, 'logger_setup'), \
+                mock.patch.object(data_parser, 'match_version_range', return_value=True), \
+                mock.patch.object(data_parser, 'force_disk_mode_by_path', return_value=False), \
+                mock.patch.object(data_parser, 'translate_path_by_ini',
+                                  return_value=local_media_path) as translate_path, \
+                mock.patch.object(data_parser, 'maybe_register_strm_cd2_url',
+                                  return_value='http://127.0.0.1:58000/cd2/nonce') as register:
+            result = data_parser.parse_received_data_emby(received_data)
+
+        self.assertEqual(result['file_path'], strm_path)
+        self.assertEqual(result['source_path'], source_path)
+        self.assertTrue(result['is_strm'])
+        self.assertFalse(result['is_http_source'])
+        self.assertTrue(result['mount_disk_mode'])
+        self.assertTrue(result['use_strm_local_path'])
+        self.assertEqual(result['strm_cd2_local_path'], local_media_path)
+        self.assertEqual(result['media_path'], 'http://127.0.0.1:58000/cd2/nonce')
+        self.assertTrue(result['stream_url'].split('?', 1)[0].endswith('/original.mkv'))
+        translate_path.assert_called_once_with(source_path)
+        register.assert_called_once_with(local_media_path, fallback_url=result['stream_url'])
+
     def test_emby_parser_does_not_register_undetermined_strm_path(self):
         received_data = {
             'extraData': {
@@ -880,6 +936,80 @@ class DataParserGatewayTests(unittest.TestCase):
         self.assertFalse(result[0]['use_strm_local_path'])
         self.assertFalse(result[0]['use_strm_cd2_url'])
         register.assert_not_called()
+
+    def test_list_episodes_keeps_strm_anchor_for_path_like_media_source(self):
+        strm_path = r'/CloudNAS/CloudDrive/115open/115/Show/S01E07.strm'
+        source_path = r'/CloudNAS/CloudDrive/115open/115/Show/S01E07.mkv'
+        local_media_path = r'X:\115\Show\S01E07.mkv'
+        data = {
+            'server': 'emby',
+            'scheme': 'http',
+            'netloc': 'emby.example',
+            'api_key': 'token',
+            'user_id': 'user',
+            'mount_disk_mode': True,
+            'headers': {},
+            'playlist_info': [{'Id': 'ep-1'}],
+            'main_ep_info': {'SeasonId': 'season-1', 'SeriesId': 'series-1'},
+            'server_version': '4.10.0.40',
+            'basename': 'S01E07.strm',
+            'is_strm': True,
+            'is_http_source': False,
+            'strm_direct': False,
+            'is_http_direct_strm': False,
+            'strm_local_by_file_path': True,
+            'item_id': 'item-1',
+            'media_source_id': 'source-1',
+            'file_path': strm_path,
+            'media_title': 'Episode',
+            'episodes_info': [],
+            'sub_inner_idx': 0,
+            'device_id': 'device',
+            'play_session_id': 'session',
+        }
+        episode = {
+            'Id': 'ep-1',
+            'Type': 'Episode',
+            'ProviderIds': {},
+            'SeriesId': 'series-1',
+            'Path': strm_path,
+            'ParentIndexNumber': 1,
+            'IndexNumber': 7,
+            'Name': 'Episode',
+            'RunTimeTicks': 10 ** 7,
+            'MediaSources': [{
+                'Id': 'source-ep-1',
+                'Path': source_path,
+                'Container': 'strm',
+                'MediaStreams': [],
+                'RunTimeTicks': 10 ** 7,
+                'Size': 10,
+            }],
+        }
+
+        with mock.patch.object(data_parser, 'requests_urllib',
+                               return_value={'Items': [episode]}), \
+                mock.patch.object(data_parser, 'match_version_range', return_value=True), \
+                mock.patch.object(data_parser, 'translate_path_by_ini',
+                                  return_value=local_media_path) as translate_path, \
+                mock.patch.object(data_parser, 'maybe_register_strm_cd2_url',
+                                  return_value='http://127.0.0.1:58000/cd2/nonce') as register, \
+                mock.patch.object(data_parser.configs, 'check_str_match',
+                                  return_value=False), \
+                mock.patch.object(data_parser.configs, 'media_title_translate',
+                                  return_value={}):
+            result = data_parser.list_episodes(data)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['file_path'], strm_path)
+        self.assertEqual(result[0]['source_path'], source_path)
+        self.assertTrue(result[0]['mount_disk_mode'])
+        self.assertTrue(result[0]['use_strm_local_path'])
+        self.assertEqual(result[0]['strm_cd2_local_path'], local_media_path)
+        self.assertEqual(result[0]['media_path'], 'http://127.0.0.1:58000/cd2/nonce')
+        self.assertTrue(result[0]['stream_url'].split('?', 1)[0].endswith('/original.mkv'))
+        translate_path.assert_called_once_with(source_path)
+        register.assert_called_once_with(local_media_path, fallback_url=result[0]['stream_url'])
 
 
 if __name__ == '__main__':
