@@ -574,6 +574,36 @@ title=Main
     return chap_path
 
 
+_MPV_PLAYLIST_START_TIMEOUT_SECONDS = 10.0
+_MPV_PLAYLIST_START_POLL_SECONDS = 0.1
+
+
+def _wait_for_mpv_playback_start(mpv, timeout=None):
+    """Wait for the current mpv item to advance before changing its playlist."""
+
+    if timeout is None:
+        timeout = _MPV_PLAYLIST_START_TIMEOUT_SECONDS
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    last_position = None
+    have_position = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            position = mpv.command('get_property', 'time-pos')
+        except (OSError, MPVError):
+            return False
+        if isinstance(position, Real) and not isinstance(position, bool):
+            position = float(position)
+            if math.isfinite(position):
+                if have_position and position != last_position:
+                    return True
+                last_position = position
+                have_position = True
+        time.sleep(min(_MPV_PLAYLIST_START_POLL_SECONDS, remaining))
+
+
 def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
     playlist_data = {}
     if not mpv:
@@ -682,6 +712,8 @@ def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
     pre_index = 0 if pre_index < 0 else pre_index
     pre_list = episodes[pre_index:cur_index]
     suf_list = episodes[cur_index:cur_index + limit]
+    has_playlist_entries = not is_iina and any(
+        ep['basename'] != data['basename'] for ep in pre_list + suf_list)
 
     # mpv 最终播放列表顺序：前插的 pre_list（倒序逐个插 0，结果保持原序）、
     # 已在播放的当前集、再是后续集。旧版 mpv 不支持 insert 时只有后续集。
@@ -697,15 +729,24 @@ def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
             ep['media_title'] for ep in suf_list if ep['basename'] != data['basename'])
 
     def adding_thread():
-        suf_thread = threading.Thread(target=loop_episodes, args=(suf_list,))
-        pre_thread = threading.Thread(target=loop_episodes, args=(reversed(pre_list), True))
-        _ = [suf_thread.start(), pre_thread.start()]
-        if configs.raw.getboolean('dev', 'mpv_ipc_playlist_data', fallback=False):
-            safe_playlist_data = redact_playlist_data_for_ipc(playlist_data)
-            mpv.command('script-message', 'etlp-playlist-data',
-                        json.dumps(safe_playlist_data, ensure_ascii=False))
-        _ = [suf_thread.join(), pre_thread.join()]
-        mpv.command('script-message', 'etlp-playlist-done')
+        try:
+            if configs.raw.getboolean('dev', 'mpv_ipc_playlist_data', fallback=False):
+                safe_playlist_data = redact_playlist_data_for_ipc(playlist_data)
+                mpv.command('script-message', 'etlp-playlist-data',
+                            json.dumps(safe_playlist_data, ensure_ascii=False))
+            if has_playlist_entries and not _wait_for_mpv_playback_start(mpv):
+                # The predicted titles must not outlive the only item actually
+                # present in mpv when startup never reaches playback.
+                mpv.mpv_playlist_titles = [data['media_title']]
+                logger.info('mpv playlist add skipped: playback did not start')
+                return
+            suf_thread = threading.Thread(target=loop_episodes, args=(suf_list,))
+            pre_thread = threading.Thread(target=loop_episodes, args=(reversed(pre_list), True))
+            _ = [suf_thread.start(), pre_thread.start()]
+            _ = [suf_thread.join(), pre_thread.join()]
+            mpv.command('script-message', 'etlp-playlist-done')
+        except (OSError, MPVError):
+            logger.info('mpv playlist add stopped: IPC unavailable')
 
     threading.Thread(target=adding_thread, daemon=True).start()
     # loop_episodes -> ep['mpv_cmd'] = mpv_cmd 貌似没被多线程运行影响

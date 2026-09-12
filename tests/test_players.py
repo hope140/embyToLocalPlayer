@@ -46,8 +46,21 @@ class _PlaylistFakeMpv(_FakeMpv):
         self.load_calls = []
         self.load_event = threading.Event()
         self.playlist_done = threading.Event()
+        self.time_pos = 0.0
+        self.time_pos_reads = 0
+        self.auto_advance_time_pos = True
+        self.time_pos_read_event = threading.Event()
+        self.time_pos_error = None
 
     def command(self, command, *args):
+        if command == 'get_property' and args == ('time-pos',):
+            self.time_pos_read_event.set()
+            if self.time_pos_error is not None:
+                raise self.time_pos_error
+            self.time_pos_reads += 1
+            if self.auto_advance_time_pos:
+                return 0.0 if self.time_pos_reads == 1 else 0.1
+            return self.time_pos
         if command == 'get_property' and args == ('command-list',):
             if self.supports_index:
                 return [{'name': 'loadfile', 'args': [{'name': 'index'}]}]
@@ -193,6 +206,82 @@ class MpvChapterPlaybackTests(unittest.TestCase):
             players.playlist_add_mpv(mpv, data, limit=1)
             self.assertTrue(mpv.chapter_event.wait(1))
         self.assertEqual(mpv.native_chapters, episodes[0]['chapters'])
+
+    def test_playlist_waits_for_playback_progress_before_adding(self):
+        startup = 'http://127.0.0.1:58000/cd2/startup'
+        next_gateway = 'http://127.0.0.1:58000/cd2/next'
+        mpv = _PlaylistFakeMpv(startup)
+        mpv.auto_advance_time_pos = False
+        data = {
+            'basename': 'ep-1.mkv', 'media_path': startup,
+            'item_id': 'ep-1', 'mount_disk_mode': False,
+            'media_title': 'Episode 1', 'chapters': [], 'sub_file': None,
+        }
+        episodes = [
+            dict(data),
+            {
+                'basename': 'ep-2.mkv', 'media_path': next_gateway,
+                'item_id': 'ep-2', 'media_title': 'Episode 2',
+                'chapters': [], 'sub_file': None,
+            },
+        ]
+        with mock.patch.object(players.configs.raw, 'getboolean', return_value=False):
+            players.playlist_add_mpv(mpv, data, eps_data=episodes, limit=2)
+            self.assertTrue(mpv.time_pos_read_event.wait(1))
+            self.assertFalse(mpv.load_event.wait(0.1))
+            mpv.time_pos = 0.5
+            self.assertTrue(mpv.load_event.wait(1))
+            self.assertTrue(mpv.playlist_done.wait(1))
+
+    def test_playlist_start_timeout_skips_addition_and_done_message(self):
+        startup = 'http://127.0.0.1:58000/cd2/startup'
+        next_gateway = 'http://127.0.0.1:58000/cd2/next'
+        mpv = _PlaylistFakeMpv(startup)
+        mpv.auto_advance_time_pos = False
+        data = {
+            'basename': 'ep-1.mkv', 'media_path': startup,
+            'item_id': 'ep-1', 'mount_disk_mode': False,
+            'media_title': 'Episode 1', 'chapters': [], 'sub_file': None,
+        }
+        episodes = [
+            dict(data),
+            {
+                'basename': 'ep-2.mkv', 'media_path': next_gateway,
+                'item_id': 'ep-2', 'media_title': 'Episode 2',
+                'chapters': [], 'sub_file': None,
+            },
+        ]
+        with mock.patch.object(players.configs.raw, 'getboolean', return_value=False), \
+                mock.patch.object(players, '_MPV_PLAYLIST_START_TIMEOUT_SECONDS', 0.05), \
+                mock.patch.object(players, '_MPV_PLAYLIST_START_POLL_SECONDS', 0.01):
+            players.playlist_add_mpv(mpv, data, eps_data=episodes, limit=2)
+            self.assertTrue(mpv.time_pos_read_event.wait(1))
+            self.assertFalse(mpv.load_event.wait(0.2))
+            self.assertFalse(mpv.playlist_done.is_set())
+
+    def test_playlist_ipc_close_skips_addition_and_done_message(self):
+        startup = 'http://127.0.0.1:58000/cd2/startup'
+        next_gateway = 'http://127.0.0.1:58000/cd2/next'
+        mpv = _PlaylistFakeMpv(startup)
+        mpv.time_pos_error = players.MPVError('closed')
+        data = {
+            'basename': 'ep-1.mkv', 'media_path': startup,
+            'item_id': 'ep-1', 'mount_disk_mode': False,
+            'media_title': 'Episode 1', 'chapters': [], 'sub_file': None,
+        }
+        episodes = [
+            dict(data),
+            {
+                'basename': 'ep-2.mkv', 'media_path': next_gateway,
+                'item_id': 'ep-2', 'media_title': 'Episode 2',
+                'chapters': [], 'sub_file': None,
+            },
+        ]
+        with mock.patch.object(players.configs.raw, 'getboolean', return_value=False):
+            players.playlist_add_mpv(mpv, data, eps_data=episodes, limit=2)
+            self.assertTrue(mpv.time_pos_read_event.wait(1))
+            self.assertFalse(mpv.load_event.wait(0.2))
+            self.assertFalse(mpv.playlist_done.is_set())
 
     def test_playlist_registers_actual_gui_cache_path_for_old_and_new_loadfile(self):
         for supports_index in (False, True):
