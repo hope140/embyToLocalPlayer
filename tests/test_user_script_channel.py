@@ -19,7 +19,7 @@ class UserScriptChannelTests(unittest.TestCase):
             self.assertEqual(len(matches), 1, name)
             metadata[name] = matches[0].strip()
         version_matches = re.findall(r"^// @version[ \t]+([^\r\n]+)$", source, re.MULTILINE)
-        self.assertEqual(version_matches, ["2026.09.08"])
+        self.assertEqual(version_matches, ["2026.09.12"])
 
         self.assertEqual(
             metadata["updateURL"],

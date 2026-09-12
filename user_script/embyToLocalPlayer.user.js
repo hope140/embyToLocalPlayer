@@ -3,7 +3,7 @@
 // @name:zh-CN   embyToLocalPlayer
 // @name:en      embyToLocalPlayer
 // @namespace    https://github.com/hope140/embyToLocalPlayer
-// @version      2026.09.08
+// @version      2026.09.12
 // @updateURL    https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js
 // @downloadURL  https://raw.githubusercontent.com/hope140/embyToLocalPlayer/beta/user_script/embyToLocalPlayer.user.js
 // @homepageURL  https://github.com/hope140/embyToLocalPlayer/tree/beta
