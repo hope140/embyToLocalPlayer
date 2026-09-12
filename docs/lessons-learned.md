@@ -94,21 +94,21 @@
 - 验证：`utils/http_server.py` 的 `_send_cd2_strm_fallback` 及
   `tests/test_clouddrive2_gateway.py` 的 `HttpGatewayRouteTests`、`StrmContentParseTests`。
 
-## 10. 共享播放状态仍要求单实例约束
+## 10. ETLP 启动和播放状态使用单实例约束
 
-- 现象：`one_instance_mode = no` 时，即使第二个 mpv 只短暂启动后立即关闭，也可能
-  让同一个 `PlaySessionId` 的 `Playing/Progress/Stopped` 回传交错。服务端先收到停止，
-  随后旧式 `embyToLocalPlayer` 回传又创建 `Playing`，Emby 控制台会短时间保留旧会话，
-  直到后续播放请求触发清理。
-- 当前实现：示例配置仍为 `one_instance_mode = no`；原文所述“默认开启”与当前文件
-  不符。启用该选项后，`start_play()` 使用进程内锁和运行中标记限制并发播放；
-  `players.py` 中的 `--one-instance` 属于 VLC 启动参数，不能作为 mpv 的实现依据。
-- 约束：`prefetch_data` 仍为共享状态，退出路径会关闭预取并清空位置；多开不能视为
-  已可靠支持。默认值是否收紧需独立处理，并说明旧配置的兼容行为；未来支持多开前，
-  应隔离预取、位置等播放状态并验证退出互不干扰。远程控制已有独立客户端和生命周期
-  锁，但不能由此推断所有播放状态已经隔离。
-- 验证：`utils/http_server.py`、`utils/players.py` 的单实例逻辑，以及 2026-08-12
-  一次双 mpv 实际运行中服务端出现的重复 `Playing`/`Stopped` 会话序列。
+- 现象：多个 ETLP 进程或重复播放请求会让共享的 `prefetch_data`、播放器进程和
+  `PlaySessionId` 回传相互交错，服务端可能短时间保留旧会话。
+- 当前实现：`embyToLocalPlayer.py` 启动时先取得 `InstanceLock`；锁文件残留不作为
+  活动状态判断。`start_play()` 和 HTTP 播放分派使用 playback lease，同一时刻只接纳
+  一个活动播放器；第二个请求返回 HTTP 409 和 `playback_busy`。直接 `Popen` 播放器
+  的 lease 保持到进程退出。`players.py` 中的 `--one-instance` 仍是 VLC 启动参数，
+  不能作为 mpv 的实现依据。
+- 约束：启动阶段不按进程名清理外部播放器，未知端口占用者不得被终止；播放 lease
+  必须在正常退出、启动失败和异常路径释放。历史 `/playMediaFile` helper 仍是独立
+  入口，未纳入这条主播放链路。
+- 验证：`utils/instance_lock.py`、`utils/http_server.py`、`tests/test_instance_lock.py`、
+  `tests/test_http_server_security.py` 和 `tests/test_process_cleanup.py`；覆盖跨进程
+  锁竞争、重复播放、直接进程等待、异常释放和端口冲突不清理。
 
 ## 11. CD2 网关 nonce 的续连绑定要兼容本机播放器
 
