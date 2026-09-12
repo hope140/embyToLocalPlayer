@@ -102,10 +102,13 @@ def run_server(ip='127.0.0.1', port=58000):
             )
     server_address = (ip, port)
     httpd = ThreadingHTTPServer(server_address, UserScriptRequestHandler)
-    actual_ip, actual_port = httpd.server_address[:2]
-    configure_gateway(f'http://{actual_ip}:{actual_port}')
-    logger.info('serving at http://%s:%d' % server_address)
-    httpd.serve_forever()
+    try:
+        actual_ip, actual_port = httpd.server_address[:2]
+        configure_gateway(f'http://{actual_ip}:{actual_port}')
+        logger.info('serving at http://%s:%d' % server_address)
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
 
 
 class UserScriptRequestHandler(BaseHTTPRequestHandler):
@@ -122,6 +125,7 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         '/plexToLocalPlayer', '/plexToLocalPlayer/',
         '/openFolder', '/openFolder/',
         '/playMediaFile', '/playMediaFile/',
+        '/shutdown', '/shutdown/',
         '/action/sparse_file',
     }
     _MEDIA_PATH_RE = re.compile(r'^/send_media_file(?:\.[A-Za-z0-9]+)?$')
@@ -301,6 +305,9 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
 
     def _dispatch_post(self, path, data):
         canonical_path = path.rstrip('/') or '/'
+        if canonical_path == '/shutdown':
+            return {'shutdown': True}
+
         if canonical_path == '/action/sparse_file':
             cache_dir = configs.raw.get('gui', 'server_cache_path', fallback='')
             if not cache_dir:
@@ -407,6 +414,10 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self._send_error(400, 'request action failed')
             return
         self._send_json_response(response)
+        if path.rstrip('/') == '/shutdown':
+            # HTTPServer.shutdown() must run outside serve_forever's thread;
+            # schedule it only after the acknowledgement has been written.
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def do_OPTIONS(self):
         self._send_error(403, 'OPTIONS is not supported')

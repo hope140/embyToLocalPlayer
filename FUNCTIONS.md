@@ -75,7 +75,7 @@ flowchart LR
 | --- | --- | --- |
 | 浏览器脚本 | 拦截播放请求、切换网页/本地模式、读取媒体信息、增强页面 | `user_script/embyToLocalPlayer.user.js` |
 | Python 入口 | 读取配置、清理临时状态、启动后台任务和本地服务 | `embyToLocalPlayer.py` |
-| HTTP 服务 | 接收脚本请求，分派播放、文件夹、缓存、STRM gateway 等动作 | `utils/http_server.py` |
+| HTTP 服务 | 接收脚本请求，分派播放、文件夹、缓存、STRM gateway 等动作，并提供回环优雅关闭入口 | `utils/http_server.py`、`utils/stop_instance.py` |
 | 数据解析 | 处理 Emby/Jellyfin/Plex 响应、版本、字幕、STRM 和播放列表 | `utils/data_parser.py` |
 | 播放器管理 | 启动播放器、维护连续播放、获取位置和暂停状态 | `utils/player_manager.py`、`utils/players.py` |
 | 服务端会话 | 最终/实时进度回传、Emby 会话和控制能力声明 | `utils/net_tools.py`、`utils/emby_session_api.py`、`utils/remote_control_client.py` |
@@ -146,6 +146,7 @@ flowchart LR
 
 - 本地 HTTP 默认只监听回环地址。只有确有跨设备需求时才设置 `[dev] listen_on_localhost = no`，并配置至少 32 个字符的随机 `http_server_token`。
 - 油猴脚本和 Python 内部请求使用 `X-ETLP-Protocol: 1`；非回环动作接口使用 `Authorization: Bearer`，且只开放代码明确允许的稀疏文件和 STRM 临时进度动作，不能据此推断为通用远程 API。
+- Windows 启动菜单的 `7` 和 `python utils/stop_instance.py` 通过 `POST /shutdown/` 请求关闭 ETLP；关闭接口只接受回环客户端和 `X-ETLP-Protocol: 1`，服务响应后退出 HTTP 服务并释放实例锁，不强制终止外部播放器。
 - 媒体转发使用带 `file_path`、`expires`、`sig` 的短期 HMAC URL；不要在 URL、日志、截图或提交中暴露 token、Cookie 或完整敏感路径。
 - `mix_log = yes` 应保持开启以模糊日志中的域名及密钥；排错时只提供必要片段。
 - 远程控制是当前播放器的独立会话通道，不是同步观看系统；修改它时不得引入房间状态、参与者状态或跨设备跟随语义。

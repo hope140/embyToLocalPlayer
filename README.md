@@ -105,13 +105,20 @@ GitCode Release。GitCode 认证使用已登录的 `gitcode` CLI，或由 `GC_TO
 - `2`：写入 Windows 启动文件夹并后台启动。
 - `3`：打开启动文件夹。
 - `4`：打开路径转换辅助工具。
+- `5`：复制当前启动命令到剪贴板。
 - `6`：运行当前安装包频道的更新程序；源码分支和包内频道元数据必须一致。
+- `7`：通过本机 HTTP 接口请求 ETLP 优雅退出。
 
 源码检出时，启动脚本位于 `utils/others/embyToLocalPlayer_debug.bat`；也可以直接运行：
 
 ```powershell
 python embyToLocalPlayer.py
 ```
+
+也可以直接运行 `python utils/stop_instance.py`，或在 Windows 菜单选择 `7` 关闭
+正在运行的 ETLP。关闭命令只访问 `http://127.0.0.1:58000/shutdown/`，服务端仅接受
+回环客户端并要求 `X-ETLP-Protocol: 1`。成功请求后 ETLP 会退出本地 HTTP 服务并由主进程
+释放实例锁；已经启动的外部播放器窗口不会被强制终止。
 
 看到日志中的 `serving at 127.0.0.1:58000` 后，再回到网页点击原有播放按钮测试。关闭控制台会停止本地服务。
 

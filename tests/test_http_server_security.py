@@ -107,6 +107,7 @@ class HttpSecurityUnitTests(unittest.TestCase):
             http_server.run_server(ip='localhost', port=0)
         server_cls.assert_called_once()
         server_cls.return_value.serve_forever.assert_called_once()
+        server_cls.return_value.server_close.assert_called_once_with()
 
     def test_open_local_folder_uses_argument_vector(self):
         raw_platform = tools.configs.platform
@@ -463,6 +464,98 @@ class HttpServerRouteTests(unittest.TestCase):
         update.assert_called_once_with(stop_sec=10, data=data)
         self.assertNotIn('update_success', data)
         self.assertFalse(http_server.player_is_running)
+
+
+class HttpServerShutdownTests(unittest.TestCase):
+    def setUp(self):
+        self.server = http_server.ThreadingHTTPServer(
+            ('127.0.0.1', 0), http_server.UserScriptRequestHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f'http://127.0.0.1:{self.server.server_address[1]}'
+
+    def tearDown(self):
+        if self.thread.is_alive():
+            self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def _post(self, path, *, headers=None):
+        request = urllib.request.Request(
+            self.base_url + path, data=b'{}', method='POST',
+            headers={'Content-Type': 'application/json', **(headers or {})})
+        try:
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    def test_shutdown_returns_ack_and_stops_server(self):
+        with mock.patch.object(http_server.configs, 'update'):
+            status, body = self._post(
+                '/shutdown/', headers={'X-ETLP-Protocol': '1'})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {'shutdown': True})
+        self.thread.join(timeout=2)
+        self.assertFalse(self.thread.is_alive())
+
+    def test_shutdown_rejects_missing_protocol_header(self):
+        with mock.patch.object(http_server.configs, 'update'):
+            status, _ = self._post('/shutdown')
+
+        self.assertEqual(status, 403)
+        self.assertTrue(self.thread.is_alive())
+
+    def test_shutdown_rejects_error_route(self):
+        with mock.patch.object(http_server.configs, 'update'):
+            status, _ = self._post(
+                '/shutdown.evil', headers={'X-ETLP-Protocol': '1'})
+
+        self.assertEqual(status, 404)
+        self.assertTrue(self.thread.is_alive())
+
+    def test_shutdown_rejects_non_loopback_client(self):
+        handler = object.__new__(http_server.UserScriptRequestHandler)
+        handler.command = 'POST'
+        handler.path = '/shutdown/'
+        handler.client_address = ('192.0.2.11', 12345)
+        handler.headers = {
+            'Content-Type': 'application/json',
+            'X-ETLP-Protocol': '1',
+        }
+        handler.server = SimpleNamespace(shutdown=mock.Mock())
+        handler._send_error = mock.Mock()
+        handler._read_json_body = mock.Mock()
+
+        http_server.UserScriptRequestHandler.do_POST(handler)
+
+        handler._send_error.assert_called_once_with(
+            403, 'local action requires a loopback client')
+        handler._read_json_body.assert_not_called()
+        handler.server.shutdown.assert_not_called()
+
+    def test_shutdown_is_scheduled_after_response_on_daemon_thread(self):
+        handler = object.__new__(http_server.UserScriptRequestHandler)
+        handler.command = 'POST'
+        handler.path = '/shutdown'
+        handler.client_address = ('127.0.0.1', 12345)
+        handler.headers = {
+            'Content-Type': 'application/json',
+            'X-ETLP-Protocol': '1',
+        }
+        handler.server = SimpleNamespace(shutdown=mock.Mock())
+        handler._read_json_body = mock.Mock(return_value={})
+        handler._send_json_response = mock.Mock()
+
+        with mock.patch.object(http_server.configs, 'update'), \
+                mock.patch.object(http_server.threading, 'Thread') as thread_cls:
+            http_server.UserScriptRequestHandler.do_POST(handler)
+
+        handler._send_json_response.assert_called_once_with({'shutdown': True})
+        thread_cls.assert_called_once_with(
+            target=handler.server.shutdown, daemon=True)
+        thread_cls.return_value.start.assert_called_once_with()
 
 
 if __name__ == '__main__':

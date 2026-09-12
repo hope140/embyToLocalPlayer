@@ -29,7 +29,7 @@ flowchart LR
 | 组件 | 主要职责 | 代码入口 |
 | --- | --- | --- |
 | 进程入口 | 加载 bundled dependencies、取得 ETLP 实例锁、读取配置、清理临时状态、启动后台任务和 HTTP 服务 | `embyToLocalPlayer.py`、`utils/instance_lock.py` |
-| 本地 HTTP 服务 | 精确路由、协议头/令牌校验、请求体解析、单播放占用、播放/文件/缓存动作分派和短期媒体 URL | `utils/http_server.py`、`utils/http_security.py` |
+| 本地 HTTP 服务 | 精确路由、协议头/令牌校验、请求体解析、单播放占用、播放/文件/缓存动作分派、短期媒体 URL 和回环优雅关闭 | `utils/http_server.py`、`utils/http_security.py`、`utils/stop_instance.py` |
 | 数据解析 | 处理 Emby/Jellyfin/Plex 响应、路径、STRM、版本、字幕和播放列表数据 | `utils/data_parser.py` |
 | 播放管理 | 启动播放器、连续播放、预热、播放状态读取和最终进度更新 | `utils/player_manager.py`、`utils/players.py` |
 | Emby 会话与远程控制 | 为当前播放建立独立控制身份，进行 HTTP/WebSocket 回传和控制命令处理 | `utils/emby_session_api.py`、`utils/remote_control_client.py` |
@@ -63,12 +63,16 @@ flowchart LR
    配置文件不由更新包直接覆盖，ZIP 成员必须先经过安全校验。用户脚本仍使用经过验证的
    GitHub branch raw 地址，因为 GitCode 内容 API 的下载链接带 blob SHA，不能作为稳定的
    Tampermonkey 更新入口。
+8. ETLP 的关闭入口是回环 `POST /shutdown` 或 `POST /shutdown/`，并要求
+   `X-ETLP-Protocol: 1`。处理器先返回 `{"shutdown": true}`，再由独立 daemon 线程调用
+   `HTTPServer.shutdown()`；`run_server()` 在服务循环退出后调用 `server_close()`，主进程
+   随后释放实例锁。该入口不主动关闭外部播放器窗口。
 
 ## 生命周期与数据存放
 
 - 进程启动时由 `embyToLocalPlayer.py` 先取得实例锁，再清理临时状态、准备配置，启动
-  恢复信息预取和 redirect cache 清理线程，最后进入 `run_server()`；实例锁释放覆盖
-  正常退出和启动异常路径。
+  恢复信息预取和 redirect cache 清理线程，最后进入 `run_server()`；收到回环关闭请求后
+  服务循环退出并关闭监听 socket，实例锁释放覆盖正常退出和启动异常路径。
 - 播放器、远程控制和播放列表状态主要保存在进程对象中；配置、字幕/媒体缓存、
   更新 archive 和示例配置使用现有配置路径及临时目录，不引入房间或服务端状态库。
   当前播放 lease 只覆盖 ETLP 主播放链路；历史 `/playMediaFile` helper 仍是独立入口。
@@ -87,6 +91,7 @@ flowchart LR
 - `tests/test_dependency_bootstrap.py`
 - `tests/test_update.py`
 - `tests/test_instance_lock.py`
+- `tests/test_stop_instance.py`
 
 新增跨组件约束时，应先补测试或可复现运行证据，再更新本文；只有需要解释长期
 取舍的变化才创建 ADR。未验证的猜测放在任务报告的残余风险中，不写成当前架构事实。

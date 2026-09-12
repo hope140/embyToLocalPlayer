@@ -186,6 +186,16 @@
 - 验证：`tests/user_script_security.test.cjs`、Python Node 桥接测试，以及本地 Edge DOM
   检查。测试确认凭据不出现在日志，恶意标题/路径不生成元素，原节点和事件保持不变。
 
+## 17. ETLP 关闭使用回环控制接口
+
+- 结论：Windows 菜单和直接命令行脚本统一向 `127.0.0.1:58000/shutdown/` 发送带
+  `X-ETLP-Protocol: 1` 的 JSON POST。服务端先返回固定成功 JSON，再从独立 daemon 线程
+  请求 `HTTPServer.shutdown()`；`run_server()` 的 `finally` 必须调用 `server_close()`，
+  由主进程的既有退出路径释放实例锁。关闭入口不负责终止外部播放器。
+- 验证：`utils/http_server.py`、`utils/stop_instance.py`、
+  `tests/test_http_server_security.py` 和 `tests/test_stop_instance.py`；实例锁释放路径
+  继续由 `tests/test_process_cleanup.py` 覆盖。
+
 ## 不应直接沉淀的内容
 
 - 未能由当前 ETLP 代码、测试或运行结果确认的另一项目规则。

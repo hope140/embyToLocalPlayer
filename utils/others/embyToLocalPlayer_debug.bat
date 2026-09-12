@@ -22,7 +22,9 @@ if "%PYTHON_VERSION:~0,6%" == "Python" (
     echo 4: path translate helper
     echo 5: copy script path to clipboard
     echo 6: update current release channel
-    choice /N /C:123456 /M "press a number" %1
+    echo 7: close ETLP gracefully
+    choice /N /C:1234567 /M "press a number" %1
+    if errorlevel 7 goto SEVEN
     if errorlevel 6 goto SIX
     if errorlevel 5 goto FIVE
     if errorlevel 4 goto FOUR
@@ -34,6 +36,12 @@ if "%PYTHON_VERSION:~0,6%" == "Python" (
     echo ERROR: python not found, reinstall it and add to path!
     GOTO END
 )
+
+
+:SEVEN
+echo you have pressed seven
+"%pythonPath%" "%~dp0utils\stop_instance.py"
+GOTO END
 
 
 :SIX
