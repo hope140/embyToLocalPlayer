@@ -18,36 +18,33 @@ except Exception:
 
 from utils.downloader import prefetch_resume_tv
 from utils.http_server import run_server
-from utils.tools import (configs, MyLogger, kill_multi_process, clean_tmp_dir)
+from utils.instance_lock import InstanceLock
+from utils.tools import configs, MyLogger, clean_tmp_dir
 from utils.net_tools import check_redirect_cache_expired_loop
 
-if __name__ == '__main__':
+
+def main():
     os.chdir(configs.cwd)
-    configs.print_version()
-    if configs.raw.getboolean('dev', 'kill_process_at_start', fallback=True):
-        if os.name == 'nt':
-            # On Windows, player selection must use the process image name.
-            # Keep command-line matching only for the legacy ETLP Python
-            # process (and its historical AutoHotkey helper marker).
-            from utils.windows_tool import WINDOWS_PLAYER_EXECUTABLE_NAMES
+    instance_lock = InstanceLock()
+    if not instance_lock.acquire():
+        MyLogger().error('ETLP instance lock is busy, exit')
+        return 1
+    try:
+        configs.print_version()
+        logger = MyLogger()
+        logger.info(__file__)
+        # The OS-backed instance lock makes broad startup process cleanup both
+        # unnecessary and unsafe: an occupied HTTP port must never trigger a
+        # kill attempt against an unrelated player process.
+        clean_tmp_dir()
+        configs.necessary_setting_when_server_start()
+        threading.Thread(target=prefetch_resume_tv, daemon=True).start()
+        threading.Thread(target=check_redirect_cache_expired_loop, daemon=True).start()
+        run_server()  # 主要逻辑入口：utils.http_server.py
+    finally:
+        instance_lock.release()
+    return 0
 
-            process_name_re = (r'embyToLocalPlayer\.py(?=["\'\s]|$)|'
-                               r'autohotkey_tool')
-            executable_names = WINDOWS_PLAYER_EXECUTABLE_NAMES
-        else:
-            # Preserve the existing ps/command-line behavior on non-Windows.
-            process_name_re = (f'(embyToLocalPlayer.py|autohotkey_tool|' +
-                               r'mpv.*exe|mpc-.*exe|vlc.exe|PotPlayer.*exe|' +
-                               r'/IINA|/VLC|/mpv)')
-            executable_names = None
-        kill_multi_process(name_re=process_name_re,
-                           executable_names=executable_names,
-                           not_re='(tmux|greasyfork|github)')
 
-    logger = MyLogger()
-    logger.info(__file__)
-    clean_tmp_dir()
-    configs.necessary_setting_when_server_start()
-    threading.Thread(target=prefetch_resume_tv, daemon=True).start()
-    threading.Thread(target=check_redirect_cache_expired_loop, daemon=True).start()
-    run_server()  # 主要逻辑入口：utils.http_server.py
+if __name__ == '__main__':
+    raise SystemExit(main())

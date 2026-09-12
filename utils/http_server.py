@@ -26,9 +26,52 @@ from utils.tools import (configs, MyLogger, open_local_folder, play_media_file,
 
 player_is_running = False
 player_state_lock = threading.Lock()
+_current_playback_lease = None
 logger = MyLogger()
 dl_manager = DownloadManager(configs.cache_path, speed_limit=configs.speed_limit)
 miss_runtime_start_sec = {}
+
+
+class PlaybackBusyError(RuntimeError):
+    """Raised when a second playback request arrives while one is active."""
+
+
+class _PlaybackLease:
+    def __init__(self):
+        self.released = False
+
+
+def _acquire_playback_lease():
+    global _current_playback_lease, player_is_running
+    with player_state_lock:
+        if player_is_running:
+            return None
+        lease = _PlaybackLease()
+        _current_playback_lease = lease
+        player_is_running = True
+        return lease
+
+
+def _release_playback_lease(lease):
+    global _current_playback_lease, player_is_running
+    with player_state_lock:
+        if lease is not _current_playback_lease:
+            return
+        _current_playback_lease = None
+        player_is_running = False
+        lease.released = True
+
+
+def _start_playback_thread(data):
+    lease = _acquire_playback_lease()
+    if lease is None:
+        raise PlaybackBusyError
+    try:
+        thread = threading.Thread(target=start_play, args=(data, lease), daemon=True)
+        thread.start()
+    except BaseException:
+        _release_playback_lease(lease)
+        raise
 
 
 def get_machine_ip():
@@ -268,8 +311,12 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             return {'sparse_file': True}
 
         if canonical_path in ('/gui', '/dl', '/pl'):
+            gui_cmd = data.get('gui_cmd')
+            if gui_cmd == 'play':
+                logger.info('http action', canonical_path, gui_cmd)
+                _start_playback_thread(data)
+                return None
             thread_dict = {
-                'play': threading.Thread(target=start_play, args=(data,)),
                 'play_check': threading.Thread(target=dl_manager.play_check, args=(data,)),
                 'download_play': threading.Thread(target=dl_manager.download_play, args=(data,)),
                 'download_not_play': threading.Thread(target=dl_manager.download_play, args=(data, False)),
@@ -279,7 +326,6 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
                 'resume_or_pause': threading.Thread(target=dl_manager.resume_or_pause, args=(data,)),
             }
             [setattr(t, 'daemon', True) for t in thread_dict.values()]
-            gui_cmd = data.get('gui_cmd')
             if gui_cmd not in thread_dict:
                 raise ValueError('unknown gui command')
             logger.info('http action', canonical_path, gui_cmd)
@@ -297,7 +343,6 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
                 else parse_received_data_plex(data)
             logger.info(f"server={data['server']}/{data.get('server_version')} {data['mount_disk_mode']=}")
             thread_dict = {
-                'play': threading.Thread(target=start_play, args=(data,)),
                 'play_check': threading.Thread(target=dl_manager.play_check, args=(data,)),
                 'download_play': threading.Thread(target=dl_manager.download_play, args=(data,)),
                 'download_not_play': threading.Thread(target=dl_manager.download_play, args=(data, False)),
@@ -308,12 +353,12 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             }
             [setattr(t, 'daemon', True) for t in thread_dict.values()]
             if configs.check_str_match(_str=data['netloc'], section='gui', option='except_host'):
-                threading.Thread(target=start_play, args=(data,), daemon=True).start()
+                _start_playback_thread(data)
                 return None
             if configs.gui_is_enable:
                 if configs.raw.get('gui', 'enable_path'):
                     if not configs.check_str_match(data['file_path'], 'gui', 'enable_path', log_by=False):
-                        thread_dict['play'].start()
+                        _start_playback_thread(data)
                         return None
                 if configs.raw.getboolean('gui', 'without_confirm', fallback=False):
                     thread_dict['download_play'].start()
@@ -325,7 +370,7 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
                 else:
                     multiprocessing.Process(target=show_ask_button, args=(data,), daemon=True).start()
             else:
-                thread_dict['play'].start()
+                _start_playback_thread(data)
             return None
 
         if canonical_path == '/openFolder':
@@ -349,6 +394,10 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         configs.update()
         try:
             response = self._dispatch_post(path, data)
+        except PlaybackBusyError:
+            logger.info('http playback busy', path)
+            self._send_error(409, 'playback_busy')
+            return
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             logger.error('http POST request rejected', path)
             self._send_error(400, 'invalid request data')
@@ -930,15 +979,12 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         return start, min(end, file_size - 1)
 
 
-def start_play(data):
-    global player_is_running
-    one_instance_mode = configs.raw.getboolean('dev', 'one_instance_mode', fallback=True)
-    with player_state_lock:
-        if player_is_running:
-            logger.error('player_is_running, skip. You may want to disable one_instance_mode, see detail in config file')
-            return
-        if one_instance_mode:
-            player_is_running = True
+def start_play(data, playback_lease=None):
+    if playback_lease is None:
+        playback_lease = _acquire_playback_lease()
+        if playback_lease is None:
+            logger.info('http playback busy')
+            return {'error': 'playback_busy'}
     try:
         file_path = data['file_path']
         start_sec = data['start_sec']
@@ -1017,8 +1063,9 @@ def start_play(data):
         else:
             logger.info('run as not support player mod')
             player = subprocess.Popen(cmd)
-            activate_window_by_pid(player.pid)
+            try:
+                activate_window_by_pid(player.pid)
+            finally:
+                player.wait()
     finally:
-        if one_instance_mode:
-            with player_state_lock:
-                player_is_running = False
+        _release_playback_lease(playback_lease)

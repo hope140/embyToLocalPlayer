@@ -543,6 +543,20 @@
             onerror: function (error) {
                 alert(`${url}\n请求错误，本地服务未运行，请查看使用说明。\nhttps://github.com/hope140/embyToLocalPlayer/tree/beta#faq`);
                 logger.error('请求错误:', error);
+            },
+            onload: function (response) {
+                if (response.status !== 409) {
+                    return;
+                }
+                let result;
+                try {
+                    result = JSON.parse(response.responseText);
+                } catch (_) {
+                    return;
+                }
+                if (result && result.error === 'playback_busy') {
+                    alert('已有播放正在进行中，请先关闭当前播放器后再播放');
+                }
             }
         });
         logger.info(path, data);

@@ -129,6 +129,15 @@ function loadAddOpenFolderElement(deps) {
     })()`, { deps });
 }
 
+function loadSendDataToLocalServer(deps) {
+    const snippet = extract('    function sendDataToLocalServer', '    let serverName');
+    return vm.runInNewContext(`(() => {
+        const { GM_xmlhttpRequest, logger, alert } = deps;
+        ${snippet}
+        return sendDataToLocalServer;
+    })()`, { deps });
+}
+
 function loadCreateFileNameElement(document) {
     const snippet = extract('    function createFileNameElement', '    async function _addOpenFolderElement');
     return vm.runInNewContext(`(() => {
@@ -214,6 +223,32 @@ test('logger handles cycles, deep values, throwing getters, and proxies without 
     assert.equal(output.includes('[Circular]'), true);
     assert.equal(output.includes('[MaxDepth]'), true);
     assert.equal(output.includes('getter should be omitted'), false);
+});
+
+test('sendDataToLocalServer reports only a validated playback busy response', () => {
+    let request;
+    const alerts = [];
+    const logs = [];
+    const sendDataToLocalServer = loadSendDataToLocalServer({
+        GM_xmlhttpRequest: options => { request = options; },
+        logger: { info: (...args) => logs.push(args), error: () => {} },
+        alert: message => alerts.push(message),
+    });
+
+    sendDataToLocalServer({ title: 'movie' }, 'embyToLocalPlayer');
+    assert.equal(typeof request.onload, 'function');
+
+    request.onload({
+        status: 409,
+        responseText: JSON.stringify({ error: 'playback_busy', token: 'SECRET_RESPONSE_TOKEN' }),
+    });
+    assert.deepEqual(alerts, ['已有播放正在进行中，请先关闭当前播放器后再播放']);
+    assert.equal(JSON.stringify(logs).includes('SECRET_RESPONSE_TOKEN'), false);
+
+    request.onload({ status: 409, responseText: JSON.stringify({ error: 'other' }) });
+    request.onload({ status: 500, responseText: JSON.stringify({ error: 'playback_busy' }) });
+    request.onload({ status: 409, responseText: 'not-json' });
+    assert.deepEqual(alerts, ['已有播放正在进行中，请先关闭当前播放器后再播放']);
 });
 
 test('play notification keeps static markup and inserts dynamic values as text', () => {

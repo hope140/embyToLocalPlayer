@@ -3,11 +3,57 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import embyToLocalPlayer as launcher
 import utils.tools as tools
 import utils.windows_tool as windows_tool
 
 
 class WindowsProcessCleanupTests(unittest.TestCase):
+    def test_startup_lock_failure_skips_initialization(self):
+        instance_lock = mock.Mock()
+        instance_lock.acquire.return_value = False
+        with mock.patch.object(launcher.os, 'chdir'), \
+                mock.patch.object(launcher.configs, 'cwd', 'test-cwd'), \
+                mock.patch.object(launcher, 'InstanceLock', return_value=instance_lock), \
+                mock.patch.object(launcher, 'clean_tmp_dir') as clean, \
+                mock.patch.object(launcher.configs, 'necessary_setting_when_server_start') as config, \
+                mock.patch.object(launcher, 'run_server') as run_server:
+            self.assertEqual(launcher.main(), 1)
+
+        clean.assert_not_called()
+        config.assert_not_called()
+        run_server.assert_not_called()
+        instance_lock.release.assert_not_called()
+
+    def test_startup_port_collision_does_not_kill_processes(self):
+        events = []
+        instance_lock = mock.Mock()
+        instance_lock.acquire.side_effect = lambda: events.append('lock') or True
+
+        def mark(name):
+            events.append(name)
+
+        with mock.patch.object(launcher.os, 'chdir'), \
+                mock.patch.object(launcher.configs, 'cwd', 'test-cwd'), \
+                mock.patch.object(launcher.configs, 'print_version'), \
+                mock.patch.object(launcher, 'InstanceLock', return_value=instance_lock), \
+                mock.patch.object(launcher, 'clean_tmp_dir', side_effect=lambda: mark('clean')), \
+                mock.patch.object(launcher.configs, 'necessary_setting_when_server_start',
+                                  side_effect=lambda: mark('config')), \
+                mock.patch.object(launcher.threading, 'Thread') as thread_cls, \
+                mock.patch.object(launcher, 'run_server',
+                                  side_effect=OSError(10048, 'address already in use')), \
+                mock.patch.object(launcher, 'kill_multi_process', create=True) as kill:
+            with self.assertRaises(OSError):
+                launcher.main()
+
+        kill.assert_not_called()
+        instance_lock.acquire.assert_called_once_with()
+        instance_lock.release.assert_called_once_with()
+        self.assertLess(events.index('lock'), events.index('clean'))
+        self.assertLess(events.index('clean'), events.index('config'))
+        self.assertEqual(thread_cls.call_count, 2)
+
     def test_process_image_name_excludes_embedded_mpv_from_electron(self):
         processes = [
             {

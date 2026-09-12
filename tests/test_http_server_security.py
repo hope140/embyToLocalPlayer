@@ -199,6 +199,9 @@ class HttpServerRouteTests(unittest.TestCase):
                               if call.kwargs.get('target') is http_server.start_play]
                 self.assertEqual(len(play_calls), 1)
                 self.assertIs(play_calls[0].kwargs['args'][0], parsed_payload)
+                lease = http_server._current_playback_lease
+                if lease is not None:
+                    http_server._release_playback_lease(lease)
 
     def _post_sparse(self, payload):
         cache_dir = tempfile.mkdtemp()
@@ -261,6 +264,114 @@ class HttpServerRouteTests(unittest.TestCase):
             'use_strm_cd2_url': False,
             'netloc': 'media.example',
         }
+
+    def test_second_play_request_returns_playback_busy_conflict(self):
+        http_server.player_is_running = True
+        try:
+            with mock.patch.object(http_server.configs, 'update'):
+                status, body = self._post(
+                    '/gui', {'gui_cmd': 'play'},
+                    headers={'X-ETLP-Protocol': '1'})
+        finally:
+            http_server.player_is_running = False
+            http_server._current_playback_lease = None
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {'error': 'playback_busy'})
+
+    def test_two_playback_requests_only_one_is_started(self):
+        started = []
+        started_lock = threading.Lock()
+
+        class FakeThread:
+            def __init__(self, *, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                with started_lock:
+                    started.append(self)
+
+        results = []
+        barrier = threading.Barrier(2)
+        data = self._start_play_data()
+
+        def submit_playback():
+            barrier.wait()
+            try:
+                http_server._start_playback_thread(data)
+            except http_server.PlaybackBusyError:
+                results.append('busy')
+            else:
+                results.append('started')
+
+        workers = [threading.Thread(target=submit_playback) for _ in range(2)]
+        with mock.patch.object(http_server.threading, 'Thread', FakeThread):
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=2)
+
+        try:
+            self.assertEqual(sorted(results), ['busy', 'started'])
+            self.assertEqual(len(started), 1)
+            self.assertIs(started[0].target, http_server.start_play)
+            self.assertIs(started[0].args[0], data)
+        finally:
+            lease = http_server._current_playback_lease
+            if lease is not None:
+                http_server._release_playback_lease(lease)
+
+    def test_direct_popen_holds_playback_until_process_exits(self):
+        process_started = threading.Event()
+        process_exit = threading.Event()
+
+        class FakeProcess:
+            pid = 12345
+
+            def wait(self):
+                process_started.set()
+                process_exit.wait(timeout=2)
+                return 0
+
+        episode_thread = mock.Mock()
+        process = FakeProcess()
+        data = self._start_play_data()
+        worker = threading.Thread(target=http_server.start_play, args=(data,))
+        try:
+            with mock.patch.object(http_server, 'ThreadWithReturnValue', return_value=episode_thread), \
+                    mock.patch.object(http_server, 'get_player_cmd', return_value=['test-player.exe', 'movie.mkv']), \
+                    mock.patch.object(http_server.subprocess, 'Popen', return_value=process) as popen, \
+                    mock.patch.object(http_server, 'activate_window_by_pid'):
+                worker.start()
+                self.assertTrue(process_started.wait(timeout=2))
+                self.assertTrue(http_server.player_is_running)
+                self.assertEqual(http_server.start_play(data), {'error': 'playback_busy'})
+                popen.assert_called_once_with(['test-player.exe', 'movie.mkv'])
+                process_exit.set()
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+                self.assertFalse(http_server.player_is_running)
+
+                self.assertIsNone(http_server.start_play(data))
+                self.assertEqual(popen.call_count, 2)
+        finally:
+            process_exit.set()
+            worker.join(timeout=2)
+            lease = http_server._current_playback_lease
+            if lease is not None:
+                http_server._release_playback_lease(lease)
+
+    def test_direct_popen_failure_releases_playback(self):
+        episode_thread = mock.Mock()
+        data = self._start_play_data()
+        with mock.patch.object(http_server, 'ThreadWithReturnValue', return_value=episode_thread), \
+                mock.patch.object(http_server, 'get_player_cmd', return_value=['test-player.exe', 'movie.mkv']), \
+                mock.patch.object(http_server.subprocess, 'Popen', side_effect=OSError('start failed')), \
+                mock.patch.object(http_server, 'activate_window_by_pid'):
+            with self.assertRaises(OSError):
+                http_server.start_play(data)
+        self.assertFalse(http_server.player_is_running)
 
     def test_start_play_resets_player_is_running_when_get_player_cmd_fails(self):
         raw = ConfigParser()
