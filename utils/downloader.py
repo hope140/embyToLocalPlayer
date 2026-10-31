@@ -697,16 +697,23 @@ class DownloadManager:
         if dl.download_only:
             logger.info('download only detected, refuse play')
             return
+        original_media_path = data.get('media_path') or url
         read_only = configs.raw.getboolean('gui', 'read_only', fallback=False)
+        preheat_attempted = False
+        cache_ready = dl.progress > 0 and os.path.exists(dl.file)
         if dl.progress >= pos:
             if not read_only and dl.file_lock.has_lock and dl.progress == 0 and not dl.file_is_busy:
-                dl.download_fist_last()
+                preheat_attempted = True
+                cache_ready = bool(dl.download_fist_last() and os.path.exists(dl.file))
             if play:
-                data['media_path'] = dl.file
+                data['media_path'] = dl.file if cache_ready else original_media_path
                 data['gui_cmd'] = 'play'
                 if configs.raw.getboolean('gui', 'without_confirm', fallback=False):
                     data['gui_without_confirm'] = True
                 requests_urllib('http://127.0.0.1:58000/dl', _json=data)
+            if preheat_attempted and not cache_ready:
+                logger.info(f'dlm: preheat failed, keep original url {_id}')
+                return
         else:
             if play:
                 data['gui_cmd'] = 'play'
@@ -771,7 +778,9 @@ class DownloadManager:
             elif operate == 'resume':
                 dl.pause = False
                 if dl.progress == 0:
-                    dl.download_fist_last()
+                    if not dl.download_fist_last() or not os.path.exists(dl.file):
+                        logger.info(f'dlm: preheat failed, keep task for manual resume {_id}')
+                        continue
                 threading.Thread(target=self._percent_download_with_limit,
                                  kwargs=dict(dl=dl, start=dl.progress, end=1)).start()
 
