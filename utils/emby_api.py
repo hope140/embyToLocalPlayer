@@ -84,7 +84,7 @@ class EmbyApi:
                 raise ValueError('get_user_data require user id')
             params.update({'UserId': self.user_id})
         if get_sources:
-            params.update({'Fields': 'MediaSources,Path,ProviderIds'})
+            params.update({'Fields': 'MediaSources,Path,ProviderIds,AlternateMediaSources'})
         res = self.get(f'Shows/{item_id}/Episodes', params=params)
         return res
 

@@ -1,4 +1,5 @@
 import collections
+import copy
 import os
 import pathlib
 import re
@@ -53,6 +54,297 @@ def _extract_auth_identity(api_client):
             api_client.get('_serverVersion')
         ),
     }
+
+
+def _identifier(value):
+    """Return a stable non-empty identifier for response matching."""
+
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def _source_path(source):
+    path = source.get('Path') if isinstance(source, dict) else None
+    return path if isinstance(path, str) and path.strip() else None
+
+
+def _source_entries(item):
+    """Return copied media-source entries without changing an API response."""
+
+    if not isinstance(item, dict):
+        return []
+    entries = []
+    seen_ids = set()
+    for field in ('MediaSources', 'AlternateMediaSources'):
+        sources = item.get(field)
+        if not isinstance(sources, list):
+            continue
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            source_id = _identifier(source.get('Id'))
+            if source_id is not None and source_id in seen_ids:
+                continue
+            if source_id is not None:
+                seen_ids.add(source_id)
+            entries.append(source)
+    return entries
+
+
+def _is_strm_item(item, source):
+    item_path = item.get('Path') if isinstance(item, dict) else None
+    container = source.get('Container') if isinstance(source, dict) else None
+    return (
+        isinstance(item_path, str) and item_path.lower().endswith('.strm')
+    ) or str(container or '').lower() == 'strm'
+
+
+def _unverified_source_path(base_path, default_name, source_name):
+    """Build a basename-only version hint, never a local-path assertion."""
+
+    if not all(isinstance(value, str) and value.strip()
+               for value in (base_path, default_name, source_name)):
+        return None
+    default_name = default_name.strip()
+    source_name = source_name.strip()
+    if default_name == source_name or any(
+            separator in default_name or separator in source_name
+            for separator in ('/', '\\')):
+        return None
+
+    directory, basename = os.path.split(base_path)
+    pattern = re.compile(
+        rf'(?<![A-Za-z0-9]){re.escape(default_name)}(?![A-Za-z0-9])',
+        flags=re.IGNORECASE,
+    )
+    match = pattern.search(basename)
+    if not match:
+        return None
+    new_basename = (
+        basename[:match.start()] + source_name + basename[match.end():]
+    )
+    if new_basename == basename:
+        return None
+    if not directory:
+        return new_basename
+    separator = '\\' if '\\' in base_path and '/' not in base_path else '/'
+    return directory.rstrip('/\\') + separator + new_basename
+
+
+def _normalize_emby_episode_items(episodes_data):
+    """Flatten Emby's multi-source rows into one source per copied item.
+
+    Emby 4.9+ may hide alternate item rows from non-admin users while still
+    returning all ``MediaSources``.  This helper intentionally has no server
+    role/version gate: it only creates a row when the response provides the
+    source's own item ID, source ID, and path.  It never mutates the response.
+    """
+
+    if not isinstance(episodes_data, list):
+        return []
+    raw_items = [item for item in episodes_data if isinstance(item, dict)]
+    explicit_item_ids = {
+        item_id for item_id in (_identifier(item.get('Id')) for item in raw_items)
+        if item_id is not None
+    }
+    emitted_item_ids = set()
+    emitted_paths = set()
+    normalized = []
+
+    for original in raw_items:
+        sources = _source_entries(original)
+        if not sources:
+            continue
+        item_id = _identifier(original.get('Id'))
+
+        primary = None
+        if item_id is not None:
+            primary = next(
+                (source for source in sources
+                 if _identifier(source.get('ItemId')) == item_id),
+                None,
+            )
+        if primary is None:
+            primary = next(
+                (source for source in sources
+                 if source.get('Type') == 'Default'
+                 and (_identifier(source.get('ItemId')) in (None, item_id))),
+                None,
+            )
+        if primary is None:
+            has_source_identity = any(
+                _identifier(source.get('ItemId')) is not None
+                or source.get('Type') is not None
+                for source in sources
+            )
+            if item_id is None or not has_source_identity:
+                # Older responses have no ownership metadata; retain their
+                # original first-source behavior in that narrow case.
+                primary = sources[0]
+            else:
+                # An explicitly owned alternate cannot inherit the browser
+                # item's sidecar when no default/owner source is identifiable.
+                continue
+
+        primary_source_id = _identifier(primary.get('Id'))
+        primary_item_id = item_id or _identifier(primary.get('ItemId'))
+        row_already_emitted = (
+            primary_item_id is not None and primary_item_id in emitted_item_ids
+        )
+        base_path = original.get('Path')
+        base_path_key = (
+            os.path.normcase(base_path)
+            if isinstance(base_path, str) and base_path.strip() else None
+        )
+        if not row_already_emitted and base_path_key not in emitted_paths:
+            base_row = copy.deepcopy(original)
+            base_row.pop('AlternateMediaSources', None)
+            base_row['MediaSources'] = [copy.deepcopy(primary)]
+            if item_id is None and primary_item_id is not None:
+                base_row['Id'] = primary_item_id
+            base_row['_etlp_path_unverified'] = False
+            base_path = base_row.get('Path')
+            if (not isinstance(base_path, str) or not base_path.strip()) \
+                    and not _is_strm_item(base_row, primary):
+                if source_path := _source_path(primary):
+                    base_row['Path'] = source_path
+                    base_path = source_path
+            if primary_item_id is not None:
+                emitted_item_ids.add(primary_item_id)
+            if isinstance(base_path, str) and base_path.strip():
+                emitted_paths.add(os.path.normcase(base_path))
+            normalized.append(base_row)
+
+        default_name = primary.get('Name')
+        for source in sources:
+            source_id = _identifier(source.get('Id'))
+            source_item_id = _identifier(source.get('ItemId'))
+            if source is primary or source_id == primary_source_id:
+                continue
+            # A source without all three identity/path values cannot safely be
+            # played as an independent item.
+            source_path = _source_path(source)
+            if (source_id is None or source_item_id is None
+                    or source_path is None):
+                continue
+            if source_item_id in emitted_item_ids or source_item_id in explicit_item_ids:
+                continue
+
+            alt_row = copy.deepcopy(original)
+            alt_row.pop('AlternateMediaSources', None)
+            # Chapters from the default item must never leak into a synthetic
+            # alternate.  Exact alternate rows/cache entries may add them back.
+            alt_row.pop('Chapters', None)
+            alt_row['Id'] = source_item_id
+            alt_row['MediaSources'] = [copy.deepcopy(source)]
+            alt_row['_etlp_path_unverified'] = False
+
+            if _is_strm_item(original, source) or source.get('IsRemote'):
+                path_hint = _unverified_source_path(
+                    original.get('Path'), default_name, source.get('Name'))
+                if path_hint is None:
+                    continue
+                alt_row['Path'] = path_hint
+                alt_row['_etlp_path_unverified'] = True
+            else:
+                alt_row['Path'] = source_path
+
+            path_key = os.path.normcase(alt_row['Path'])
+            if path_key in emitted_paths:
+                continue
+            if 'Size' in source:
+                alt_row['Size'] = source.get('Size')
+            if 'RunTimeTicks' in source:
+                alt_row['RunTimeTicks'] = source.get('RunTimeTicks')
+            normalized.append(alt_row)
+            emitted_item_ids.add(source_item_id)
+            emitted_paths.add(path_key)
+
+    return normalized
+
+
+def _row_source(row):
+    sources = row.get('MediaSources') if isinstance(row, dict) else None
+    if isinstance(sources, list) and sources and isinstance(sources[0], dict):
+        return sources[0]
+    return {}
+
+
+def _find_source_row(rows, source_id=None, item_id=None):
+    source_id = _identifier(source_id)
+    item_id = _identifier(item_id)
+    candidates = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        row_id = _identifier(row.get('Id'))
+        source = _row_source(row)
+        row_source_id = _identifier(source.get('Id'))
+        row_source_item_id = _identifier(source.get('ItemId'))
+        if source_id is not None and row_source_id == source_id:
+            candidates.append(row)
+    if source_id is not None:
+        if not candidates:
+            return None
+    else:
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            row_id = _identifier(row.get('Id'))
+            source = _row_source(row)
+            row_source_item_id = _identifier(source.get('ItemId'))
+            if item_id is not None and (
+                    row_id == item_id or row_source_item_id == item_id):
+                candidates.append(row)
+    if not candidates:
+        return None
+    # Exact item rows are more trustworthy than a generated hint.
+    candidates.sort(key=lambda row: (
+        bool(row.get('_etlp_path_unverified')),
+        0 if item_id is not None and _identifier(row.get('Id')) == item_id else 1,
+    ))
+    return candidates[0]
+
+
+def _project_emby_playlist_items(episodes_data, playlist_info, data):
+    """Project one normalized source row for each explicit playlist entry."""
+
+    playlist_rows = [
+        row for row in (playlist_info if isinstance(playlist_info, list) else [])
+        if isinstance(row, dict) and _source_entries(row)
+    ]
+    normalized = _normalize_emby_episode_items(
+        [*(episodes_data if isinstance(episodes_data, list) else []), *playlist_rows]
+    )
+    current_item_id = _identifier(data.get('item_id'))
+    current_source_id = _identifier(data.get('media_source_id'))
+    projected = []
+    for entry in playlist_info if isinstance(playlist_info, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = _identifier(entry.get('Id') or entry.get('ItemId'))
+        candidate = None
+        current_entry = current_source_id and entry_id == current_item_id
+        if current_entry:
+            candidate = _find_source_row(
+                normalized, source_id=current_source_id, item_id=entry_id)
+        if candidate is None and entry_id is not None and not current_entry:
+            candidate = _find_source_row(normalized, item_id=entry_id)
+        if (candidate is None and current_source_id and not current_item_id
+                and not projected):
+            candidate = _find_source_row(normalized, source_id=current_source_id)
+        if candidate is None:
+            candidate = next(
+                (row for row in normalized
+                 if entry_id is not None
+                 and _identifier(row.get('Id')) == entry_id),
+                None,
+            )
+        if candidate is not None:
+            projected.append(copy.deepcopy(candidate))
+    return projected
 
 
 def strm_local_media_path(file_path, source_path):
@@ -160,13 +452,14 @@ def subtitle_checker(media_streams, sub_index, mount_disk_mode, log=False):
 def parse_received_data_emby(received_data):
     extra_data = received_data['extraData']
     show_version_info(extra_data=extra_data)
-    main_ep_info = extra_data['mainEpInfo']
+    main_ep_info = extra_data.get('mainEpInfo') or {}
     episodes_info = extra_data.get('episodesInfo') or []
     playlist_info = extra_data.get('playlistInfo') or []
     # 随机播放剧集媒体库时，油猴没获取其他集的 Emby 标题，导致第一集回传数据失败，暂不处理。
-    emby_title = main_ep_to_title(main_ep_info) if not playlist_info else None
-    chapters = main_ep_chapters(main_ep_info)
-    intro_time = main_ep_intro_time(main_ep_info)
+    try:
+        emby_title = main_ep_to_title(main_ep_info) if not playlist_info else None
+    except (KeyError, TypeError):
+        emby_title = None
     api_client = received_data['ApiClient']
     auth_identity = _extract_auth_identity(api_client)
     url = urllib.parse.urlparse(received_data['playbackUrl'])
@@ -189,20 +482,82 @@ def parse_received_data_emby(received_data):
     logger_setup(api_key=api_key, netloc=netloc)
 
     data = received_data['playbackData']
-    media_sources = data['MediaSources']
+    media_sources = [copy.deepcopy(source) for source in _source_entries(data)]
     play_session_id = data['PlaySessionId']
     if media_source_id and media_source_id != 'undefined': # jellyfin 10.10.6
-        media_source_info = [i for i in media_sources if i['Id'] == media_source_id][0]
+        media_source_info = next(
+            (source for source in media_sources
+             if _identifier(source.get('Id')) == _identifier(media_source_id)),
+            None,
+        )
     else:
-        media_source_info = version_prefer_emby(media_sources) \
-            if len(media_sources) > 1 and is_emby else media_sources[0]
-        media_source_id = media_source_info['Id']
+        if not media_sources:
+            media_source_info = {}
+        elif len(media_sources) > 1 and is_emby:
+            try:
+                media_source_info = version_prefer_emby(media_sources)
+            except (KeyError, IndexError, TypeError):
+                media_source_info = media_sources[0]
+        else:
+            media_source_info = media_sources[0]
+        media_source_id = media_source_info.get('Id')
+    media_source_info = media_source_info or {}
+
+    source_item_id = _identifier(media_source_info.get('ItemId'))
+    selected_source_row = None
+    if is_emby:
+        playback_item = copy.deepcopy(main_ep_info)
+        playback_item['MediaSources'] = copy.deepcopy(media_sources)
+        normalized_rows = _normalize_emby_episode_items(
+            [*episodes_info, main_ep_info, playback_item]
+        )
+        selected_source_row = _find_source_row(
+            normalized_rows,
+            source_id=media_source_info.get('Id'),
+            item_id=source_item_id,
+        )
+        if source_item_id is None and selected_source_row is not None:
+            source_item_id = _identifier(selected_source_row.get('Id'))
+    main_item_id = _identifier(main_ep_info.get('Id'))
+    default_source = next(
+        (source for source in media_sources
+         if source.get('Type') == 'Default'),
+        media_sources[0] if media_sources else {},
+    )
+    main_sources = _source_entries(main_ep_info)
+    main_default_source = next(
+        (source for source in main_sources
+         if _identifier(source.get('ItemId')) == main_item_id),
+        None,
+    ) or next(
+        (source for source in main_sources
+         if source.get('Type') == 'Default'),
+        main_sources[0] if main_sources else {},
+    )
+    selected_source_differs = (
+        (source_item_id is not None and main_item_id is not None
+         and source_item_id != main_item_id)
+        or (len(media_sources) > 1
+            and _identifier(media_source_info.get('Id'))
+            != _identifier(default_source.get('Id')))
+        or (main_sources and _identifier(media_source_info.get('Id'))
+            != _identifier(main_default_source.get('Id')))
+    )
     # STRM 多版本可能找不到其他版本的 sidecar 路径，需要额外请求分集数据。
-    source_path = media_source_info['Path']  # strm 内的地址文本，可能是 URL，也可能是服务器路径
-    file_path = source_path if main_ep_info.get('Type') == 'TvChannel' else main_ep_info['Path']  # 多版本时候有误，直播源时没有。
+    source_path = _source_path(media_source_info) or ''
+    selected_row_path = (
+        selected_source_row.get('Path') if selected_source_row else None
+    )
+    main_item_path = main_ep_info.get('Path') or ''
+    if main_ep_info.get('Type') == 'TvChannel':
+        file_path = source_path
+    elif isinstance(selected_row_path, str) and selected_row_path.strip():
+        file_path = selected_row_path
+    else:
+        file_path = main_item_path
     is_strm = (
         isinstance(file_path, str) and file_path.lower().endswith('.strm')
-    ) or media_source_info.get('Container') == 'strm'
+    ) or str(media_source_info.get('Container') or '').lower() == 'strm'
     is_http_source = (
         isinstance(source_path, str)
         and source_path.lower().startswith(('http://', 'https://'))
@@ -212,51 +567,41 @@ def parse_received_data_emby(received_data):
     # MediaSource.Path may be the path written inside the pointer file.
     if not is_strm:
         file_path = source_path
-
-    strm_local_path_resolved = True
-    if is_strm:
-        source_map = {}
-        for episode in [*episodes_info, main_ep_info]:
-            if not isinstance(episode, dict):
-                continue
-            episode_path = episode.get('Path')
-            if not isinstance(episode_path, str) or not episode_path:
-                continue
-            sources = [source for source in episode.get('MediaSources') or []
-                       if isinstance(source, dict)]
-            if len(sources) == 1:
-                source = sources[0]
-                source_id = source.get('Id')
-                if source_id is not None:
-                    source_map.setdefault(str(source_id), episode_path)
-                continue
-            episode_id = episode.get('Id')
-            for source in sources:
-                source_id = source.get('Id')
-                if source_id is None:
-                    continue
-                # A multi-source row represents the item's default source;
-                # alternative sources need their own item row before their
-                # sidecar can be associated safely.
-                if source.get('Type') == 'Default' or (
-                        episode_id is not None
-                        and str(source.get('ItemId')) == str(episode_id)):
-                    source_map.setdefault(str(source_id), episode_path)
-
-        selected_sidecar = source_map.get(str(media_source_id))
-        if (not selected_sidecar
-                and media_source_info.get('Type') == 'Default'
-                and isinstance(file_path, str)
-                and file_path.lower().endswith('.strm')):
-            selected_sidecar = file_path
-        if selected_sidecar:
-            file_path = selected_sidecar
-        elif len(media_sources) > 1:
-            # The browser item path is only a reliable sidecar when it names the
-            # selected source.  Without an exact item/source mapping, deriving a
-            # local path from another version can play the wrong file; keep the
-            # selected MediaSourceId in the server stream URL instead.
+    strm_local_path_resolved = not bool(
+        selected_source_row and selected_source_row.get('_etlp_path_unverified')
+    )
+    if is_strm and selected_source_row is None:
+        default_source = next(
+            (source for source in media_sources
+             if source.get('Type') == 'Default'),
+            media_sources[0] if media_sources else {},
+        )
+        selected_is_alternate = (
+            _identifier(media_source_info.get('Id'))
+            != _identifier(default_source.get('Id'))
+        )
+        if ((source_item_id is not None and source_item_id != main_item_id)
+                or selected_is_alternate):
+            # Without an exact row or a safe basename hint, the selected source
+            # must remain a server stream and cannot inherit the default sidecar.
             strm_local_path_resolved = False
+
+    if is_emby:
+        if selected_source_row and 'Chapters' in selected_source_row:
+            chapters = main_ep_chapters(selected_source_row)
+            intro_time = main_ep_intro_time(selected_source_row)
+        elif selected_source_differs:
+            chapters = []
+            intro_time = {}
+        else:
+            chapters = main_ep_chapters(main_ep_info)
+            intro_time = main_ep_intro_time(main_ep_info)
+    else:
+        chapters = main_ep_chapters(main_ep_info)
+        intro_time = main_ep_intro_time(main_ep_info)
+    path_unverified = bool(
+        selected_source_row and selected_source_row.get('_etlp_path_unverified')
+    )
 
     # stream_url = f'{scheme}://{netloc}{media_source_info["DirectStreamUrl"]}' # 可能为转码后的链接
     basename = os.path.basename(file_path)
@@ -266,7 +611,6 @@ def parse_received_data_emby(received_data):
     container = os.path.splitext(stream_file_path)[-1]
     extra_str = '/emby' if is_emby else ''
     server_version = api_client['_serverVersion']
-    _a, _b, _c, *_d = [int(i) for i in server_version.split('.')]
     stream_name = 'original' if match_version_range(server_version, ver_range='4.8.0.40-9') else 'stream'
     if media_source_info.get('Container') == 'bluray':  # emby bdmv 根据路径选播放器也够用了，先不管
         container = '.m2ts'
@@ -278,7 +622,9 @@ def parse_received_data_emby(received_data):
                  f'?DeviceId={device_id}&MediaSourceId={media_source_id}' \
                  f'&PlaySessionId={play_session_id}&api_key={api_key}&Static=true'
     stream_netloc = netloc
-    if is_http_direct_strm := is_strm and strm_direct and is_http_source:
+    if is_http_direct_strm := (
+            is_strm and strm_direct and is_http_source
+            and strm_local_path_resolved and not path_unverified):
         stream_url = source_path
         stream_netloc = urllib.parse.urlparse(stream_url).netloc
 
@@ -290,6 +636,9 @@ def parse_received_data_emby(received_data):
         and strm_local_path_resolved
         and isinstance(source_path, str) and bool(source_path.strip())
     )
+    if (is_strm and not strm_direct or is_http_source
+            or not strm_local_path_resolved) and not use_strm_local_path:
+        mount_disk_mode = False
     if not mount_disk_mode or (is_http_direct_strm and not use_strm_local_path):
         stream_url = configs.string_replace_by_ini_pair(stream_url, 'dev', 'stream_redirect')
 
@@ -303,12 +652,11 @@ def parse_received_data_emby(received_data):
             stream_prefix = configs.ini_str_split('dev', 'stream_prefix')[0].strip('/')
             stream_url = f'{stream_prefix}{stream_url}'
 
-    if (is_strm and not strm_direct or is_http_source or not strm_local_path_resolved) and not use_strm_local_path:
-        mount_disk_mode = False
-    if strm_local_path_resolved and not is_http_source and force_disk_mode_by_path(file_path):
+    if (strm_local_path_resolved and not path_unverified and not is_http_source
+            and force_disk_mode_by_path(file_path)):
         mount_disk_mode = True
     if is_strm and not is_http_source:
-        if strm_local_path_resolved and strm_direct:
+        if strm_local_path_resolved and not path_unverified and strm_direct:
             mount_disk_mode = True
         hint = '\nyou may want to set strm_direct_host in ini' if not strm_direct else ''
         logger.info(f'{source_path=}{hint}')
@@ -329,7 +677,7 @@ def parse_received_data_emby(received_data):
             else:
                 media_path = local_media_path
         elif is_strm:
-            if strm_direct:
+            if strm_direct and not path_unverified:
                 media_path = translate_path_by_ini(source_path)
             else:  # strm 文件无法直接播放
                 media_path = stream_url
@@ -337,7 +685,8 @@ def parse_received_data_emby(received_data):
         else:
             media_path = translate_path_by_ini(file_path)
     else:
-        if is_strm and strm_direct and strm_local_path_resolved and not is_http_direct_strm:
+        if (is_strm and strm_direct and strm_local_path_resolved
+                and not path_unverified and not is_http_direct_strm):
             media_path = source_path
         else:
             media_path = stream_url
@@ -352,7 +701,8 @@ def parse_received_data_emby(received_data):
     if strm_cd2_url:
         media_path = strm_cd2_url
 
-    media_streams = media_source_info['MediaStreams']
+    media_streams = [stream for stream in media_source_info.get('MediaStreams') or []
+                     if isinstance(stream, dict)]
     # mpv 可传递首集内封字幕选中序号，其他播放器由播放器自身规则决定。
     # A local path derived from an HTTP .strm has no matching sidecar subtitle path.
     # Keep using Emby's external subtitle URL while the video itself is played locally.
@@ -372,7 +722,8 @@ def parse_received_data_emby(received_data):
         sub_delivery_url = None
 
     if not sub_delivery_url and configs.raw.get('dev', 'sub_extract_priority', fallback='') and main_ep_info:
-        if sub_all_match := sub_via_other_media_version(main_ep_info['MediaSources']):
+        if sub_all_match := sub_via_other_media_version(
+                main_ep_info.get('MediaSources') or []):
             _sub_source_id, _sub_index, _sub_codec = list(sub_all_match.values())[0]
             if not sub_all_match.get(media_source_id):
                 sub_emby_str = f'/{_sub_source_id}' if is_emby else ''
@@ -380,7 +731,7 @@ def parse_received_data_emby(received_data):
                                    f'/{_sub_index}/0/Stream.{_sub_codec}?api_key={api_key}'
                 logger.info(f'other version sub found, url={sub_delivery_url}')
     sub_file = f'{scheme}://{netloc}{sub_delivery_url}' if sub_delivery_url else None
-    if '.m3u8' in file_path:
+    if isinstance(file_path, str) and '.m3u8' in file_path:
         media_path = stream_url = file_path
 
     # An HTTP STRM may resolve to a local mounted media file while the actual
@@ -401,13 +752,19 @@ def parse_received_data_emby(received_data):
     server = 'emby' if is_emby else 'jellyfin'
 
     fake_name = os.path.splitdrive(file_path)[1].replace('/', '__').replace('\\', '__')
-    total_sec = int(media_source_info.get('RunTimeTicks', 0)) // 10 ** 7 or 3600 * 24
+    try:
+        total_sec = int(media_source_info.get('RunTimeTicks', 0)) // 10 ** 7 or 3600 * 24
+    except (TypeError, ValueError):
+        total_sec = 3600 * 24
     position = start_sec / total_sec
     user_id = query['UserId']
     # Keep the real filename when the transport URL is an opaque CD2 gateway
     # nonce; playlist/window naming must not depend on that random URL.
     media_basename = os.path.basename(strm_cd2_local_path or media_path)
-    size = int(media_source_info.get('Size', 0)) or 0
+    try:
+        size = int(media_source_info.get('Size', 0)) or 0
+    except (TypeError, ValueError):
+        size = 0
 
     result = dict(
         server=server,
@@ -453,6 +810,10 @@ def parse_received_data_emby(received_data):
         use_strm_cd2_url=use_strm_cd2_url,
         strm_cd2_local_path=strm_cd2_local_path,
         source_path=source_path,
+        strm_local_path_resolved=strm_local_path_resolved,
+        _path_unverified=path_unverified,
+        _selected_source_item_id=source_item_id,
+        _selected_source_differs=selected_source_differs,
         is_http_direct_strm=is_http_direct_strm,
         sub_inner_idx=sub_inner_idx,
         size=size,
@@ -612,9 +973,12 @@ def list_playlist_or_mix_s0(data):
     params = {'X-Emby-Token': api_key, }
     headers = {'accept': 'application/json', }
     headers.update(data['headers'])
+    fields = 'MediaSources,Path,ProviderIds,Chapters'
+    if data['server'] == 'emby':
+        fields += ',AlternateMediaSources'
 
     ids = [ep['Id'] for ep in playlist_info]
-    params.update({'Fields': 'MediaSources,Path,ProviderIds,Chapters',
+    params.update({'Fields': fields,
                    'Ids': ','.join(ids), })
     playlist_data = requests_urllib(
         f'{scheme}://{netloc}{extra_str}/Users/{user_id}/Items',
@@ -636,6 +1000,9 @@ def list_episodes(data: dict):
     params = {'X-Emby-Token': api_key, }
     headers = {'accept': 'application/json', }
     headers.update(data['headers'])
+    fields = 'MediaSources,Path,ProviderIds,Chapters'
+    if data['server'] == 'emby':
+        fields += ',AlternateMediaSources'
 
     playlist_info = data.get('playlist_info')
     playlist_info and logger.info('playlist_info found, skip version filter and pretty title')
@@ -644,12 +1011,23 @@ def list_episodes(data: dict):
         params=params, headers=headers, get_json=True)
 
     def fill_data_type_provider_ids(): # sync trakt required
-        data.update(main_ep_info)
-        data['chapters'] = main_ep_chapters(main_ep_info)
-        intro_time = main_ep_intro_time(main_ep_info)
-        data['intro_start'] = intro_time.get('intro_start')
-        data['intro_end'] = intro_time.get('intro_end')
-        return data
+        fallback_data = data.copy()
+        selected_source_differs = bool(data.get('_selected_source_differs'))
+        if not selected_source_differs:
+            fallback_data.update(main_ep_info)
+            fallback_data['chapters'] = main_ep_chapters(main_ep_info)
+            intro_time = main_ep_intro_time(main_ep_info)
+            fallback_data['intro_start'] = intro_time.get('intro_start')
+            fallback_data['intro_end'] = intro_time.get('intro_end')
+        else:
+            # A selected alternate may have the same movie/episode numbers as
+            # the browser's default row.  Preserve its already normalized
+            # chapters and source identity instead of copying A metadata back.
+            fallback_data.pop('Chapters', None)
+            fallback_data['chapters'] = data.get('chapters', [])
+            fallback_data['intro_start'] = data.get('intro_start')
+            fallback_data['intro_end'] = data.get('intro_end')
+        return fallback_data
 
     # if video is movie
     if not playlist_info and 'SeasonId' not in main_ep_info:
@@ -722,25 +1100,52 @@ def list_episodes(data: dict):
 
         if ep_num == len(episodes_data):
             return episodes_data
-        try:
-            ep_current = [i for i in episodes_data if file_path in (i['Path'], i['MediaSources'][0]['Path'])][0]
-        except IndexError:
-            logger.info('file_path may wrong')
-            ep_current = [i for i in episodes_data if data['media_source_id'] == i['MediaSources'][0]['Id']][0]
+        def ep_source_id(ep):
+            return _identifier(_row_source(ep).get('Id'))
+
+        def ep_path_values(ep):
+            item_path = ep.get('Path') if isinstance(ep, dict) else None
+            source_path = _source_path(_row_source(ep))
+            return item_path, source_path
+
+        # MediaSourceId is the only stable identity when several rows share a
+        # season/episode key.  Path remains a compatibility fallback.
+        ep_current = next(
+            (ep for ep in episodes_data
+             if ep_source_id(ep) == _identifier(data.get('media_source_id'))),
+            None,
+        )
+        if ep_current is None:
+            ep_current = next(
+                (ep for ep in episodes_data
+                 if file_path in ep_path_values(ep)),
+                None,
+            )
+        if ep_current is None:
+            logger.info('version_filter: current source/path not found')
+            return episodes_data
         current_key = ep_to_key(ep_current)
         curr_count = ep_raw_cur_list.count(current_key)
         curr_raw_index = episodes_data.index(ep_current)
         if curr_count > 1:  # 适配首集多版本但过于相似的情况
-            _episodes_data = episodes_data.copy()
-            del _episodes_data[curr_raw_index + 1:curr_raw_index + curr_count]
-            # del ep_raw_cur_list[curr_raw_index + 1:curr_raw_index + curr_count]
-            _episodes_data[curr_raw_index] = ep_current
+            # Do not assume duplicate versions are contiguous.  In
+            # [A1, B1, A2], selecting B1 must retain A2 for the next episode.
+            _episodes_data = []
+            current_inserted = False
+            for episode in episodes_data:
+                if ep_to_key(episode) == current_key:
+                    if current_inserted:
+                        continue
+                    _episodes_data.append(ep_current)
+                    current_inserted = True
+                else:
+                    _episodes_data.append(episode)
             if ep_num == len(_episodes_data):  # 只有首集是多版本时
                 return _episodes_data
-            del _episodes_data
         _cut_cur_list = ep_seq_cur_list[ep_seq_cur_list.index(current_key):]
         _eps_after = [i for i in episodes_data if ep_to_key(i) in _cut_cur_list]
         _ep_index_list = sorted(list({i['IndexNumber'] for i in episodes_data}))
+        file_path = file_path if isinstance(file_path, str) else ''
         official_rule = file_path.rsplit(' - ', 1)
         official_rule = official_rule[-1] if len(official_rule) == 2 else None
         clean_path = re.split(r'E\d\d?', file_path, maxsplit=1)[-1].strip()
@@ -749,9 +1154,12 @@ def list_episodes(data: dict):
 
         # 适配由原始文件派生出多版本的情况 S01E01.mkv, S01E01 - ver.mkv
         if curr_count > 1:
-            _sortest_ep, _is_real_raw = multi_ver_find_sortest_ep(
-                episodes_data[curr_raw_index: curr_raw_index + curr_count])
-            if _sortest_ep['Path'] == file_path and _is_real_raw:
+            same_current = [
+                episode for episode in episodes_data
+                if ep_to_key(episode) == current_key
+            ]
+            _sortest_ep, _is_real_raw = multi_ver_find_sortest_ep(same_current)
+            if _sortest_ep.get('Path') == file_path and _is_real_raw:
                 _raw_name_success = version_filter_by_raw_name(ep_to_key, episodes_data)
                 _raw_name_index = None
                 if _raw_name_success:
@@ -783,7 +1191,10 @@ def list_episodes(data: dict):
             for rule in (official_rule, clean_path):
                 if not rule:
                     continue
-                _ep_data = [i for i in _eps_data if rule in i['Path']]
+                _ep_data = [
+                    i for i in _eps_data
+                    if isinstance(i.get('Path'), str) and rule in i['Path']
+                ]
                 if len(_ep_data) == len(_cur_list) and len(_cur_list) > 1:
                     logger.info(f'version_filter: success with {rule=}, pass {len(_cur_list)}')
                     return _ep_data
@@ -795,9 +1206,17 @@ def list_episodes(data: dict):
                         break
 
         ver_re = ''.join(ver_re.split('\n'))  # 多行转单行
-        ini_re = re.findall(ver_re, file_path, re.I)
-        ver_re = re.compile('|'.join(ini_re))
-        _ep_data = [i for i in episodes_data if len(ver_re.findall(i['Path'])) == len(ini_re)]
+        try:
+            ini_re = re.findall(ver_re, file_path, re.I)
+            ver_re = re.compile('|'.join(ini_re))
+        except re.error:
+            logger.error('version_filter: invalid version_filter regex')
+            return [ep_current]
+        _ep_data = [
+            i for i in episodes_data
+            if isinstance(i.get('Path'), str)
+            and len(ver_re.findall(i['Path'])) == len(ini_re)
+        ]
         _ep_data_num = len(_ep_data)
         if _ep_data_num == ep_num:
             logger.info(f'version_filter: success with {ini_re=}')
@@ -806,6 +1225,7 @@ def list_episodes(data: dict):
         _pairs = [(ep_to_key(i), i) for i in _ep_data]
         _counts = collections.Counter(k for k, _ in _pairs)
         _ep_success_map = {k: v for k, v in _pairs if _counts[k] == 1}
+        _ep_success_map[current_key] = ep_current
         prefer_eps = version_prefer_for_playlist(_ep_success_map, current_key, file_path, ep_raw_cur_list,
                                                  episodes_data)
         if _ep_data_num == 0:
@@ -833,6 +1253,8 @@ def list_episodes(data: dict):
             else:
                 ini_res = _ep_success
         filter_res = ini_res if len(ini_res) > len(builtin_res) else builtin_res
+        if not filter_res:
+            return prefer_eps or [ep_current]
         if len(filter_res) <= 2 and prefer_eps:
             return prefer_eps
         fist_cur, last_cur = ep_to_key(filter_res[0]), ep_to_key(filter_res[-1])
@@ -879,9 +1301,13 @@ def list_episodes(data: dict):
         title_intro_map_fail = not episodes_info
 
         for ep in episodes_info:
-            if ep['SeasonId'] != season_id:  # 影响S0混播，使用频率过低，先不管
+            if not isinstance(ep, dict):
+                title_intro_map_fail = True
                 continue
-            if 'ParentIndexNumber' not in ep or 'IndexNumber' not in ep:
+            if ep.get('SeasonId') != season_id:  # 影响S0混播，使用频率过低，先不管
+                continue
+            if ('ParentIndexNumber' not in ep or 'IndexNumber' not in ep
+                    or 'SeriesName' not in ep or 'Name' not in ep):
                 title_intro_map_fail = True
                 logger.info('disable title_intro_index_map, cuz season or ep index num error found')
                 return _title_map
@@ -901,13 +1327,15 @@ def list_episodes(data: dict):
 
     def parse_item(item, order):
         item_mount_disk_mode = mount_disk_mode
-        source_info = item['MediaSources'][0]
-        media_source_id = source_info["Id"]
-        file_path = item['Path']
-        source_path = source_info['Path']
+        source_info = _row_source(item)
+        media_source_id = source_info.get('Id') or item.get('MediaSourceId')
+        file_path = item.get('Path') or _source_path(source_info) or ''
+        source_path = _source_path(source_info) or ''
+        path_unverified = bool(item.get('_etlp_path_unverified'))
+        strm_local_path_resolved = not path_unverified
         item_is_strm = (
             isinstance(file_path, str) and file_path.lower().endswith('.strm')
-            or source_info.get('Container') == 'strm'
+            or str(source_info.get('Container') or '').lower() == 'strm'
         )
         item_is_http_source = (
             isinstance(source_path, str)
@@ -915,10 +1343,17 @@ def list_episodes(data: dict):
         )
         use_strm_local_path = (
             item_mount_disk_mode and item_is_strm and strm_local_by_file_path
+            and strm_local_path_resolved
             and isinstance(source_path, str) and bool(source_path.strip())
         )
+        if path_unverified:
+            item_mount_disk_mode = False
+        if item_is_http_source and not use_strm_local_path:
+            item_mount_disk_mode = False
+        if item_is_strm and not strm_direct and not use_strm_local_path:
+            item_mount_disk_mode = False
         fake_name = os.path.splitdrive(file_path)[1].replace('/', '__').replace('\\', '__')
-        item_id = item['Id']
+        item_id = item.get('Id') or source_info.get('ItemId') or data.get('item_id', '')
         item_chapters, item_intro = item_chapters_and_intro(item)
         # Keep the STRM sidecar for identity, but retain the inner source
         # suffix for the fallback Emby stream URL when it is path-like.
@@ -927,7 +1362,11 @@ def list_episodes(data: dict):
         stream_url = f'{scheme}://{netloc}{extra_str}/videos/{item_id}/{stream_name}{container}' \
                      f'?DeviceId={device_id}&MediaSourceId={media_source_id}' \
                      f'&PlaySessionId={play_session_id}&api_key={api_key}&Static=true'
-        if is_http_direct_strm:
+        item_is_http_direct_strm = (
+            item_is_strm and strm_direct and item_is_http_source
+            and not path_unverified
+        )
+        if item_is_http_direct_strm:
             stream_url = source_path
 
         if item_mount_disk_mode:  # 肯定不会是 http
@@ -943,15 +1382,17 @@ def list_episodes(data: dict):
                     media_path = stream_url
                 else:
                     media_path = local_media_path
-            elif is_strm:
-                if strm_direct:
+            elif item_is_strm:
+                if strm_direct and not path_unverified:
                     media_path = translate_path_by_ini(source_path)
                 else:  # strm 文件无法直接播放
                     media_path = stream_url
+                    item_mount_disk_mode = False
             else:
                 media_path = translate_path_by_ini(file_path)
         else:
-            if is_strm and strm_direct and not is_http_direct_strm:
+            if (item_is_strm and strm_direct and not path_unverified
+                    and not item_is_http_direct_strm):
                 media_path = source_path
             else:
                 media_path = stream_url
@@ -974,10 +1415,21 @@ def list_episodes(data: dict):
         media_title = f'{emby_title}  |  {display_basename}' if pretty_title and emby_title else display_basename
         media_title = media_title.replace('"', '”')
         media_basename = os.path.basename(strm_cd2_local_path or media_path)
-        total_sec = int(source_info.get('RunTimeTicks', 0)) // 10 ** 7 or 3600 * 24
-        size = int(source_info.get('Size', 0)) or 0
+        is_current_source = (
+            _identifier(media_source_id)
+            == _identifier(data.get('media_source_id'))
+        )
+        try:
+            total_sec = int(source_info.get('RunTimeTicks', 0)) // 10 ** 7 or 3600 * 24
+        except (TypeError, ValueError):
+            total_sec = 3600 * 24
+        try:
+            size = int(source_info.get('Size', 0)) or 0
+        except (TypeError, ValueError):
+            size = 0
 
-        media_streams = source_info['MediaStreams']
+        media_streams = [stream for stream in source_info.get('MediaStreams') or []
+                         if isinstance(stream, dict)]
         subtitle_disk_mode = item_mount_disk_mode and not use_strm_local_path
         sub_index, sub_inner_idx, sub_dict = subtitle_checker(
             media_streams, need_check_inner_sub, subtitle_disk_mode)
@@ -986,7 +1438,7 @@ def list_episodes(data: dict):
         if sub_dict and sub_inner_idx == 0:
             sub_ext = os.path.splitext(sub_dict.get('Path') or '')[-1] \
                       or f'.{sub_dict["Codec"]}'
-            sub_file = f'{scheme}://{netloc}/Videos/{item_id}/{source_info["Id"]}/Subtitles' \
+            sub_file = f'{scheme}://{netloc}/Videos/{item_id}/{media_source_id}/Subtitles' \
                        f'/{sub_dict["Index"]}/Stream{sub_ext}' \
                        f'?api_key={api_key}'
 
@@ -997,19 +1449,19 @@ def list_episodes(data: dict):
         result.pop('chapters', None)
         result.pop('intro_start', None)
         result.pop('intro_end', None)
-        result['Type'] = item['Type']
-        result['ProviderIds'] = item['ProviderIds']
+        result['Type'] = item.get('Type', 'Episode')
+        result['ProviderIds'] = item.get('ProviderIds', {})
         result['ParentIndexNumber'] = item.get('ParentIndexNumber')
         if not playlist_info:
-            result['SeriesId'] = item['SeriesId']
+            result['SeriesId'] = item.get('SeriesId')
             result['SeasonId'] = season_id
-        if basename != main_ep_basename:
+        if basename != main_ep_basename and not is_current_source:
             for none_key in ['start_sec', 'main_ep_info', 'episodes_info']:
                 result[none_key] = None
-        else:
+        if is_current_source:
             # 因入库时间不同，同一集 ver_a ver_b 的 emby 标题可能不同，网页只会显示 ver_a 的。
             # 起播集标题固定为 ver_a，但通过 version_prefer 实际播放和列表里数据可能为 b，导致回传失败。
-            media_title = data['media_title']
+            media_title = data.get('media_title', media_title)
         result.update(dict(
             basename=basename,
             media_basename=media_basename,
@@ -1030,11 +1482,24 @@ def list_episodes(data: dict):
             order=order,
             sub_inner_idx=sub_inner_idx,
             source_path=source_path,
+            is_http_direct_strm=item_is_http_direct_strm,
+            strm_local_path_resolved=strm_local_path_resolved,
+            _path_unverified=path_unverified,
             mount_disk_mode=item_mount_disk_mode,
             use_strm_local_path=use_strm_local_path,
             use_strm_cd2_url=use_strm_cd2_url,
             strm_cd2_local_path=strm_cd2_local_path,
         ))
+        if is_current_source:
+            # Keep the startup identity used by player playlist selection even
+            # when a later exact item row supplies a different sidecar name.
+            result['basename'] = data.get('basename', result['basename'])
+            result['media_title'] = data.get('media_title', result['media_title'])
+            result['fake_name'] = data.get('fake_name', result['fake_name'])
+            if data.get('start_sec') is not None:
+                result['start_sec'] = data['start_sec']
+            result['main_ep_info'] = data.get('main_ep_info', result['main_ep_info'])
+            result['episodes_info'] = data.get('episodes_info', result['episodes_info'])
         return result
 
     if playlist_info:
@@ -1046,7 +1511,7 @@ def list_episodes(data: dict):
         ids = [ep['Id'] for ep in playlist_info][:200]
         _eps_parts = []
         for _ids in chunk_list(ids, 200):
-            params.update({'Fields': 'MediaSources,Path,ProviderIds,Chapters',
+            params.update({'Fields': fields,
                            'Ids': ','.join(_ids), })
             _episodes = requests_urllib(
                 f'{scheme}://{netloc}{extra_str}/Users/{user_id}/Items',
@@ -1059,9 +1524,9 @@ def list_episodes(data: dict):
             logger.info(f'playlist_info items count: {len(ids)}, may too large')
 
     else:
-        params.update({'Fields': 'MediaSources,Path,ProviderIds,Chapters',
+        params.update({'Fields': fields,
                        'SeasonId': season_id, })
-        series_id = main_ep_info['SeriesId']
+        series_id = main_ep_info.get('SeriesId')
         if not season_id:  # Jellyfin 10.10.7 未知季: mainEpInfo 缺失季 id，导致请求失败。10.9.11 10.11.1 正常。
             season_id = series_id
             del params['SeasonId']
@@ -1069,26 +1534,78 @@ def list_episodes(data: dict):
         # 改用 season_id，避免S0命名不规范导致美化标题失败，不知道会不会影响S0混播。
         url = f'{scheme}://{netloc}{extra_str}/Shows/{season_id}/Episodes'
         episodes = requests_urllib(url, params=params, headers=headers, get_json=True)
-    # dump_json_file(episodes, 'z_playlist_movie.json')
-    eps_error = [i for i in episodes['Items'] if 'Path' not in i or 'RunTimeTicks' not in i]
-    path_error = [i for i in eps_error if 'Path' not in i]
+    # ``MediaSources`` carries the authoritative duration/size for synthetic
+    # alternate rows; item-level RuntimeTicks may be omitted for non-admins.
+    raw_items = episodes.get('Items') if isinstance(episodes, dict) else []
+    if not isinstance(raw_items, list):
+        raw_items = []
+    raw_items = [item for item in raw_items if isinstance(item, dict)]
+    if data['server'] == 'emby':
+        if playlist_info:
+            episodes = _project_emby_playlist_items(
+                raw_items, playlist_info, data)
+        else:
+            episodes = _normalize_emby_episode_items(raw_items)
+    else:
+        # Jellyfin keeps its original item/source shape; never flatten it here.
+        episodes = [copy.deepcopy(item) for item in raw_items]
+    eps_error = []
+    for item in episodes:
+        source = _row_source(item)
+        item_path = item.get('Path') if isinstance(item, dict) else None
+        runtime = item.get('RunTimeTicks') if isinstance(item, dict) else None
+        source_runtime = source.get('RunTimeTicks')
+        if (not isinstance(item_path, str) or not item_path.strip()
+                or runtime is None and source_runtime is None):
+            eps_error.append(item)
     if eps_error:
-        # total_sec 没有，不方便判断进度。
-        ids_error = [i['MediaSources'][0]['Id'] for i in path_error]
-        try:
-            eps_error = [f"E{i['IndexNumber']}-{i['Name']}-id={i['Id']}" for i in eps_error]
-        except KeyError:
-            logger.error('disable playlist, IndexNumber miss')
-            return [fill_data_type_provider_ids()]
-        logger.error(f'some ep miss path or runtime data, may leak error\n{eps_error}')
-        if data['media_source_id'] in ids_error:
-            logger.error(f'disable playlist, Path miss')
-            return [fill_data_type_provider_ids()]
-
-    episodes = [i for i in episodes['Items'] if 'Path' in i]
+        error_preview = []
+        for item in eps_error[:10]:
+            error_preview.append(
+                f"E{item.get('IndexNumber')}-{item.get('Name')}-id={item.get('Id')}"
+            )
+        logger.error(
+            'some ep miss path or runtime data, may leak error\n'
+            f'{error_preview}...{len(eps_error)=}'
+        )
+    current_source_id = _identifier(data.get('media_source_id'))
+    episodes = [
+        item for item in episodes
+        if _identifier(_row_source(item).get('Id')) is not None
+        and _source_path(_row_source(item)) is not None
+    ]
+    if playlist_info and data['server'] == 'emby' and current_source_id:
+        current_item_id = _identifier(data.get('item_id'))
+        current_entry_present = any(
+            isinstance(entry, dict)
+            and _identifier(entry.get('Id') or entry.get('ItemId')) == current_item_id
+            for entry in playlist_info
+        )
+        current_row_present = any(
+            _identifier(_row_source(item).get('Id')) == current_source_id
+            for item in episodes
+        )
+        if current_entry_present and not current_row_present:
+            logger.info('disable playlist: selected playlist source is unavailable')
+            return [data.copy()]
+    if (data['server'] == 'emby' and not playlist_info and current_source_id
+            and not any(
+                _identifier(_row_source(item).get('Id')) == current_source_id
+                for item in episodes
+            )):
+        logger.info('disable playlist: selected media source row is unavailable')
+        return [data.copy()]
+    if not episodes:
+        logger.info('disable playlist: no playable episode source rows')
+        if data['server'] == 'emby' and current_source_id:
+            return [data.copy()]
+        return [fill_data_type_provider_ids()]
     episodes = strm_file_name_sync(data['file_path'], episodes)
     episodes = version_filter(data['file_path'], episodes) if data['server'] == 'emby' else episodes
     episodes = [parse_item(i, o) for (o, i) in enumerate(episodes)]
+
+    if not episodes:
+        return [fill_data_type_provider_ids()]
 
     if title_intro_map_fail:
         debug_beep_win32()
@@ -1104,7 +1621,7 @@ def list_episodes(data: dict):
         for i in episodes:
             if stream_redirect:
                 i['stream_url'] = i['stream_url'].replace(stream_redirect[0], stream_redirect[1])
-                if not mount_disk_mode:
+                if not i.get('mount_disk_mode'):
                     i['media_path'] = i['stream_url']
             if title_trans:
                 i['media_title'] = i['media_title'].translate(title_trans)
@@ -1115,7 +1632,7 @@ def list_episodes(data: dict):
             if i['stream_url'].startswith(stream_prefix):
                 continue
             i['stream_url'] = f"{stream_prefix}{i['stream_url']}"
-            if not mount_disk_mode:
+            if not i.get('mount_disk_mode'):
                 i['media_path'] = i['stream_url']
 
     return episodes
