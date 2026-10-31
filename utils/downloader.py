@@ -270,6 +270,7 @@ class Downloader:
             headers = {
                 'Range': f'bytes={start}-{request_end}',
                 'Accept-Encoding': 'identity',
+                'User-Agent': 'embyToLocalPlayer/dl',
             }
             response = None
             try:

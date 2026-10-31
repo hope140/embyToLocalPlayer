@@ -6,6 +6,7 @@ from unittest import mock
 
 import utils.data_parser as data_parser
 from utils.emby_api import EmbyApi
+from utils.emby_api_thin import EmbyApiThin
 
 
 class EmbyMultiVersionTests(unittest.TestCase):
@@ -791,6 +792,51 @@ class EmbyMultiVersionTests(unittest.TestCase):
         fields = request.call_args.kwargs['params']['Fields']
         self.assertIn('MediaSources', fields)
         self.assertIn('AlternateMediaSources', fields)
+
+    def test_emby_api_uses_etlp_identity_headers_for_requests(self):
+        api = EmbyApi('http://emby.example', 'token', 'user')
+        response = mock.Mock()
+        response.json.return_value = {'Items': []}
+        with mock.patch.object(api.req, 'get', return_value=response) as request:
+            self.assertEqual(api.get('Items/item'), {'Items': []})
+
+        request.assert_called_once_with(
+            'http://emby.example/emby/Items/item',
+            params={'X-Emby-Token': 'token'},
+        )
+        self.assertEqual(api.req.headers['User-Agent'], 'embyToLocalPlayer/1.1')
+        self.assertEqual(
+            api.req.headers['X-Emby-Authorization'],
+            'MediaBrowser Client="embyToLocalPlayer",Token="token"',
+        )
+        self.assertEqual(
+            api.req.headers['Authorization'],
+            'MediaBrowser Client="embyToLocalPlayer",Token="token"',
+        )
+        self.assertEqual(api.req.headers['Referer'], 'http://emby.example/web/index.html')
+
+    def test_emby_api_thin_uses_matching_client_identity_in_query_and_headers(self):
+        api = EmbyApiThin(host='http://emby.example', api_key='token', user_id='user')
+        with mock.patch.object(api, 'req', return_value={'Items': []}) as request:
+            self.assertEqual(api.get('Items/item', params={'Limit': 1}), {'Items': []})
+
+        call = request.call_args
+        self.assertEqual(call.args[0], 'http://emby.example/emby/Items/item')
+        self.assertEqual(call.kwargs['params']['Limit'], 1)
+        self.assertEqual(call.kwargs['params']['X-Emby-Token'], 'token')
+        self.assertEqual(
+            call.kwargs['params']['Authorization'],
+            'MediaBrowser Client="embyToLocalPlayer",Token="token"',
+        )
+        self.assertEqual(
+            call.kwargs['headers']['X-Emby-Authorization'],
+            'MediaBrowser Client="embyToLocalPlayer",Token="token"',
+        )
+        self.assertEqual(
+            call.kwargs['headers']['Authorization'],
+            'MediaBrowser Client="embyToLocalPlayer",Token="token"',
+        )
+        self.assertEqual(call.kwargs['headers']['Referer'], 'http://emby.example/web/index.html')
 
 
 if __name__ == '__main__':

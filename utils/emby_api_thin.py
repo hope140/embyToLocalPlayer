@@ -23,7 +23,7 @@ class EmbyApiThin:
         params.update(
             {
                 'X-Emby-Token': self.api_key,
-                'Authorization': f'MediaBrowser Client="EmbyApi",Token="{self.api_key}"',
+                'Authorization': f'MediaBrowser Client="embyToLocalPlayer",Token="{self.api_key}"',
             }
         )
         url = rf'{self.host}/emby/{path}'

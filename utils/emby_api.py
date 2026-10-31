@@ -15,11 +15,10 @@ class EmbyApi:
             from requests.packages import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self.req.headers.update({'Accept': 'application/json'})
-        self.req.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                                               '(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
+        self.req.headers.update({'User-Agent': 'embyToLocalPlayer/1.1',
                                  'Referer': f'{self.host}/web/index.html',
-                                 'X-Emby-Authorization': f'MediaBrowser Client="EmbyApi",Token="{self.api_key}"',
-                                 'Authorization': f'MediaBrowser Client="EmbyApi",Token="{self.api_key}"',
+                                 'X-Emby-Authorization': f'MediaBrowser Client="embyToLocalPlayer",Token="{self.api_key}"',
+                                 'Authorization': f'MediaBrowser Client="embyToLocalPlayer",Token="{self.api_key}"',
                                  })
         self._default_fields = ','.join([
             'PremiereDate',

@@ -63,6 +63,7 @@ class DownloaderRangeTests(unittest.TestCase):
                 self.assertEqual(dl.range_download(5, 10), 10)
             self.assertEqual(request.call_args.kwargs["headers"]["Range"], "bytes=5-9")
             self.assertEqual(request.call_args.kwargs["headers"]["Accept-Encoding"], "identity")
+            self.assertEqual(request.call_args.kwargs["headers"]["User-Agent"], "embyToLocalPlayer/dl")
             self.assertEqual(path.read_bytes(), b"ABCDE56789")
             self.assertTrue(response.closed)
 

@@ -1,5 +1,6 @@
 @echo OFF
 chcp 65001
+set "PATH=%SystemRoot%\System32;%PATH%"
 :BEGIN
 cls
 
