@@ -197,8 +197,7 @@ def parse_received_data_emby(received_data):
         media_source_info = version_prefer_emby(media_sources) \
             if len(media_sources) > 1 and is_emby else media_sources[0]
         media_source_id = media_source_info['Id']
-    # STRM 多版本可能找不到其他版本的 sidecar 路径，需要额外请求分集数据；
-    # HTTP 源仍沿用现有的多版本路径选择逻辑。
+    # STRM 多版本可能找不到其他版本的 sidecar 路径，需要额外请求分集数据。
     source_path = media_source_info['Path']  # strm 内的地址文本，可能是 URL，也可能是服务器路径
     file_path = source_path if main_ep_info.get('Type') == 'TvChannel' else main_ep_info['Path']  # 多版本时候有误，直播源时没有。
     is_strm = (
@@ -214,21 +213,50 @@ def parse_received_data_emby(received_data):
     if not is_strm:
         file_path = source_path
 
-    if is_strm and is_http_source and len(media_sources) > 1 and media_source_info['Name'] not in file_path:
-        source_map = {
-            s['Id']: i['Path']
-            for i in episodes_info
-            for s in i.get('MediaSources', [])
-        }  # episodes_info 由油猴拦截点击，手动请求时，会包含多版本条目，此时会解决下方的路径错误问题。
-        if media_source_id in source_map:
-            file_path = source_map[media_source_id]
-        else:
-            basename = os.path.basename(file_path)
-            # Season 0/S0E04-ver-a.strm Specials/S0E04-ver-b.strm 这种情况也可能导致路径文件夹名称拼装错误。
-            for _m in media_sources:
-                if _m['Name'] in basename:  # S01E01.mkv 这种无解
-                    file_path = file_path.replace(_m['Name'], media_source_info['Name'])
-                    break
+    strm_local_path_resolved = True
+    if is_strm:
+        source_map = {}
+        for episode in [*episodes_info, main_ep_info]:
+            if not isinstance(episode, dict):
+                continue
+            episode_path = episode.get('Path')
+            if not isinstance(episode_path, str) or not episode_path:
+                continue
+            sources = [source for source in episode.get('MediaSources') or []
+                       if isinstance(source, dict)]
+            if len(sources) == 1:
+                source = sources[0]
+                source_id = source.get('Id')
+                if source_id is not None:
+                    source_map.setdefault(str(source_id), episode_path)
+                continue
+            episode_id = episode.get('Id')
+            for source in sources:
+                source_id = source.get('Id')
+                if source_id is None:
+                    continue
+                # A multi-source row represents the item's default source;
+                # alternative sources need their own item row before their
+                # sidecar can be associated safely.
+                if source.get('Type') == 'Default' or (
+                        episode_id is not None
+                        and str(source.get('ItemId')) == str(episode_id)):
+                    source_map.setdefault(str(source_id), episode_path)
+
+        selected_sidecar = source_map.get(str(media_source_id))
+        if (not selected_sidecar
+                and media_source_info.get('Type') == 'Default'
+                and isinstance(file_path, str)
+                and file_path.lower().endswith('.strm')):
+            selected_sidecar = file_path
+        if selected_sidecar:
+            file_path = selected_sidecar
+        elif len(media_sources) > 1:
+            # The browser item path is only a reliable sidecar when it names the
+            # selected source.  Without an exact item/source mapping, deriving a
+            # local path from another version can play the wrong file; keep the
+            # selected MediaSourceId in the server stream URL instead.
+            strm_local_path_resolved = False
 
     # stream_url = f'{scheme}://{netloc}{media_source_info["DirectStreamUrl"]}' # 可能为转码后的链接
     basename = os.path.basename(file_path)
@@ -259,6 +287,7 @@ def parse_received_data_emby(received_data):
         'dev', 'strm_local_by_file_path', fallback=False)
     use_strm_local_path = (
         mount_disk_mode and is_strm and strm_local_by_file_path
+        and strm_local_path_resolved
         and isinstance(source_path, str) and bool(source_path.strip())
     )
     if not mount_disk_mode or (is_http_direct_strm and not use_strm_local_path):
@@ -274,12 +303,12 @@ def parse_received_data_emby(received_data):
             stream_prefix = configs.ini_str_split('dev', 'stream_prefix')[0].strip('/')
             stream_url = f'{stream_prefix}{stream_url}'
 
-    if (is_strm and not strm_direct or is_http_source) and not use_strm_local_path:
+    if (is_strm and not strm_direct or is_http_source or not strm_local_path_resolved) and not use_strm_local_path:
         mount_disk_mode = False
-    if not is_http_source and force_disk_mode_by_path(file_path):
+    if strm_local_path_resolved and not is_http_source and force_disk_mode_by_path(file_path):
         mount_disk_mode = True
     if is_strm and not is_http_source:
-        if strm_direct:
+        if strm_local_path_resolved and strm_direct:
             mount_disk_mode = True
         hint = '\nyou may want to set strm_direct_host in ini' if not strm_direct else ''
         logger.info(f'{source_path=}{hint}')
@@ -308,7 +337,7 @@ def parse_received_data_emby(received_data):
         else:
             media_path = translate_path_by_ini(file_path)
     else:
-        if is_strm and strm_direct and not is_http_direct_strm:
+        if is_strm and strm_direct and strm_local_path_resolved and not is_http_direct_strm:
             media_path = source_path
         else:
             media_path = stream_url

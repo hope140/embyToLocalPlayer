@@ -715,6 +715,286 @@ class StrmContentParseTests(unittest.TestCase):
         self.assertIn(('Content-Length', '3'), handler.headers_sent)
 
 class DataParserGatewayTests(unittest.TestCase):
+    @staticmethod
+    def _strm_source(source_id, source_path, name):
+        return {
+            'Id': source_id,
+            'Name': name,
+            'Path': source_path,
+            'Container': 'strm',
+            'MediaStreams': [],
+            'RunTimeTicks': 10 ** 7,
+            'Size': 10,
+        }
+
+    @staticmethod
+    def _strm_received_data(media_sources, *, source_id, main_path, episodes_info,
+                             include_source_id=True):
+        source_query = f'MediaSourceId={source_id}&' if include_source_id else ''
+        return {
+            'extraData': {
+                'mainEpInfo': {'Path': main_path, 'Type': 'Episode'},
+                'episodesInfo': episodes_info,
+            },
+            'ApiClient': {
+                '_serverAddress': 'http://emby.example',
+                '_serverVersion': '4.10.0.40',
+            },
+            'playbackUrl': (
+                'http://emby.example/emby/Items/item-1/stream.mkv?'
+                f'X-Emby-Token=token&X-Emby-Device-Id=device&{source_query}'
+                'StartTimeTicks=0&UserId=user'
+            ),
+            'request': {'headers': {}},
+            'playbackData': {
+                'PlaySessionId': 'session',
+                'MediaSources': media_sources,
+            },
+            'mountDiskEnable': 'true',
+        }
+
+    def _parse_strm_received_data(self, received_data, *, local_media_path,
+                                  strm_direct=False, force_disk=False,
+                                  mock_local=True):
+        raw = ConfigParser()
+        raw.read_dict({'dev': {'strm_local_by_file_path': 'yes'}})
+        def check_str_match(*args, **kwargs):
+            return strm_direct and len(args) >= 3 and args[2] == 'strm_direct_host'
+
+        local_path_patch = (
+            mock.patch.object(data_parser, 'strm_local_media_path',
+                              return_value=local_media_path)
+            if mock_local else
+            mock.patch.object(data_parser, 'strm_local_media_path',
+                              wraps=data_parser.strm_local_media_path)
+        )
+        translate_path_side_effect = (
+            (lambda value: value) if mock_local
+            else (lambda value: local_media_path)
+        )
+
+        with mock.patch.object(data_parser, 'show_version_info'), \
+                mock.patch.object(data_parser, 'main_ep_to_title', return_value='Episode'), \
+                mock.patch.object(data_parser, 'main_ep_intro_time', return_value={}), \
+                mock.patch.object(data_parser, 'logger_setup'), \
+                mock.patch.object(data_parser, 'match_version_range', return_value=True), \
+                mock.patch.object(data_parser, 'force_disk_mode_by_path', return_value=force_disk), \
+                mock.patch.object(data_parser, 'translate_path_by_ini',
+                                  side_effect=translate_path_side_effect) as translate_path, \
+                local_path_patch as local_path, \
+                mock.patch.object(data_parser, 'maybe_register_strm_cd2_url',
+                                  return_value='http://127.0.0.1:58000/cd2/nonce') as register, \
+                mock.patch.object(data_parser.configs, 'raw', raw), \
+                mock.patch.object(data_parser.configs, 'media_title_translate', return_value={}), \
+                mock.patch.object(data_parser.configs, 'check_str_match', side_effect=check_str_match):
+            result = data_parser.parse_received_data_emby(received_data)
+        return result, translate_path, local_path, register
+
+    def test_emby_parser_uses_selected_version_sidecar_for_path_source(self):
+        source_a_path = r'/CloudNAS/Show/S01E07.mkv'
+        source_b_path = r'/CloudNAS/Show/S01E07-1080p.mkv'
+        sidecar_a = r'/CloudNAS/Show/S01E07.strm'
+        sidecar_b = r'/CloudNAS/Show/S01E07-1080p.strm'
+        source_a = self._strm_source('source-a', source_a_path, 'S01E07')
+        source_b = self._strm_source('source-b', source_b_path, 'S01E07-1080p')
+        received_data = self._strm_received_data(
+            [source_a, source_b], source_id='source-b', main_path=sidecar_a,
+            episodes_info=[{
+                'Id': 'item-b',
+                'Path': sidecar_b,
+                'MediaSources': [{'Id': 'source-b'}],
+            }],
+        )
+
+        result, translate_path, local_path, register = self._parse_strm_received_data(
+            received_data, local_media_path=r'X:\Show\S01E07-1080p.mkv',
+            mock_local=False)
+
+        self.assertEqual(result['file_path'], sidecar_b)
+        self.assertTrue(result['use_strm_local_path'])
+        self.assertEqual(result['strm_cd2_local_path'], r'X:\Show\S01E07-1080p.mkv')
+        self.assertEqual(result['media_path'], 'http://127.0.0.1:58000/cd2/nonce')
+        local_path.assert_called_once_with(sidecar_b, source_b_path)
+        translate_path.assert_called_once_with(source_b_path)
+        register.assert_called_once_with(
+            r'X:\Show\S01E07-1080p.mkv', fallback_url=result['stream_url'])
+
+    def test_emby_parser_falls_back_to_selected_stream_without_sidecar_mapping(self):
+        source_a_path = r'/CloudNAS/Show/S01E07.mkv'
+        source_b_path = r'/CloudNAS/Show/S01E07-1080p.mkv'
+        sidecar_a = r'/CloudNAS/Show/S01E07.strm'
+        source_a = self._strm_source('source-a', source_a_path, 'S01E07')
+        source_b = self._strm_source('source-b', source_b_path, 'S01E07-1080p')
+        received_data = self._strm_received_data(
+            [source_a, source_b], source_id='source-b', main_path=sidecar_a,
+            episodes_info=[{
+                'Id': 'item-a',
+                'Path': sidecar_a,
+                'MediaSources': [
+                    {'Id': 'source-a', 'Type': 'Default'},
+                    {'Id': 'source-b'},
+                ],
+            }],
+        )
+
+        result, translate_path, local_path, register = self._parse_strm_received_data(
+            received_data, local_media_path=r'X:\Show\S01E07.mkv')
+
+        self.assertEqual(result['file_path'], sidecar_a)
+        self.assertFalse(result['use_strm_local_path'])
+        self.assertFalse(result['use_strm_cd2_url'])
+        self.assertEqual(result['media_path'], result['stream_url'])
+        self.assertIn('MediaSourceId=source-b', result['stream_url'])
+        local_path.assert_not_called()
+        translate_path.assert_not_called()
+        register.assert_not_called()
+
+    def test_emby_parser_uses_selected_version_sidecar_for_http_source(self):
+        source_a = self._strm_source(
+            'source-a', 'https://media.example/S01E07.mkv', 'S01E07')
+        source_b = self._strm_source(
+            'source-b', 'https://media.example/S01E07-1080p.mkv', 'S01E07-1080p')
+        sidecar_a = r'/CloudNAS/Show/S01E07.strm'
+        sidecar_b = r'/CloudNAS/Show/S01E07-1080p.strm'
+        received_data = self._strm_received_data(
+            [source_a, source_b], source_id='source-b', main_path=sidecar_a,
+            episodes_info=[{
+                'Id': 'item-b',
+                'Path': sidecar_b,
+                'MediaSources': [{'Id': 'source-b'}],
+            }],
+        )
+
+        result, translate_path, local_path, register = self._parse_strm_received_data(
+            received_data, local_media_path=r'X:\Show\S01E07-1080p.mkv')
+
+        self.assertEqual(result['file_path'], sidecar_b)
+        self.assertTrue(result['use_strm_local_path'])
+        self.assertTrue(result['is_http_source'])
+        self.assertEqual(result['strm_cd2_local_path'], r'X:\Show\S01E07-1080p.mkv')
+        local_path.assert_called_once_with(sidecar_b, source_b['Path'])
+        translate_path.assert_called_once_with(r'X:\Show\S01E07-1080p.mkv')
+        register.assert_called_once_with(
+            r'X:\Show\S01E07-1080p.mkv', fallback_url=result['stream_url'])
+
+    def test_emby_parser_uses_auto_preferred_version_sidecar(self):
+        source_a_path = r'/CloudNAS/Show/S01E07.mkv'
+        source_b_path = r'/CloudNAS/Show/S01E07-1080p.mkv'
+        sidecar_a = r'/CloudNAS/Show/S01E07.strm'
+        sidecar_b = r'/CloudNAS/Show/S01E07-1080p.strm'
+        source_a = self._strm_source('source-a', source_a_path, 'S01E07')
+        source_b = self._strm_source('source-b', source_b_path, 'S01E07-1080p')
+        received_data = self._strm_received_data(
+            [source_a, source_b], source_id='source-b', main_path=sidecar_a,
+            include_source_id=False,
+            episodes_info=[{
+                'Id': 'item-b',
+                'Path': sidecar_b,
+                'MediaSources': [{'Id': 'source-b'}],
+            }],
+        )
+
+        with mock.patch.object(data_parser, 'version_prefer_emby', return_value=source_b):
+            result, translate_path, local_path, register = self._parse_strm_received_data(
+                received_data, local_media_path=r'X:\Show\S01E07-1080p.mkv')
+
+        self.assertEqual(result['media_source_id'], 'source-b')
+        self.assertEqual(result['file_path'], sidecar_b)
+        self.assertTrue(result['use_strm_local_path'])
+        local_path.assert_called_once_with(sidecar_b, source_b_path)
+        translate_path.assert_called_once_with(r'X:\Show\S01E07-1080p.mkv')
+        register.assert_called_once_with(
+            r'X:\Show\S01E07-1080p.mkv', fallback_url=result['stream_url'])
+
+    def test_emby_parser_unresolved_version_ignores_direct_and_forced_disk_modes(self):
+        source_a_path = r'/CloudNAS/Show/S01E07.mkv'
+        source_b_path = r'/CloudNAS/Show/S01E07-1080p.mkv'
+        sidecar_a = r'/CloudNAS/Show/S01E07.strm'
+        source_a = self._strm_source('source-a', source_a_path, 'S01E07')
+        source_b = self._strm_source('source-b', source_b_path, 'S01E07-1080p')
+        received_data = self._strm_received_data(
+            [source_a, source_b], source_id='source-b', main_path=sidecar_a,
+            episodes_info=[],
+        )
+
+        result, translate_path, local_path, register = self._parse_strm_received_data(
+            received_data, local_media_path=r'X:\Show\S01E07.mkv',
+            strm_direct=True, force_disk=True)
+
+        self.assertFalse(result['use_strm_local_path'])
+        self.assertFalse(result['mount_disk_mode'])
+        self.assertEqual(result['media_path'], result['stream_url'])
+        self.assertIn('MediaSourceId=source-b', result['stream_url'])
+        local_path.assert_not_called()
+        translate_path.assert_not_called()
+        register.assert_not_called()
+
+    def test_list_episodes_keeps_selected_strm_version_row(self):
+        sidecar_b = r'/CloudNAS/Show/S01E07-1080p.strm'
+        source_b_path = r'/CloudNAS/Show/S01E07-1080p.mkv'
+        source_b = self._strm_source('source-b', source_b_path, 'S01E07-1080p')
+        data = {
+            'server': 'emby',
+            'scheme': 'http',
+            'netloc': 'emby.example',
+            'api_key': 'token',
+            'user_id': 'user',
+            'mount_disk_mode': True,
+            'headers': {},
+            'playlist_info': [{'Id': 'item-b'}],
+            'main_ep_info': {'SeasonId': 'season-1', 'SeriesId': 'series-1'},
+            'server_version': '4.10.0.40',
+            'basename': 'S01E07-1080p.strm',
+            'is_strm': True,
+            'is_http_source': False,
+            'strm_direct': False,
+            'is_http_direct_strm': False,
+            'strm_local_by_file_path': True,
+            'item_id': 'item-b',
+            'media_source_id': 'source-b',
+            'file_path': sidecar_b,
+            'media_title': 'Episode',
+            'episodes_info': [],
+            'sub_inner_idx': 0,
+            'device_id': 'device',
+            'play_session_id': 'session',
+        }
+        episode = {
+            'Id': 'item-b',
+            'Type': 'Episode',
+            'ProviderIds': {},
+            'SeriesId': 'series-1',
+            'Path': sidecar_b,
+            'ParentIndexNumber': 1,
+            'IndexNumber': 7,
+            'Name': 'Episode',
+            'RunTimeTicks': 10 ** 7,
+            'MediaSources': [source_b],
+        }
+
+        with mock.patch.object(data_parser, 'requests_urllib',
+                               return_value={'Items': [episode]}), \
+                mock.patch.object(data_parser, 'match_version_range', return_value=True), \
+                mock.patch.object(data_parser, 'strm_local_media_path',
+                                  return_value=r'X:\Show\S01E07-1080p.mkv') as local_path, \
+                mock.patch.object(data_parser, 'translate_path_by_ini',
+                                  side_effect=lambda value: value), \
+                mock.patch.object(data_parser, 'maybe_register_strm_cd2_url',
+                                  return_value='http://127.0.0.1:58000/cd2/nonce') as register, \
+                mock.patch.object(data_parser.configs, 'check_str_match',
+                                  return_value=False), \
+                mock.patch.object(data_parser.configs, 'media_title_translate',
+                                  return_value={}):
+            result = data_parser.list_episodes(data)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['file_path'], sidecar_b)
+        self.assertEqual(result[0]['media_source_id'], 'source-b')
+        self.assertTrue(result[0]['use_strm_local_path'])
+        local_path.assert_called_once_with(sidecar_b, source_b_path)
+        register.assert_called_once_with(
+            r'X:\Show\S01E07-1080p.mkv', fallback_url=result[0]['stream_url'])
+
     def test_emby_parser_replaces_local_strm_path_with_gateway_url(self):
         received_data = {
             'extraData': {
