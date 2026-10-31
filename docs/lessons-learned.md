@@ -98,7 +98,7 @@
 
 - 现象：多个 ETLP 进程或重复播放请求会让共享的 `prefetch_data`、播放器进程和
   `PlaySessionId` 回传相互交错，服务端可能短时间保留旧会话。
-- 当前实现：`embyToLocalPlayer.py` 启动时先取得 `InstanceLock`；锁文件残留不作为
+- 当前实现：`embyToLocalPlayer.py` 在导入 bootstrap、配置、下载器和 HTTP 模块之前取得 `InstanceLock`；锁文件残留不作为
   活动状态判断。`start_play()` 和 HTTP 播放分派使用 playback lease，同一时刻只接纳
   一个活动播放器；第二个请求返回 HTTP 409 和 `playback_busy`。直接 `Popen` 播放器
   的 lease 保持到进程退出。`players.py` 中的 `--one-instance` 仍是 VLC 启动参数，
@@ -108,7 +108,7 @@
   入口，未纳入这条主播放链路。
 - 验证：`utils/instance_lock.py`、`utils/http_server.py`、`tests/test_instance_lock.py`、
   `tests/test_http_server_security.py` 和 `tests/test_process_cleanup.py`；覆盖跨进程
-  锁竞争、重复播放、直接进程等待、异常释放和端口冲突不清理。
+  锁竞争、重复播放、直接进程等待、异常释放和端口冲突不清理。真实入口子进程还覆盖 GUI 自动恢复、锁失败时禁止业务导入，以及同一临时端口关闭后再次启动。
 
 ## 11. CD2 网关 nonce 的续连绑定要兼容本机播放器
 
@@ -128,7 +128,7 @@
   100、200 秒等合法标记；只生成 Opening/Main 会丢失普通章节和片尾。
 - 结论：在现有条目请求中索取完整 `Chapters`，按精确 ItemId 使用缓存兜底，不能
   用季集编号共享不同版本的章节。每集明确保存自己的章节列表（包括空列表），ticks
-  转换为秒时保留小数。片头起止只依赖有效的 IntroStart/IntroEnd 配对。
+  转换为秒时保留小数。片头起止只依赖有效的 IntroStart/IntroEnd 配对。替代源展开时必须清除默认条目的章节，只能使用替代 ItemId 自身或精确缓存的章节。
 - 播放器边界：mpv 使用实际加载路径匹配章节，在 `file-loaded` 后仅为空章节列表
   补入 Emby 数据，保留媒体已有章节；写入前再次核对路径，避免切集时标题滞后造成
   错配。CD2 地址是传输路径，不能作为章节内容的来源。
@@ -175,6 +175,8 @@
 - 验证：`tests/test_downloader_range.py` 的错误响应、首段保护、短读续传、最后字节、锁和
   小文件预热测试，以及本地 HTTP 服务的 `200`、错误范围、`403`、有效 `206` 和短读场景。
 
+- 调用方约束：`download_play()` 只有首尾预热均成功且文件存在时才切换缓存路径；失败只分派一次原媒体地址。`resume_or_pause()` 也消费失败结果并保留任务，不能紧接另一轮完整下载抵消有限重试。`tests/test_downloader_range.py` 以真实下载器方法验证 403、错误范围、短读耗尽、成功、只读、暂停、取消和旧缓存续播。
+
 ## 16. 用户脚本日志和动态页面文本要使用安全快照
 
 - 现象：直接把播放对象传给 `console.log()` 会保留可变原对象，开发者工具稍后展开时可能
@@ -215,6 +217,15 @@
   `name`/`filename`/`file_name` 查询值，最后使用配置备用后缀。只接受已知视频后缀，
   纯 pickcode、接口后缀和任意查询值均不能作为格式依据；目录及基名始终来自 sidecar。
   `tests/test_strm_media_path.py` 覆盖这些形式、编码文件名、格式冲突和未知格式回退。
+
+- 多版本约束：只能根据精确 ItemId/源归属使用 sidecar；不能按名称子串猜测，不能把同一个多源条目 Path 分配给所有版本。无法验证的替代路径只作筛选提示，播放走选中源的服务端地址，不登记 CD2。验证见 `tests/test_clouddrive2_gateway.py` 和 `tests/test_emby_multi_version.py`。
+
+## 19. 多版本展开必须保护列表身份
+
+- Emby 请求保留 `Chapters` 并增加 `AlternateMediaSources`，按响应实际缺失条目补全，不以 `CanDelete` 推断管理员身份。显式条目优先，输入不被原地改写，Jellyfin 不进行该展开。
+- 当前源按精确媒体源 ID 固定；同季同集候选按键过滤，不能假设选中版本位于连续分组首位。显式播放列表保留选定条目和数量，不能把一次选择展开成多个版本。
+- 下游仍使用 basename/标题匹配起播项。无法构造可区分提示的替代源应安全退回当前单项流播放，不能返回同 Path 的歧义候选。各项网络回退后的重定向按该项实际播放模式处理。
+- 验证：`tests/test_emby_multi_version.py` 的首播、连续播放、章节、缺字段、显式列表与回退场景。
 
 ## 不应直接沉淀的内容
 

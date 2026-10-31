@@ -28,7 +28,7 @@ flowchart LR
 
 | 组件 | 主要职责 | 代码入口 |
 | --- | --- | --- |
-| 进程入口 | 加载 bundled dependencies、取得 ETLP 实例锁、读取配置、清理临时状态、启动后台任务和 HTTP 服务 | `embyToLocalPlayer.py`、`utils/instance_lock.py` |
+| 进程入口 | 先取得 ETLP 实例锁，再加载 bundled dependencies、业务模块和配置、清理临时状态、启动后台任务和 HTTP 服务 | `embyToLocalPlayer.py`、`utils/instance_lock.py` |
 | 本地 HTTP 服务 | 精确路由、协议头/令牌校验、请求体解析、单播放占用、播放/文件/缓存动作分派、短期媒体 URL 和回环优雅关闭 | `utils/http_server.py`、`utils/http_security.py`、`utils/stop_instance.py` |
 | 数据解析 | 处理 Emby/Jellyfin/Plex 响应、路径、STRM、版本、字幕和播放列表数据 | `utils/data_parser.py` |
 | 播放管理 | 启动播放器、连续播放、预热、播放状态读取和最终进度更新 | `utils/player_manager.py`、`utils/players.py` |
@@ -48,7 +48,7 @@ flowchart LR
    MediaSource 要跟随当前播放项目，旧 session 的命令不能被新播放确认。
 5. STRM 本地预热和 CloudDrive2 解析均是 best-effort：超时或不可用时保留原有
    路径判断和回退路径，不能阻塞播放启动。
-6. ETLP 启动前取得基于操作系统的跨进程实例锁；第二个 ETLP 进程直接退出，残留锁文件
+6. ETLP 在导入配置、下载器、HTTP 和 bundled dependency bootstrap 之前取得基于操作系统的跨进程实例锁；第二个 ETLP 进程直接退出，残留锁文件
    本身不代表活动实例。启动阶段不按进程名清理外部播放器，未知端口占用者不得被终止。
    播放路由使用进程内 playback lease 同时只接纳一个活动播放器；第二个播放请求返回
    `409 playback_busy`，lease 保持到托管播放器结束或直接 `Popen` 进程退出。
@@ -71,11 +71,15 @@ flowchart LR
    锚点；`MediaSource.Path` 只作为指针内部媒体源和扩展名来源，既可能是 URL，也可能是
    服务器返回的路径型媒体文件名。读盘模式先由 sidecar 路径派生真实媒体路径，再进行
    本地映射和可选 CloudDrive2 gateway 登记；无法派生出合法媒体扩展名时必须回退，不能
-   把远程 `MediaSource.Path` 当作本地可写目标。
+   把远程 `MediaSource.Path` 当作本地可写目标。多版本 sidecar 必须属于选中源；名称提示不能当作已验证的本地路径。
+10. Emby 的替代媒体源按源和 ItemId 补全；保留显式播放列表的选择和逐条章节身份，
+    不能复制默认版本的章节给替代版本。
+11. 缓存播放与恢复下载必须消费首尾预热结果；失败保留原媒体地址和任务，
+    不立即重新开始整段下载。
 
 ## 生命周期与数据存放
 
-- 进程启动时由 `embyToLocalPlayer.py` 先取得实例锁，再清理临时状态、准备配置，启动
+- 进程入口锁外只加载标准库和锁模块；取得实例锁后才加载 bundled dependencies、业务模块和配置，再清理临时状态、准备配置，启动
   恢复信息预取和 redirect cache 清理线程，最后进入 `run_server()`；收到回环关闭请求后
   服务循环退出并关闭监听 socket，实例锁释放覆盖正常退出和启动异常路径。
 - 播放器、远程控制和播放列表状态主要保存在进程对象中；配置、字幕/媒体缓存、
