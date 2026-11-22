@@ -26,7 +26,6 @@
 // @grant        GM_unregisterMenuCommand
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @grant        GM_deleteValue
 // @run-at       document-start
 // @connect      127.0.0.1
 // @license MIT

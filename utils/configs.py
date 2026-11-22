@@ -259,10 +259,6 @@ class Configs:
                         return version
 
     def media_title_translate(self, media_title=None, get_trans=False, log=True, player_path=''):
-        if '--|--' in str(None):
-            if get_trans:
-                return
-            return media_title
         map_pair = self.raw.get('dev', 'media_title_translate', fallback='')
         if not map_pair:
             if pot_ver := self._pot_version_is_too_high(player_path=player_path):

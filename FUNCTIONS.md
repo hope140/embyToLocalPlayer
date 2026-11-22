@@ -17,7 +17,7 @@
 | mpv 连播章节 | Emby/Jellyfin 条目请求同时获取 `Chapters`，每集独立传递完整章节；mpv/mpv.net 加载后按实际媒体路径补齐空章节列表，保留已有内嵌章节。Emby 与媒体均无章节时保持为空。 |
 | 独立远程控制 | `[remote_control]` 为当前 mpv/IINA 建立独立 Emby 会话控制通道，支持暂停/继续、seek、停止和消息显示；只作用于当前机器。 |
 | 实时反馈 | `[dev] playing_feedback_*` 面向 mpv/IINA 回传播放位置和暂停状态；最终回传仍由 `[emby] update_progress` 控制。 |
-| 明确排除 | 本项目不实现同步观看房间；该能力请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。同时不对豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 联动等旁线能力提供支持承诺。 |
+| 明确排除 | 本项目不实现同步观看房间；该能力请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。同时不对豆瓣/Bangumi、Simkl/Trakt、聚合搜索等旁线能力提供支持承诺。 |
 
 ### 1.1 频道规则
 
@@ -140,20 +140,20 @@ flowchart LR
 | 连续播放 | `[playlist]` | `utils/player_manager.py`、`utils/data_parser.py`、`utils/players.py` | 单集、列表、多版本、S0、HTTP 外挂字幕。 |
 | 实时反馈 | `playing_feedback_*` | `utils/player_manager.py`、`utils/net_tools.py`、`utils/emby_session_api.py` | mpv/IINA、暂停/恢复、间隔、服务器过滤。 |
 | 独立远程控制 | `[remote_control] enable` | `utils/remote_control_client.py`、`utils/emby_session_api.py` | 会话绑定、能力声明、Pause/Seek/Stop/Message、断线回退。 |
-| HTTP 安全 | `listen_on_localhost`、`http_server_token` | `utils/http_server.py`、`utils/http_security.py` | 回环默认、非回环 token、Bearer、媒体签名 URL。 |
+| HTTP 安全 | `listen_on_localhost`、`http_server_token` | `utils/http_server.py`、`utils/http_security.py` | 回环默认、非回环 token、Bearer。 |
 
 ## 6. 安全约束与已知边界
 
 - 本地 HTTP 默认只监听回环地址。只有确有跨设备需求时才设置 `[dev] listen_on_localhost = no`，并配置至少 32 个字符的随机 `http_server_token`。
 - 油猴脚本和 Python 内部请求使用 `X-ETLP-Protocol: 1`；非回环动作接口使用 `Authorization: Bearer`，且只开放代码明确允许的稀疏文件和 STRM 临时进度动作，不能据此推断为通用远程 API。
 - Windows 启动菜单的 `7` 和 `python utils/stop_instance.py` 通过 `POST /shutdown/` 请求关闭 ETLP；关闭接口只接受回环客户端和 `X-ETLP-Protocol: 1`，服务响应后退出 HTTP 服务并释放实例锁，不强制终止外部播放器。
-- 媒体转发使用带 `file_path`、`expires`、`sig` 的短期 HMAC URL；不要在 URL、日志、截图或提交中暴露 token、Cookie 或完整敏感路径。
+- 日志、截图或提交应省略 token、Cookie 和完整敏感路径。
 - `mix_log = yes` 应保持开启以模糊日志中的域名及密钥；排错时只提供必要片段。
 - 远程控制是当前播放器的独立会话通道，不是同步观看系统；修改它时不得引入房间状态、参与者状态或跨设备跟随语义。
 - 修改播放流程至少回归：网络模式、读取硬盘模式、单集、播放列表、`.strm`、CloudDrive2 失败回退和播放器退出后的最终进度。
 - 修改实时反馈时要分别验证实时反馈、暂停/恢复、会话识别和退出后的最终回传，不能用其中一种结果替代另一种。
 - 新增播放器不能只验证“能启动”，还要记录其开始时间、字幕、连续播放、最终进度和实时反馈支持情况。
-- 同步观看房间不属于当前应用的实现范围；需要房间、参与者管理和跨设备跟随播放时，请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 等旁线文案也不属于当前频道验收依据；若代码重新引入相关能力，应另行设计范围和测试。
+- 同步观看房间不属于当前应用的实现范围；需要房间、参与者管理和跨设备跟随播放时，请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。豆瓣/Bangumi、Simkl/Trakt、聚合搜索等旁线文案也不属于当前频道验收依据；若代码重新引入相关能力，应另行设计范围和测试。
 
 ## 7. 维护文档与 Knowledge Review
 

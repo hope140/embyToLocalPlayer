@@ -6,7 +6,6 @@ import signal
 import subprocess
 import threading
 import time
-import urllib.parse
 from collections import defaultdict
 from numbers import Real
 from typing import Union
@@ -14,7 +13,6 @@ from typing import Union
 import unicodedata
 
 from utils.configs import configs, MyLogger
-from utils.http_security import media_signature
 
 _logger = MyLogger()
 
@@ -161,36 +159,6 @@ def open_local_folder(data):
         cmd = ['xdg-open', path] if isdir else ['xdg-open', os.path.dirname(path)]
     _logger.info('open local folder')
     subprocess.Popen(cmd)
-
-
-def play_media_file(data):
-    nas_href = configs.raw.get('dev', 'server_side_href', fallback='').strip().strip('/')
-    href = data.get('href', '').rsplit(':', maxsplit=1)[0].strip('/')
-    if not href:
-        _logger.info('qb open file: userscript update needed.')
-        return
-    href = nas_href or f'{href}:58000'
-    save_path = data['info'][0]['save_path']
-    big_file = sorted(data['file'], key=lambda i: i['size'], reverse=True)[0]['name']
-    file_path = os.path.join(save_path, big_file)
-    media_path = translate_path_by_ini(file_path)
-
-    qb_play_via_http = configs.raw.getboolean('dev', 'qb_play_via_http', fallback=False)
-    server_token = configs.raw.get('dev', 'http_server_token', fallback='').strip()
-    if qb_play_via_http and server_token and not os.path.exists(media_path):
-        _, ext = os.path.splitext(file_path)
-        expires = str(int(time.time()) + 60 * 60)
-        params = {
-            'file_path': file_path,
-            'expires': expires,
-            'sig': media_signature(server_token, file_path, expires),
-        }
-        query_str = urllib.parse.urlencode(params)
-        media_path = f'{href}/send_media_file{ext}' + '?' + query_str
-
-    cmd = get_player_cmd(media_path, file_path=file_path)
-    player = subprocess.Popen(cmd)
-    activate_window_by_pid(player.pid)
 
 
 def kill_multi_process(name_re, not_re=None, executable_names=None):

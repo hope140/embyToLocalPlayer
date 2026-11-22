@@ -31,8 +31,8 @@
 ## 4. 本地 HTTP 接口保持窄边界
 
 - 结论：默认回环监听；非回环需要至少 32 字符 token；POST 使用精确路由和
-  `X-ETLP-Protocol: 1`；请求体有 1 MiB 上限；稀疏文件限制在 cache 目录内；媒体
-  URL 使用短期 HMAC，并避免把查询串、token 或敏感路径写进普通日志。
+  `X-ETLP-Protocol: 1`；请求体有 1 MiB 上限；稀疏文件限制在 cache 目录内；
+  普通日志省略查询串、token 和敏感路径。
 - 验证：`utils/http_server.py`、`utils/http_security.py` 和
   `tests/test_http_server_security.py`。
 
@@ -104,8 +104,7 @@
   的 lease 保持到进程退出。`players.py` 中的 `--one-instance` 仍是 VLC 启动参数，
   不能作为 mpv 的实现依据。
 - 约束：启动阶段不按进程名清理外部播放器，未知端口占用者不得被终止；播放 lease
-  必须在正常退出、启动失败和异常路径释放。历史 `/playMediaFile` helper 仍是独立
-  入口，未纳入这条主播放链路。
+  必须在正常退出、启动失败和异常路径释放。
 - 验证：`utils/instance_lock.py`、`utils/http_server.py`、`tests/test_instance_lock.py`、
   `tests/test_http_server_security.py` 和 `tests/test_process_cleanup.py`；覆盖跨进程
   锁竞争、重复播放、直接进程等待、异常释放和端口冲突不清理。真实入口子进程还覆盖 GUI 自动恢复、锁失败时禁止业务导入，以及同一临时端口关闭后再次启动。

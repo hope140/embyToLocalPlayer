@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import ipaddress
-import time
 import urllib.parse
 
 
 ETLP_PROTOCOL_HEADER = 'X-ETLP-Protocol'
 ETLP_PROTOCOL_VERSION = '1'
 HTTP_SERVER_PORT = 58000
-MAX_MEDIA_URL_LIFETIME_SECONDS = 24 * 60 * 60
 
 
 def is_loopback_address(address: str | None) -> bool:
@@ -65,29 +62,3 @@ def bearer_token_valid(header: str | None, token: str) -> bool:
     if not supplied:
         return False
     return hmac.compare_digest(supplied, token)
-
-
-def media_signature(token: str, file_path: str, expires: str) -> str:
-    """Return the HMAC-SHA256 signature for a media URL."""
-
-    payload = f'{file_path}\n{expires}'.encode('utf-8')
-    return hmac.new(token.encode('utf-8'), payload, hashlib.sha256).hexdigest()
-
-
-def media_url_signature_valid(token: str, file_path: str, expires: str,
-                              signature: str, *, now: int | None = None) -> bool:
-    """Validate token, expiry window and signature for a media URL."""
-
-    if not token or not file_path or not expires or not signature:
-        return False
-    try:
-        expires_at = int(expires)
-    except (TypeError, ValueError):
-        return False
-    if str(expires_at) != str(expires):
-        return False
-    current = int(time.time()) if now is None else int(now)
-    if expires_at < current or expires_at > current + MAX_MEDIA_URL_LIFETIME_SECONDS:
-        return False
-    expected = media_signature(token, file_path, expires)
-    return hmac.compare_digest(signature, expected)

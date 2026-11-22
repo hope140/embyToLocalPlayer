@@ -960,32 +960,6 @@ def list_episodes_plex(data: dict):
     return result
 
 
-def list_playlist_or_mix_s0(data):
-    scheme = data['scheme']
-    netloc = data['netloc']
-    api_key = data['api_key']
-    user_id = data['user_id']
-    extra_str = '/emby' if data['server'] == 'emby' else ''
-    device_id, play_session_id = data['device_id'], data['play_session_id']
-    playlist_info = data['playlist_info']  # 电影或者音乐视频
-    episodes_info = data['episodes_info']  # 可能是混合了S0的正确集数
-
-    params = {'X-Emby-Token': api_key, }
-    headers = {'accept': 'application/json', }
-    headers.update(data['headers'])
-    fields = 'MediaSources,Path,ProviderIds,Chapters'
-    if data['server'] == 'emby':
-        fields += ',AlternateMediaSources'
-
-    ids = [ep['Id'] for ep in playlist_info]
-    params.update({'Fields': fields,
-                   'Ids': ','.join(ids), })
-    playlist_data = requests_urllib(
-        f'{scheme}://{netloc}{extra_str}/Users/{user_id}/Items',
-        params=params, headers=headers, get_json=True)
-    return playlist_data
-
-
 def list_episodes(data: dict):
     if data['server'] == 'plex':
         return list_episodes_plex(data)

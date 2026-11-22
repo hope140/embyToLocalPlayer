@@ -1,5 +1,4 @@
 import os
-import re
 import threading
 import time
 import urllib.parse
@@ -324,25 +323,6 @@ class PrefetchManager(BaseInit):  # 未兼容播放器多开，暂不处理
             if self.playing_feedback_stop_event.is_set():
                 return False
             return bool(realtime_playing_request_sender(**kwargs))
-
-    def mpv_cache_via_nas_loop(self):
-        mpv = self.player_kwargs.get('mpv')
-        if not mpv or not configs.check_str_match(self.data['netloc'], 'dev', 'playing_feedback_host', log_by=True):
-            return
-        if self.data['server'] == 'plex':
-            logger.info('playing_feedback not support plex, skip')
-            return
-        stop_sec_dict = prefetch_data['stop_sec_dict']
-        prefetch_data['on'] = True
-
-        source_id = re.compile(r'(?<=MediaSourceId=)\w+')
-
-        while prefetch_data['on']:
-            try:
-                key = mpv.command('get_property', 'media-title')
-                speed = mpv.command('get_property', 'speed')
-            except Exception:
-                break
 
     def realtime_playing_feedback_loop(self):
         mpv = self.player_kwargs.get('mpv')

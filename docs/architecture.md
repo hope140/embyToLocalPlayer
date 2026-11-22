@@ -29,7 +29,7 @@ flowchart LR
 | 组件 | 主要职责 | 代码入口 |
 | --- | --- | --- |
 | 进程入口 | 先取得 ETLP 实例锁，再加载 bundled dependencies、业务模块和配置、清理临时状态、启动后台任务和 HTTP 服务 | `embyToLocalPlayer.py`、`utils/instance_lock.py` |
-| 本地 HTTP 服务 | 精确路由、协议头/令牌校验、请求体解析、单播放占用、播放/文件/缓存动作分派、短期媒体 URL 和回环优雅关闭 | `utils/http_server.py`、`utils/http_security.py`、`utils/stop_instance.py` |
+| 本地 HTTP 服务 | 精确路由、协议头/令牌校验、请求体解析、单播放占用、播放/文件/缓存动作分派、CD2 短期媒体 URL 和回环优雅关闭 | `utils/http_server.py`、`utils/http_security.py`、`utils/stop_instance.py` |
 | 数据解析 | 处理 Emby/Jellyfin/Plex 响应、路径、STRM、版本、字幕和播放列表数据 | `utils/data_parser.py` |
 | 播放管理 | 启动播放器、连续播放、预热、播放状态读取和最终进度更新 | `utils/player_manager.py`、`utils/players.py` |
 | Emby 会话与远程控制 | 为当前播放建立独立控制身份，进行 HTTP/WebSocket 回传和控制命令处理 | `utils/emby_session_api.py`、`utils/remote_control_client.py` |
@@ -84,7 +84,6 @@ flowchart LR
   服务循环退出并关闭监听 socket，实例锁释放覆盖正常退出和启动异常路径。
 - 播放器、远程控制和播放列表状态主要保存在进程对象中；配置、字幕/媒体缓存、
   更新 archive 和示例配置使用现有配置路径及临时目录，不引入房间或服务端状态库。
-  当前播放 lease 只覆盖 ETLP 主播放链路；历史 `/playMediaFile` helper 仍是独立入口。
 - CloudDrive2 gateway 只保留短期 nonce 到本地路径的进程内映射；解析失败继续尝试
   原挂载路径（媒体文件直发，或 `.strm` 指针读取其内容 URL 后 307 重定向），不能把
   gateway 当成公网永久 URL。
