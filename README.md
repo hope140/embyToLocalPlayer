@@ -79,7 +79,7 @@ GitCode Release。GitCode 认证使用已登录的 `gitcode` CLI，或由 `GC_TO
 | Emby 控制台远程控制 | 内置当前机器播放器的独立控制通道，面向 mpv/IINA | `[remote_control] enable = yes` 默认开启；控制当前播放器的暂停、继续、seek、停止和消息显示，不建立房间、不让多台设备互相跟随。 |
 | 实时进度回传 | mpv/IINA 可在播放中回传进度和暂停状态 | 由 `[dev] playing_feedback_*` 控制；其他播放器仍可在退出时回传最终进度。 |
 | 同步观看房间 | **不包含** | 本分支不提供房间、参与者、同步播放或跟随观看能力；该能力请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。 |
-| 旁线功能 | **不作为本分支能力提供** | 不承诺豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 联动等能力；不要把上游 README 或其他实验分支的旧文案复制到这里。 |
+| 旁线功能 | **不作为本分支能力提供** | 不承诺豆瓣/Bangumi、Simkl/Trakt、聚合搜索等能力；不要把上游 README 或其他实验分支的旧文案复制到这里。 |
 
 ## 主要能力
 
@@ -193,7 +193,7 @@ enable = yes
 以下内容不属于当前应用的交付承诺：
 
 - 同步观看房间、参与者管理、跨设备跟随播放；该能力请使用独立项目 [EmbyWatchTogether](https://github.com/hope140/EmbyWatchTogether)。
-- 豆瓣/Bangumi、Simkl/Trakt、聚合搜索、qBittorrent 联动等旁线集成；
+- 豆瓣/Bangumi、Simkl/Trakt 和聚合搜索等旁线集成。当前 beta 分支已移除旧 qBittorrent 播放接口及其专用文件转发入口。
 - 把 CloudDrive2 gateway 直接暴露到公网，或把本地服务当成通用媒体服务器。
 
 如果需要比较上游实现，请直接查看 [上游仓库](https://github.com/kjtsune/embyToLocalPlayer)；上游文档中的功能、配置和 FAQ 不自动适用于本分支。

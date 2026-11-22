@@ -552,28 +552,6 @@ def mpv_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_s
     return dict(mpv=mpv)
 
 
-def mpv_intro_chapters_maker(start, end, file_name):
-    chapters_text = f''';FFMETADATA1
-[CHAPTER]
-TIMEBASE=1/1
-START={start}
-END={end}
-title=Opening
-[CHAPTER]
-TIMEBASE=1/1
-START={end}
-END=9999
-title=Main
-'''
-    _tmp = os.path.join(configs.cwd, '.tmp')
-    chap_path = os.path.join(_tmp, f'{file_name}-chapters.txt')
-    if not os.path.exists(_tmp):
-        os.mkdir(_tmp)
-    with open(chap_path, 'w', encoding='utf-8') as f:
-        f.write(chapters_text)
-    return chap_path
-
-
 _MPV_PLAYLIST_START_TIMEOUT_SECONDS = 10.0
 _MPV_PLAYLIST_START_POLL_SECONDS = 0.1
 

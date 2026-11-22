@@ -15,12 +15,11 @@ from utils.clouddrive2_gateway import (CloudDrive2Gateway, GatewayRouteDecision,
                                        configure_gateway, gateway)
 from utils.downloader import DownloadManager
 from utils.http_security import (ETLP_PROTOCOL_HEADER, bearer_token_valid,
-                                 is_loopback_address, media_url_signature_valid,
-                                 protocol_header_valid)
+                                 is_loopback_address, protocol_header_valid)
 from utils.net_tools import (realtime_playing_request_sender, update_server_playback_progress)
 from utils.player_manager import PlayerManager
 from utils.players import start_player_func_dict, stop_sec_func_dict
-from utils.tools import (configs, MyLogger, open_local_folder, play_media_file,
+from utils.tools import (configs, MyLogger, open_local_folder,
                          activate_window_by_pid, get_player_cmd, ThreadWithReturnValue,
                          create_sparse_file)
 
@@ -124,11 +123,9 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         '/embyToLocalPlayer', '/embyToLocalPlayer/',
         '/plexToLocalPlayer', '/plexToLocalPlayer/',
         '/openFolder', '/openFolder/',
-        '/playMediaFile', '/playMediaFile/',
         '/shutdown', '/shutdown/',
         '/action/sparse_file',
     }
-    _MEDIA_PATH_RE = re.compile(r'^/send_media_file(?:\.[A-Za-z0-9]+)?$')
     # .strm pointer files are plain text; the media location is on the first
     # line.  Bound both the read and the redirected URL so a corrupt pointer
     # cannot turn the gateway into a large-memory or arbitrary-scheme relay.
@@ -383,9 +380,6 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
         if canonical_path == '/openFolder':
             open_local_folder(data)
             return None
-        if canonical_path == '/playMediaFile':
-            play_media_file(data)
-            return None
         raise ValueError('route not allowed')
 
     def do_POST(self):
@@ -421,10 +415,6 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self._send_error(403, 'OPTIONS is not supported')
-
-    @classmethod
-    def _is_media_path(cls, path):
-        return bool(cls._MEDIA_PATH_RE.fullmatch(path))
 
     @classmethod
     def _is_allowed_media_extension(cls, path):
@@ -484,9 +474,6 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'Server is running')
             return
-        if self._is_media_path(path):
-            self.send_media_file()
-            return
         if self._is_cd2_path(path):
             if self._authorize_cd2_get():
                 self.send_cd2_file()
@@ -499,9 +486,6 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         path = self._request_path()
-        if self._is_media_path(path):
-            self.send_media_file()
-            return
         if self._is_cd2_path(path):
             if self._authorize_cd2_get():
                 self.send_cd2_file()
@@ -541,33 +525,6 @@ class UserScriptRequestHandler(BaseHTTPRequestHandler):
             self._send_empty_response()
         else:
             self._send_json_response({'start_sec': start_sec})
-
-    def send_media_file(self):
-        parsed_path = urllib.parse.urlparse(self.path)
-        pairs = urllib.parse.parse_qsl(parsed_path.query, keep_blank_values=True)
-        query = dict(pairs)
-        required = {'file_path', 'expires', 'sig'}
-        if len(pairs) != len(required) or set(query) != required:
-            self._send_error(400, 'file_path, expires and sig are required')
-            return
-        video_path = query['file_path']
-        if not media_url_signature_valid(self._server_token(), video_path,
-                                         query['expires'], query['sig']):
-            self._send_error(403, 'media URL signature invalid or expired')
-            return
-
-        if not self._is_allowed_media_extension(video_path):
-            self._send_error(404, 'media extension not allowed')
-            return
-
-        if not os.path.exists(video_path):
-            self.send_response(404)
-            self.end_headers()
-            if self.command != 'HEAD':
-                self.wfile.write(b'File not found')
-            return
-
-        self._send_local_file(video_path)
 
     @staticmethod
     def _cd2_route_decision(entry, resolver):

@@ -12,21 +12,9 @@ from unittest import mock
 import utils.http_server as http_server
 import utils.net_tools as net_tools
 import utils.tools as tools
-from utils.http_security import media_signature, media_url_signature_valid
 
 
 class HttpSecurityUnitTests(unittest.TestCase):
-    def test_media_signature_window_and_tamper_checks(self):
-        token = 't' * 32
-        path = r'C:\Media\movie.mkv'
-        expires = '1100'
-        signature = media_signature(token, path, expires)
-        self.assertTrue(media_url_signature_valid(token, path, expires, signature, now=1000))
-        self.assertFalse(media_url_signature_valid('', path, expires, signature, now=1000))
-        self.assertFalse(media_url_signature_valid(token, path + 'x', expires, signature, now=1000))
-        self.assertFalse(media_url_signature_valid(token, path, '900', signature, now=1000))
-        self.assertFalse(media_url_signature_valid(token, path, '1201', signature, now=1000))
-
     def test_local_request_wrapper_adds_protocol_header(self):
         for host in ('127.0.0.1', 'localhost', '[::1]'):
             with self.subTest(host=host):
@@ -172,6 +160,21 @@ class HttpServerRouteTests(unittest.TestCase):
 
         status, _ = self._post('/openFolder.evil', {}, headers={'X-ETLP-Protocol': '1'})
         self.assertEqual(status, 404)
+
+    def test_legacy_qbittorrent_play_routes_return_not_found(self):
+        for path in ('/playMediaFile', '/playMediaFile/'):
+            with self.subTest(path=path):
+                status, body = self._post(path, {}, headers={'X-ETLP-Protocol': '1'})
+                self.assertEqual(status, 404)
+                self.assertEqual(json.loads(body), {'error': 'route not found'})
+
+        for method in ('GET', 'HEAD'):
+            with self.subTest(method=method):
+                request = urllib.request.Request(
+                    self.base_url + '/send_media_file.mkv', method=method)
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    urllib.request.urlopen(request, timeout=3)
+                self.assertEqual(context.exception.code, 404)
 
     def test_emby_and_plex_threads_use_parsed_payload(self):
         raw = ConfigParser()
